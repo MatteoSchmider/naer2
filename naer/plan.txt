@@ -1,0 +1,175 @@
+
+PLANNING
+
+class decorator => lightweight => only register class as a node type in module
+function decorator => lightweight => cannot register function to class => can do function analysis/transpilation? => no
+
+Do it lazily!
+=> only compile when needed (JIT)
+=> only do transpilation once network is started / inited
+
+
+okay, so what the f does that mean? doing some compiling early seems way more comfortable...
+what happens lazily on init, for example?
+=> we dont really want to intervene here yet!
+what happens when instance is modified after init?
+=> we also dont really care, we are not using it for the network yet!
+is modifying an instance okay once its been submitted to a network that is not running yet?
+=> maybe?! => THIS IS THE PROBLEM
+what about when a network is running, what happens to the instance that was submitted for compilation?, nothing?
+    I think nothing should happen to it actually
+=> can only access gpu data from network via single network entry point, converting back into python node instances seems not possible with sucha n architecture
+=> for debugging, it would be good to have a python only/CPU simulation framework integrated
+=> 
+
+NEW ARCHITECTURE JUST DROPPED:
+1.) Decorator registers class source code ast and does nothing else
+1.1.) Instance is added to network
+2.) network is inited => determines which instances are actually used => only compile those, then
+2.1.) instance in network is separated from instance outside
+3.) compilation now = compile functions for network from source, using instance as reference for initial state!
+to get a view into the simulation, it can be stopped and the current state converted back into a new python instance.
+since this is a different instance than what was started with, everything is fine with just leaving the original separated
+
+note:
+this architecture really is the most forgiving! if things are programmed but not needed for simulation, they are simply ignored!
+similarly, things which are missing for a simulation only become a problem once you actually do want to run it
+
+
+current plan: only do stuff with full class ast, ignore functions again!
+
+I cant just start programming the full compilation process in network.py
+do top down and bottom up at the same time:
+    top down:
+        collect information about network components, such as static/dynamic solo/group node members, etc.
+    bottom up:
+        try to generate a basic but working kernel using the existing kernel template from triton experiments
+
+
+
+Architecture for stdp:
+make stdp synapse code
+synapses can have hooks for update and transmit
+on transmit, synapses should have access to from node, to node, and message
+but only the members can be modified
+IDEA: DO NOT SEND TRACE VALUE VIA MESSAGE; JUST PASS NODE INFO AS PART OF EACH MESSAGE!
+=> message has time, from node info and custom fields
+=> in naer thesis, spikes carry the following fields:
+   - time
+   - from address
+   - last spike time before current spike
+   - pre-trace at time of current spike
+   - static/dynamic type
+=> this could be reduced to time/address and the from info!
+=> if one spike means 10k synapses are loaded, the additional info per spike doesnt add much to bandwidth
+
+Architecture Choice 2:
+STDP can now become a part of the synapse class, provided the from/to population supports it
+=> if a network has mixed stdp/non-stdp populations, the non-stdp populations should only use the lif_ed code and not the stdp code
+=> thus, when adding a connection between populations, the synapse type should be added there explicitly so code can get associated to it
+=> the synapse type needs to decide which from/to are compatible, or which fields are required (so extensions can still be easily made)
+=> only the to kernel needs to include the synapse code
+=> in that to kernel, spikes from different input populations may be sent
+=> thus, when a spike comes in:
+   - check what population it is from by reading the address
+   - if the connection from that population has synapse code, use it
+   - otherwise, skip the synapse code!
+=> for synapses with update hook, a separate kernel needs to be run
+=> only implement this hook and kernel later on
+=> but do implement it, to show just how ineffective it is, and that this simulator can support ALL configurations, even the historical (bad) ones
+if successful, a new naer paper can focus on its flexible architecture for GPU Parallel Discrete Event Simulation, and compare to existing work specifically in that field
+AND a second paper can focus on the improvements specific to SNN simulation, such as GPU event-driven simulation and the STDP history architecture
+THEN experiments on new SNN architectures can follow, whilst naer might get picked up for other uses as well
+Multi-GPU support can also be added later on, which will be highly important for adoption in other fields and adoption by groups which are able to offer development resources
+
+
+'''
+#ifndef BASIC_STDP
+#define BASIC_STDP
+
+#define NAER_CONST_DT 100 // 100 us simulation timestep size for reference
+#define NAER_T_STDP 20000 // 20ms = 20'000us
+#define NAER_ALPHA 2.02f // dimensionless
+#define NAER_LAMBDA 0.01 // dimensionless
+#define NAER_W_MAX 0.0003f // 0.3mV
+
+float stdp_trace_dynamics(float trace, uint previous_time, uint current_time)
+{
+    float dt = (float)(current_time - previous_time);
+    return dt > 0.f ? exp(-dt / NAER_T_STDP) * trace : trace;
+}
+
+float stdp_LTP(float weight, float pre_trace, uint pre_time, uint post_time)
+{
+    float pre = exp(((float)(pre_time - post_time)) / NAER_T_STDP) * pre_trace + 1.f;
+    float inc = NAER_LAMBDA * (1.f - weight) * exp(-pre / NAER_CONST_DT);
+    return weight + inc;
+}
+
+float stdp_LTD(float weight, float post_trace)
+{
+    float inc = NAER_ALPHA * NAER_LAMBDA * weight * exp(-post_trace / NAER_CONST_DT);
+    return weight - inc;
+}
+
+#endif // BASIC_STDP
+'''
+
+'''
+#define NAER_HIST_LENGTH 10
+#define NAER_HIST_UNIT 4 // 4 us
+
+typedef struct __attribute__((packed)) stdp_traces {
+    float potential;
+    float stdp;
+} stdp_traces;
+
+typedef struct __attribute__((packed)) stdp_group {
+    uint times[NAER_STDP_GROUP_SIZE];
+    stdp_traces traces[NAER_STDP_GROUP_SIZE];
+    ushort hists[NAER_STDP_GROUP_SIZE][NAER_HIST_LENGTH];
+} stdp_group;
+'''
+
+'''
+float update_synapse(
+    local stdp_group* group,
+    ushort local_address,
+    int last_spike_time,
+    float weight,
+    uint spike_time,
+    int previous_time,
+    float pre_trace)
+{
+    // Synapse Dynamics
+    // apply LTP with all hist spike times
+    int post_spike_time = last_spike_time;
+    for (uint hist = 1; (hist < NAER_HIST_LENGTH) && (post_spike_time > previous_time) && (group->hists[local_address][hist] > 0); hist++) {
+        weight = stdp_LTP(weight, pre_trace, previous_time, post_spike_time);
+        post_spike_time -= group->hists[local_address][hist] * NAER_HIST_UNIT;
+    }
+    // apply LTD
+    group->traces[local_address].stdp = stdp_trace_dynamics(group->traces[local_address].stdp, last_spike_time, spike_time);
+    weight = stdp_LTD(weight, group->traces[local_address].stdp);
+    // bound weight
+    weight = max(min(weight, NAER_W_MAX), -NAER_W_MAX); // hard bounds
+    return weight;
+}
+'''
+
+'''
+// get last timestamp for that neurons
+uint last_spike_time = group.times[local_address] - (group.hists[local_address][0] * NAER_HIST_UNIT);
+// Time Management
+group.hists[local_address][0] = (spike_time - last_spike_time) / NAER_HIST_UNIT;
+if (has_spiked) {
+    uint offset = atomic_inc(&output_counter);
+    // just adjusting per-neuron hists
+    for (uint hist = (NAER_HIST_LENGTH - 1); hist > 0; hist--) {
+        group.hists[local_address][hist] = group.hists[local_address][hist - 1];
+    }
+    group.hists[local_address][0] = 0;
+    // adjust post trace
+    group.traces[local_address].stdp += 1.f;
+}
+'''
