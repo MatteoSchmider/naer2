@@ -1,3 +1,9 @@
+import logging
+
+logging.basicConfig(
+    format="{%(filename)s:%(lineno)d} %(levelname)s - %(message)s", level=logging.DEBUG
+)
+
 # import naer as naer
 from test.lif_cd import *
 from test.stdp_synapse import *
@@ -14,7 +20,8 @@ import triton.language as tl
 
 DEVICE = torch.device("cuda:0")
 
-test = lif_cd(1, 2, 3) * 1000
+test = lif_cd(1, 2, 3)
+test = test * 1000
 
 test.compile()
 

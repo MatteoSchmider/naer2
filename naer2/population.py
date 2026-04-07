@@ -1,7 +1,5 @@
 from logging import debug
 
-from naer.class_transpiler import ClassTranspiler
-
 from .network import Network
 from .nodes import Node, node_types
 from .types import Region
@@ -25,7 +23,7 @@ class Population:
         for receive_func in self.node.receive.values():
             assigned_members += receive_func.assigned_members
         for member in assigned_members:
-            if member not in self.instance.__dict__:
+            if member not in instance.__dict__:
                 raise ValueError(f"Node instance needs to have a member {member}")
             else:
                 self.dynamic_attrs[member] = self.instance.__dict__[member].__class__
