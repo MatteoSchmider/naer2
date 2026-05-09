@@ -18,15 +18,15 @@ class Population:
         # Check that the instance has all dynamic members initialized
         self.dynamic_attrs: dict[str, type] = {}
         assigned_members = (
-            self.node.send.assigned_members + self.node.update.assigned_members
+            self.node.send.assigned_members | self.node.update.assigned_members
         )
         for receive_func in self.node.receive.values():
-            assigned_members += receive_func.assigned_members
+            assigned_members |= receive_func.assigned_members
         for member in assigned_members:
             if member not in instance.__dict__:
                 raise ValueError(f"Node instance needs to have a member {member}")
             else:
-                self.dynamic_attrs[member] = self.instance.__dict__[member].__class__
+                self.dynamic_attrs[member] = instance.__dict__[member].__class__
         self.instance = instance
 
         self.network: Network = Network(self)
