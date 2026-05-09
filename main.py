@@ -4,26 +4,22 @@ logging.basicConfig(
     format="{%(filename)s:%(lineno)d} %(levelname)s - %(message)s", level=logging.DEBUG
 )
 
-# import naer as naer
-from test.lif_cd import *
-from test.stdp_synapse import *
+from test.all_to_all import all_to_all
+from test.lif_cd import lif_cd
+from test.static_synapse import static_synapse
 
-import torch
-import triton
-import triton.language as tl
-
-# print(torch.cuda.get_arch_list())
-# print(torch.cuda.get_device_properties(0))
 # to let 780M (gfx1103) be used, fake gfx1100 with 'export HSA_OVERRIDE_GFX_VERSION=11.0.0'
-# print(torch.__version__)
 
+pop_a = lif_cd(1.0, 0.0, 0.9) * 10
+pop_b = lif_cd(1.0, 0.0, 0.9) * 5
 
-DEVICE = torch.device("cuda:0")
+conn = pop_a >> static_synapse(0.5) @ all_to_all >> pop_b
 
-test = lif_cd(1, 2, 3)
-test = test * 1000
-
-test.compile()
+pop_a.compile()
+print(pop_a, pop_b)
+print(pop_b.network.populations)
+print(conn)
+print(pop_b.network.connections)
 
 
 """

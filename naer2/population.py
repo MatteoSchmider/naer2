@@ -81,6 +81,10 @@ class Population:
     def ports(self):
         return self.node.receive.keys()
 
+    def __rshift__(self, right):
+        from .connection import ConnectionBuilder
+        return ConnectionBuilder(self).connect(right)
+
     def compile(self):
         pass
         # transpiler = ClassTranspiler()

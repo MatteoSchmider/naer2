@@ -1,38 +1,42 @@
-import naer2 as np
+import naer2 as n2
 
 
-# Option 1
-@np.edge
-class stdp_synapse_timestamp:
+@n2.edge()
+class stdp_synapse:
+    """
+    Spike-timing-dependent plasticity synapse.
+
+    Weight updates are applied lazily: LTP is computed against the pre-synaptic
+    neuron's second-to-last spike (carried in the spike metadata), and LTD is
+    computed from an exponential post-synaptic trace maintained per neuron.
+    This defers the race condition on concurrent pre/post spike events to the
+    next pre-synaptic spike, at which point the weight is actually loaded
+    anyway — so the update is free.
+
+    The neuron type paired with this synapse must expose (or have injected at
+    JIT time) a spike history buffer for LTP and a stdp_trace for LTD.
+    """
+
     def __init__(self, weight: float):
         self.weight = weight
 
-    def forward(self, time, source, destination):
-        self.weight = self.LTP(self.weight, source.potential, source.time, time)
-        self.weight = self.LTD(self.weight, source.time, time)
-        # extend lif_ed here with additional attributes for timestamp buffer
+    def forward(
+        self,
+        t: n2.receives.time,
+        src: n2.receives.source,
+        dst: n2.receives.destination,
+    ):
+        # TODO: implement lazy STDP
+        # LTP: stdp_LTP(self.weight, src.pre_trace, src.previous_time, t)
+        # LTD: stdp_LTD(self.weight, dst.stdp_trace)
+        pass
 
-    def backward(self, time, source, destination):
-        self.weight = self.LTP(self.weight, source.potential, source.time, time)
-        self.weight = self.LTD(self.weight, source.time, time)
-        # extend lif_ed here with additional attributes for timestamp buffer
-
-
-# load all neurons of group
-# for each neuron
-#   update
-# load messages with sources
-# for each message
-#   load connections and targets of message
-#   for each connection
-#     update synapse (transmit message forwards)
-#     receive
-# whenever a send is made: neuron send + all incoming connections back-transmit
-
-# OBSERVATION: since the synapse can add attributes to source and destination for buffers, there is no need to specify which type they are!
-# This STDP Synapse would work with ANY type, and only checking at transpilation that the type there matches is needed.
-# The interaction only comes from the neuron code needing to know the weight!
-# The synapse code does not need to know anything about the neuron code in this case!
-
-# enforce back-transmission cannot change self attributes!
-# if it does, a backwards search is needed, slowing computation, so its forbidden for now
+    def backward(
+        self,
+        t: n2.receives.time,
+        src: n2.receives.source,
+        dst: n2.receives.destination,
+    ):
+        # Backward pass is forbidden from modifying self attributes to avoid
+        # requiring a reverse spike search (which would break event-driven perf).
+        pass

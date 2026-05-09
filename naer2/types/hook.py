@@ -36,11 +36,12 @@ class Hook:
         # Ensure 'self' is the first parameter if it is a parameter
         self_adjust = 0
         for index, param in enumerate(params):
+            annotation_name = getattr(param.annotation, "__name__", str(param.annotation))
             debug(
                 "Found parameter: "
                 + str(param.name)
                 + " , type: "
-                + str(param.annotation.__name__)
+                + annotation_name
                 + " , kind: "
                 + str(param.kind)
                 + " , default: "
@@ -54,24 +55,38 @@ class Hook:
                 else:
                     self_adjust = 1
 
-        # Map type annotation types to their parameter names
+        # Map annotated parameter types to their names (excludes unannotated params)
         type_to_name = {
             param.annotation: param.name
             for param in params[self_adjust:]
             if param.annotation != Parameter.empty
         }
 
-        # Ensure all annotations are allowed and unique
+        # All annotations must be from the allowed set
         if set(type_to_name.keys()) - allowed_types:
             raise TypeError(
                 f"{self.name} arguments can only use types inside the allowed set."
             )
 
-        # Ensure all parameters are annotated
-        if len(type_to_name) != len(params) - self_adjust:
+        # Required parameters (no default) must be annotated.
+        # Optional parameters (with a default) may be unannotated — the framework
+        # will not dispatch to them by type, but they can still receive values
+        # positionally (e.g. the optional target_region in pattern callbacks).
+        for param in params[self_adjust:]:
+            if param.annotation == Parameter.empty and param.default == Parameter.empty:
+                raise TypeError(
+                    f"Required parameter '{param.name}' of '{self.name}' must be "
+                    f"annotated with an allowed type."
+                )
+
+        # Annotated parameters must use unique types (the framework dispatches by type)
+        annotated = [p for p in params[self_adjust:] if p.annotation != Parameter.empty]
+        if len(type_to_name) != len(annotated):
             raise TypeError(
-                f"All parameters (except 'self') of {self.name} must be uniquely annotated with allowed types."
+                f"Annotated parameters of '{self.name}' must each use a unique type "
+                f"(found duplicate annotations)."
             )
+
         # We now have a valid hook with the function and a map to get the parameter names
         self.parameter_type_to_name: dict[Type, str] = type_to_name
         return self
