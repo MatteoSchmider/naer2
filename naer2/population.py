@@ -83,9 +83,29 @@ class Population:
 
     def __rshift__(self, right):
         from .connection import ConnectionBuilder
+
         return ConnectionBuilder(self).connect(right)
 
-    def compile(self):
-        pass
-        # transpiler = ClassTranspiler()
-        # transpiler.compile(self.instance, self.connections)
+    def compile(self):  # returns ast.Module
+        import ast
+
+        from .transpiler.context import TranspilerContext
+        from .transpiler.hook_transpiler import HookTranspiler
+        from .transpiler.kernel_builder import KernelBuilder
+
+        ctx = TranspilerContext(
+            static_attrs={
+                k: v
+                for k, v in self.instance.__dict__.items()
+                if k not in self.dynamic_attrs
+            },
+            dynamic_attrs=self.dynamic_attrs,
+        )
+
+        kernel_ast = (
+            KernelBuilder(ctx)
+            .add_update(HookTranspiler(self.node.update, ctx).emit())
+            .build()
+        )
+
+        return kernel_ast

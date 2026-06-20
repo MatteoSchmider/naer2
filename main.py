@@ -15,11 +15,15 @@ pop_b = lif_cd(1.0, 0.0, 0.9) * 5
 
 conn = pop_a >> static_synapse(0.5) @ all_to_all >> pop_b
 
-pop_a.compile()
 print(pop_a, pop_b)
 print(pop_b.network.populations)
 print(conn)
 print(pop_b.network.connections)
+
+import ast
+
+print(ast.unparse(pop_a.compile()))
+# print(ast.dump(pop_a.compile(), indent=4))
 
 
 """
