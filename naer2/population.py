@@ -104,7 +104,7 @@ class Population:
 
         kernel_ast = (
             KernelBuilder(ctx)
-            .add_update(HookTranspiler(self.node.update, ctx).emit())
+            .add_section(HookTranspiler(self.node.update, ctx).emit())
             .build()
         )
 

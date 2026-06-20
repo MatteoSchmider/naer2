@@ -2,168 +2,72 @@ import ast
 
 from .context import TranspilerContext
 
+_EXPR = lambda src: ast.parse(src, mode="eval").body
+_STMTS = lambda src: ast.parse(src).body
 
-def _tl(attr: str) -> ast.Attribute:
-    """tl.<attr>"""
-    return ast.Attribute(
-        value=ast.Name(id="tl", ctx=ast.Load()),
-        attr=attr,
-        ctx=ast.Load(),
-    )
-
-
-def _call(func: ast.expr, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
-    return ast.Call(
-        func=func,
-        args=list(args),
-        keywords=[ast.keyword(arg=k, value=v) for k, v in kwargs.items()],
-    )
-
-
-def _name(id: str, store: bool = False) -> ast.Name:
-    return ast.Name(id=id, ctx=ast.Store() if store else ast.Load())
-
-
-def _ptr(attr: str) -> ast.Name:
-    return _name(f"{attr}_ptr")
-
-
-def _load_stmt(attr: str) -> ast.Assign:
-    """
-    potential = tl.load(potential_ptr + offsets, mask=mask)
-
-    Emitted before each hook body for every dynamic attr. Loads the entire
-    group's values into a local block-level variable for the hook to operate on.
-    """
-    return ast.Assign(
-        targets=[_name(attr, store=True)],
-        value=_call(
-            _tl("load"),
-            ast.BinOp(left=_ptr(attr), op=ast.Add(), right=_name("offsets")),
-            mask=_name("mask"),
-        ),
-    )
-
-
-def _store_stmt(attr: str) -> ast.Expr:
-    """
-    tl.store(potential_ptr + offsets, potential, mask=mask)
-
-    Emitted after each hook body for every dynamic attr. Writes modified values
-    back to global memory. A later optimisation pass can elide stores for attrs
-    that the hook only reads.
-    """
-    return ast.Expr(
-        value=_call(
-            _tl("store"),
-            ast.BinOp(left=_ptr(attr), op=ast.Add(), right=_name("offsets")),
-            _name(attr),
-            mask=_name("mask"),
-        )
-    )
+_SPMD_BOILERPLATE = """\
+pid = tl.program_id(0)
+offsets = pid * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+mask = offsets < n_neurons
+"""
 
 
 class KernelBuilder:
     """
     Assembles a Triton kernel ast.Module for a single population group.
 
-    Hooks are added in simulation order (update → receive → send). Each
-    contributes a block of statements sandwiched between the shared boilerplate
-    that computes SPMD offsets and loads/stores dynamic attr tensors.
+    The caller (Population.compile) adds sections in execution order via
+    add_section() — the builder is agnostic to whether a section came from
+    an update, receive, or send hook. Population and Node own that ordering.
 
-    Only update is wired in the first vertical slice; receive and send hooks
-    will slot in between the load and store sections as they are implemented.
+    The only thing the builder needs from the context is dynamic_attrs, which
+    determines the kernel's pointer parameters and the load/store framing
+    around the section bodies. Additional args (spike buffers, weight pointers
+    for connections) will be added to the signature by the caller as needed.
 
-    Generated kernel signature:
+    Generated signature:
+        @triton.jit
         def population_kernel(
             <attr>_ptr, ...,   # one pointer per dynamic attr
-            n_neurons,         # total population size (for masking)
+            n_neurons,
             GROUP_SIZE: tl.constexpr,
         ):
     """
 
     def __init__(self, context: TranspilerContext):
         self.context = context
-        self._update_stmts: list[ast.stmt] = []
+        self._sections: list[list[ast.stmt]] = []
 
-    def add_update(self, stmts: list[ast.stmt]) -> "KernelBuilder":
-        self._update_stmts = stmts
+    def add_section(self, stmts: list[ast.stmt]) -> "KernelBuilder":
+        """Append a block of hook statements to the kernel body in order."""
+        self._sections.append(stmts)
         return self
 
     def build(self) -> ast.Module:
-        body: list[ast.stmt] = []
+        body = list(_STMTS(_SPMD_BOILERPLATE))
 
-        # pid = tl.program_id(0)
-        body.append(
-            ast.Assign(
-                targets=[_name("pid", store=True)],
-                value=_call(_tl("program_id"), ast.Constant(value=0)),
-            )
-        )
-
-        # offsets = pid * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        body.append(
-            ast.Assign(
-                targets=[_name("offsets", store=True)],
-                value=ast.BinOp(
-                    left=ast.BinOp(
-                        left=_name("pid"),
-                        op=ast.Mult(),
-                        right=_name("GROUP_SIZE"),
-                    ),
-                    op=ast.Add(),
-                    right=_call(
-                        _tl("arange"), ast.Constant(value=0), _name("GROUP_SIZE")
-                    ),
-                ),
-            )
-        )
-
-        # mask = offsets < n_neurons
-        body.append(
-            ast.Assign(
-                targets=[_name("mask", store=True)],
-                value=ast.Compare(
-                    left=_name("offsets"),
-                    ops=[ast.Lt()],
-                    comparators=[_name("n_neurons")],
-                ),
-            )
-        )
-
-        # Load all dynamic attrs
         for attr in self.context.dynamic_attrs:
-            body.append(_load_stmt(attr))
+            body += _STMTS(f"{attr} = tl.load({attr}_ptr + offsets, mask=mask)")
 
-        # Hook bodies (update only for now)
-        body.extend(self._update_stmts)
+        for section in self._sections:
+            body.extend(section)
 
-        # Store all dynamic attrs
         for attr in self.context.dynamic_attrs:
-            body.append(_store_stmt(attr))
+            body += _STMTS(f"tl.store({attr}_ptr + offsets, {attr}, mask=mask)")
 
-        # Kernel function arguments
-        constexpr_annotation = _tl("constexpr")
         func = ast.FunctionDef(
             name="population_kernel",
             args=ast.arguments(
                 posonlyargs=[],
                 args=[
-                    *[
-                        ast.arg(arg=f"{attr}_ptr")
-                        for attr in self.context.dynamic_attrs
-                    ],
+                    *[ast.arg(arg=f"{attr}_ptr") for attr in self.context.dynamic_attrs],
                     ast.arg(arg="n_neurons"),
-                    ast.arg(arg="GROUP_SIZE", annotation=constexpr_annotation),
+                    ast.arg(arg="GROUP_SIZE", annotation=_EXPR("tl.constexpr")),
                 ],
-                vararg=None,
-                kwonlyargs=[],
-                kw_defaults=[],
-                kwarg=None,
-                defaults=[],
+                vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[],
             ),
             body=body,
-            decorator_list=[_tl("jit")],  # triton.jit added by KernelBuilder caller
+            decorator_list=[_EXPR("triton.jit")],
             returns=None,
         )
 
