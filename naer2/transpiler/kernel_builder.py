@@ -37,6 +37,12 @@ class KernelBuilder:
     def __init__(self, context: TranspilerContext):
         self.context = context
         self._sections: list[list[ast.stmt]] = []
+        self._extra_args: list[str] = []
+
+    def add_arg(self, name: str) -> "KernelBuilder":
+        """Add a pointer arg to the kernel signature without auto load/store."""
+        self._extra_args.append(name)
+        return self
 
     def add_section(self, stmts: list[ast.stmt]) -> "KernelBuilder":
         """Append a block of hook statements to the kernel body in order."""
@@ -61,6 +67,7 @@ class KernelBuilder:
                 posonlyargs=[],
                 args=[
                     *[ast.arg(arg=f"{attr}_ptr") for attr in self.context.dynamic_attrs],
+                    *[ast.arg(arg=f"{name}_ptr") for name in self._extra_args],
                     ast.arg(arg="n_neurons"),
                     ast.arg(arg="GROUP_SIZE", annotation=_EXPR("tl.constexpr")),
                 ],

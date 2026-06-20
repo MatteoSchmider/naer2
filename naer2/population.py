@@ -32,7 +32,7 @@ class Population:
         self.network: Network = Network(self)
 
         # Debug
-        debug(self.dynamic_attrs)
+        # debug(self.dynamic_attrs)
 
         # need to decide:
         # attributes may be dynamic if they are changed in a connection as well!
@@ -105,6 +105,8 @@ class Population:
         kernel_ast = (
             KernelBuilder(ctx)
             .add_section(HookTranspiler(self.node.update, ctx).emit())
+            .add_section(HookTranspiler(self.node.send, ctx).emit())
+            .add_arg("spikes")
             .build()
         )
 

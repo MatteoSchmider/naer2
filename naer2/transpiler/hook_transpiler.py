@@ -4,6 +4,53 @@ import copy
 from ..types.hook import Hook
 from .context import TranspilerContext
 
+_STMTS = lambda src: ast.parse(src).body
+
+
+class _SpikeTransformer(ast.NodeTransformer):
+    """
+    Lowers if-blocks containing n2.spike() to vectorized Triton masked ops.
+
+    Input (after _SelfAttrTransformer):
+        if potential > 1.0:
+            potential = 0.0
+            n2.spike()
+
+    Output:
+        _fire_mask = mask & (potential > 1.0)
+        potential = tl.where(_fire_mask, 0.0, potential)
+        tl.store(spikes_ptr + offsets, _fire_mask, mask=mask)
+
+    ast.Assign nodes in the body become tl.where calls. Other statement types
+    (e.g. AugAssign, function calls that aren't n2.spike()) are left as-is before
+    the tl.store — this is intentional: handle the common case now, revisit when
+    needed. Non-spike if-blocks are left completely untouched.
+    """
+
+    def _is_spike_call(self, node: ast.stmt) -> bool:
+        return (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "spike"
+        )
+
+    def visit_If(self, node: ast.If):
+        if not any(self._is_spike_call(s) for s in node.body):
+            return self.generic_visit(node)
+
+        cond = ast.unparse(node.test)
+        result = list(_STMTS(f"_fire_mask = mask & ({cond})"))
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    name = ast.unparse(target)
+                    value = ast.unparse(stmt.value)
+                    result += _STMTS(f"{name} = tl.where(_fire_mask, {value}, {name})")
+            elif self._is_spike_call(stmt):
+                result += _STMTS("tl.store(spikes_ptr + offsets, _fire_mask, mask=mask)")
+        return result
+
 
 class _SelfAttrTransformer(ast.NodeTransformer):
     """
@@ -61,8 +108,8 @@ class HookTranspiler:
         self.context = context
 
     def emit(self) -> list[ast.stmt]:
-        # Deep-copy so the Hook's stored AST is never mutated
         func_copy = copy.deepcopy(self.hook.ast)
         transformed = _SelfAttrTransformer(self.context).visit(func_copy)
+        transformed = _SpikeTransformer().visit(transformed)
         ast.fix_missing_locations(transformed)
         return transformed.body
