@@ -1,9 +1,7 @@
-import naer2 as np
-
-# TODO: standardize t_mem, implement t_ref here, use same differential equation for both lif types
+import naer2 as n2
 
 
-@np.node(
+@n2.node(
     send="send",
     receive={"excitatory": "receive_excitatory", "inhibitory": "receive_inhibitory"},
     update="update",
@@ -15,20 +13,16 @@ class lif_cd_weightless:
         self.t_mem = t_mem
         self.potential: float = v_reset
 
+    def update(self):
+        self.potential *= self.t_mem
+
     def send(self):
         if self.potential > self.v_thresh:
             self.potential = self.v_reset
-            np.spike()
+            n2.spike()
 
-    def receive_excitatory(
-        self, time: np.time, connection: np.connection, source: np.source
-    ):
+    def receive_excitatory(self, time: n2.receives.time, edge: n2.receives.edge, source: n2.receives.source):
         self.potential += 1.0
 
-    def receive_inhibitory(
-        self, time: np.time, connection: np.connection, source: np.source
-    ):
-        self.potential += 1.0
-
-    def update(self):
-        self.potential *= self.t_mem
+    def receive_inhibitory(self, time: n2.receives.time, edge: n2.receives.edge, source: n2.receives.source):
+        self.potential -= 1.0

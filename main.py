@@ -6,24 +6,27 @@ logging.basicConfig(
 
 from test.all_to_all import all_to_all
 from test.lif_cd import lif_cd
+from test.lif_cd_weightless import lif_cd_weightless
+from test.lif_ed import lif_ed
 from test.static_synapse import static_synapse
 
 # to let 780M (gfx1103) be used, fake gfx1100 with 'export HSA_OVERRIDE_GFX_VERSION=11.0.0'
 
 pop_a = lif_cd(1.0, 0.0, 0.9) * 10
 pop_b = lif_cd(1.0, 0.0, 0.9) * 5
+pop_ed = lif_ed(1.0, 0.0, 0.9, 4) * 10
+pop_cw = lif_cd_weightless(1.0, 0.0, 0.9) * 10
 
 conn = pop_a >> static_synapse(0.5) @ all_to_all >> pop_b
 
-print(pop_a, pop_b)
-print(pop_b.network.populations)
-print(conn)
-print(pop_b.network.connections)
-
 import ast
 
+print("=== lif_cd ===")
 print(ast.unparse(pop_a.compile()))
-# print(ast.dump(pop_a.compile(), indent=4))
+print("=== lif_ed ===")
+print(ast.unparse(pop_ed.compile()))
+print("=== lif_cd_weightless ===")
+print(ast.unparse(pop_cw.compile()))
 
 
 """
