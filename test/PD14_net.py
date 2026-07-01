@@ -6,13 +6,19 @@ from .PD14_poisson import PD14_poisson
 from .PD14_synapse import PD14_synapse
 
 """
-Units: times in ms, potentials in mV, currents in nA, resistances in MOhm.
-  1 nA * 1 MOhm = 1 mV
+Implementation notes (Potjans & Diesmann 2014):
 
-Synaptic weights are PSC amplitudes in nA, derived from the spec's PSP amplitude
-J = 0.15 mV via J_unit(tau_m=10ms, tau_s=0.5ms, R_m=40MOhm) ≈ 87.81 pA = 0.08781 nA.
-Exception: E23→E4 uses 2*J/J_unit ≈ 0.17562 nA.
-Inhibitory weights: -4*J/J_unit ≈ -0.35124 nA.
+Units: ms / mV / nA / MOhm  (1 nA × 1 MOhm = 1 mV).
+
+Weights: PSC amplitudes in nA from spec PSP J=0.15 mV via
+  J_unit(tau_m=10, tau_s=0.5, R_m=40) ≈ 0.08781 nA (excitatory),
+  -4 × J_unit ≈ -0.35124 nA (inhibitory), 2 × J_unit ≈ 0.17562 nA (E23→E4).
+
+Neuron: exact propagator integration (Rotter & Diesmann 1999) with fixed dt=0.1 ms.
+  Background input (nu_ext=8 Hz × K_cortical) approximated as DC via V_rest shift;
+  full spec requires explicit Poisson background generators.
+
+Pending framework support: per-synapse delay routing, initial V tensor assignment.
 """
 
 _J_E = 0.08781  # nA — excitatory PSC amplitude
@@ -87,7 +93,8 @@ def build(desc: dict = description):
             conn = (
                 populations[source] >> PD14_synapse() @ pattern >> populations[target]
             )
-            conn.weight = torch.normal(w_mean, w_std, conn.shape).clamp(min=0)
+            weights = torch.normal(w_mean, w_std, conn.shape)
+            conn.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
             conn.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
 
     return populations["T"].network

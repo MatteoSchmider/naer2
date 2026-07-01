@@ -5,51 +5,40 @@ logging.basicConfig(
 )
 # to let 780M (gfx1103) be used, fake gfx1100 with 'export HSA_OVERRIDE_GFX_VERSION=11.0.0'
 
-import ast
 from test import PD14_net
 
 net = PD14_net.build()
-print(net)
 
+pops = sorted(net.populations, key=lambda p: int(p.shape[0][1]), reverse=True)
+conns = sorted(net.connections, key=lambda c: int(c.source.shape[0][1]), reverse=True)
 
-"""
-class AllToAll:
-    def __init__(self):
-        self.all_to_all = True
+print(f"\n{'='*60}")
+print(f"Network: {len(pops)} populations, {len(conns)} connections")
 
+print(f"\nPopulations:")
+for pop in pops:
+    name = type(pop.instance).__name__
+    size = int(pop.shape[0][1])
+    print(f"  {name:<20} n={size:>6}  dyn={list(pop.dynamic_attrs)}")
 
-# ideal, full connection flow
-pop_a = lif_cd(1, 2, 3) * 10
-pop_b = lif_cd(1, 2, 3) * 20
-conn = pop_a >> stdp_synapse_timestamp(1.0) @ AllToAll() >> pop_b
-conn.source.map(to_edge={"s": "strength"}, to_target={"s": "s_strength"})
-conn.target.select_port("input").map(
-    from_edge={"w": "weight"}, to_edge={"s": "s_strength"}
-)
+# Largest cortical population
+pop = pops[0]
+name = type(pop.instance).__name__
+size = int(pop.shape[0][1])
+static = {k: v for k, v in pop.instance.__dict__.items() if k not in pop.dynamic_attrs}
+print(f"\n--- Population: {name} (n={size}) ---")
+print(f"  static:  {static}")
+print(f"  dynamic: {list(pop.dynamic_attrs)}")
+if hasattr(pop, "potential"):
+    t = pop.potential
+    print(f"  potential: n={t.numel()}, mean={t.mean():.2f}, std={t.std():.2f}, range=[{t.min():.2f}, {t.max():.2f}]")
 
-pop_a.net == pop_b.net == conn.net
-pop_a.simulate(
-    10
-)  # simulate for 10 timesteps -> find other populations and assemble into a transient network object, all new populations are added to the network once there is an instance
-pop_a.net.simulate(10)
-
-# if no mappings/ports needed, it's just:
-pop_a >> stdp_synapse_timestamp(1.0) @ AllToAll() >> pop_b
-# or explicitly:
-conn = naer.Connection(
-    source=pop_a,
-    edge=stdp_synapse_timestamp(1.0),
-    target=pop_b,
-    pattern=AllToAll(),
-)
-# the operators are evaluated like this btw:
-pop_a >> ((stdp_synapse_timestamp(1.0) @ AllToAll()) >> pop_b)
-"""
-
-
-# OBSERVATION:
-# by making populations the core building blocks and generating kernels anyways, we can eliminate the need for global spike management structures!
-# => connections and connection group arrays and offset arrays can all be allocated separately!
-# => to avoid scattered loading of offsets for time-ordered spikes in node kernel, let population kernel also generate a spike management kernel for just its population
-# ==> then we can parallelize by executing kernels in parallel, instead of globalizing and letting a single kernel parallelize over spikes
-# ===> might be a little slower this way, but much more flexible
+# Largest connection
+conn = conns[0]
+src = conn.source
+tgt = conn._target
+print(f"\n--- Connection: {type(src.instance).__name__}(n={int(src.shape[0][1])}) → {type(tgt.instance).__name__}(n={int(tgt.shape[0][1])}) ---")
+print(f"  edge:   {type(conn._fabric.instance).__name__}")
+print(f"  weight: n={conn.weight.numel()}, mean={conn.weight.mean():.5f}, std={conn.weight.std():.5f}, range=[{conn.weight.min():.5f}, {conn.weight.max():.5f}]")
+print(f"  delay:  n={conn.delay.numel()}, mean={conn.delay.mean():.3f}, std={conn.delay.std():.3f}, range=[{conn.delay.min():.3f}, {conn.delay.max():.3f}]")
+print(f"{'='*60}")

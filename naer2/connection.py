@@ -124,6 +124,22 @@ class ConnectionBuilder:
             return self.pattern(to)
         raise ValueError(f"Cannot connect to {to!r}")
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Total connection count as a 1-D shape tuple, for pre-allocating weight/delay tensors.
+
+        Requires target to be set and the pattern to implement n_connections(N_x, N_y).
+        """
+        if self._target is None:
+            raise ValueError("shape requires target to be set first")
+        N_x = int(self.source.shape[0][1])
+        N_y = int(self._target.shape[0][1])
+        if not hasattr(self._pattern, "n_connections"):
+            raise NotImplementedError(
+                f"pattern {self._pattern!r} does not implement n_connections(N_x, N_y)"
+            )
+        return (self._pattern.n_connections(N_x, N_y),)
+
     def __rshift__(self, to) -> "ConnectionBuilder | Connection":
         return self.connect(to)
 
