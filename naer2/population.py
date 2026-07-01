@@ -81,6 +81,10 @@ class Population:
     def ports(self):
         return self.node.receive.keys()
 
+    @property
+    def incoming_connections(self):
+        return [c for c in self.network.connections if c._target is self]
+
     def __rshift__(self, right):
         from .connection import ConnectionBuilder
 

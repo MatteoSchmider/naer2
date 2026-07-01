@@ -66,12 +66,19 @@ class KernelBuilder:
             args=ast.arguments(
                 posonlyargs=[],
                 args=[
-                    *[ast.arg(arg=f"{attr}_ptr") for attr in self.context.dynamic_attrs],
+                    *[
+                        ast.arg(arg=f"{attr}_ptr")
+                        for attr in self.context.dynamic_attrs
+                    ],
                     *[ast.arg(arg=f"{name}_ptr") for name in self._extra_args],
                     ast.arg(arg="n_neurons"),
                     ast.arg(arg="GROUP_SIZE", annotation=_EXPR("tl.constexpr")),
                 ],
-                vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
             ),
             body=body,
             decorator_list=[_EXPR("triton.jit")],

@@ -36,7 +36,9 @@ class Hook:
         # Ensure 'self' is the first parameter if it is a parameter
         self_adjust = 0
         for index, param in enumerate(params):
-            annotation_name = getattr(param.annotation, "__name__", str(param.annotation))
+            annotation_name = getattr(
+                param.annotation, "__name__", str(param.annotation)
+            )
             # debug(
             #    "Found parameter: "
             #    + str(param.name)
@@ -46,7 +48,7 @@ class Hook:
             #    + str(param.kind)
             #    + " , default: "
             #    + str(param.default)
-            #)
+            # )
             if param.name == "self":
                 if index != 0:
                     raise TypeError(

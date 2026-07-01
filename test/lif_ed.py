@@ -22,7 +22,9 @@ class lif_ed:
             self.last_time += self.t_ref
             n2.spike()
 
-    def receive(self, time: n2.receives.time, edge: n2.receives.edge, source: n2.receives.source):
+    def receive(
+        self, time: n2.receives.time, edge: n2.receives.edge, source: n2.receives.source
+    ):
         dt = time - self.last_time
         if dt < 0:
             return
