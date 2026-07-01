@@ -3,30 +3,13 @@ import logging
 logging.basicConfig(
     format="{%(filename)s:%(lineno)d} %(levelname)s - %(message)s", level=logging.DEBUG
 )
-
-from test.all_to_all import all_to_all
-from test.lif_cd import lif_cd
-from test.lif_cd_weightless import lif_cd_weightless
-from test.lif_ed import lif_ed
-from test.static_synapse import static_synapse
-
 # to let 780M (gfx1103) be used, fake gfx1100 with 'export HSA_OVERRIDE_GFX_VERSION=11.0.0'
 
-pop_a = lif_cd(1.0, 0.0, 0.9) * 10
-pop_b = lif_cd(1.0, 0.0, 0.9) * 5
-pop_ed = lif_ed(1.0, 0.0, 0.9, 4) * 10
-pop_cw = lif_cd_weightless(1.0, 0.0, 0.9) * 10
-
-conn = pop_a >> static_synapse(0.5) @ all_to_all >> pop_b
-
 import ast
+from test import PD14_net
 
-print("=== lif_cd ===")
-print(ast.unparse(pop_a.compile()))
-print("=== lif_ed ===")
-print(ast.unparse(pop_ed.compile()))
-print("=== lif_cd_weightless ===")
-print(ast.unparse(pop_cw.compile()))
+net = PD14_net.build()
+print(net)
 
 
 """

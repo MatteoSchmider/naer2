@@ -11,6 +11,8 @@ _EDGE_RECEIVE_TYPES = {time, source, destination}
 
 
 def edge(
+    cls=None,
+    *,
     forward: str = "forward",
     backward: str = "backward",
 ) -> Callable[[type], type]:
@@ -20,8 +22,10 @@ def edge(
     forward/backward hooks may annotate any subset of (time, source, destination).
     A static synapse with no dynamics can have hooks with no parameters at all.
 
-    Usage requires parentheses: @n2.edge()
+    Supports both @n2.edge and @n2.edge(forward=...) forms.
     """
+    if cls is not None:
+        return edge_decorator(cls, forward, backward)
 
     def wrapper(cls):
         return edge_decorator(cls, forward, backward)

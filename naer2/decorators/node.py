@@ -8,11 +8,18 @@ from ..types import Hook
 
 
 def node(
+    cls=None,
+    *,
     send: str = "send",
     receive: str | dict[str, str] = "receive",
     update: str = "update",
 ) -> Callable[[type], type]:
-    """Class decorator to define a node with send/update/receive hooks."""
+    """Class decorator to define a node with send/update/receive hooks.
+
+    Supports both @n2.node and @n2.node(send=...) forms.
+    """
+    if cls is not None:
+        return node_decorator(cls, send, receive, update)
 
     def wrapper(cls):
         return node_decorator(cls, send, receive, update)
@@ -29,6 +36,8 @@ def node_decorator(
         )
 
     match receive_name:
+        case None:
+            receive_funcs = {}
         case str():
             receive_funcs = {
                 receive_name: Hook("receive", getattr(cls, receive_name)).verify(
@@ -44,12 +53,12 @@ def node_decorator(
             }
         case _:
             raise ValueError(
-                f"'receive' must be a string or dict[str, str] (got {type(receive_name).__name__}) in decorator for {cls.__name__}"
+                f"'receive' must be a string, dict[str, str], or None (got {type(receive_name).__name__}) in decorator for {cls.__name__}"
             )
 
     node_types[cls] = Node(
-        send=Hook("send", getattr(cls, str(send_name))).verify(set()),
-        update=Hook("update", getattr(cls, str(update_name))).verify(set()),
+        send=Hook("send", getattr(cls, str(send_name))).verify({time}),
+        update=Hook("update", getattr(cls, str(update_name))).verify({time}),
         receive=receive_funcs,
     )
 

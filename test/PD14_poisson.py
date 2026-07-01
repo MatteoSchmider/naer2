@@ -1,27 +1,27 @@
+import math
+import random
+
 import naer2 as n2
 
 
-@n2.node
+@n2.node(receive=None)
 class PD14_poisson:
     def __init__(
         self,
-        v_T: float,
-        t_start: float,
-        t_stop: float,
+        rate: float,  # spikes/ms  (e.g. 0.12 ≈ 120 Hz)
+        t_start: float,  # ms
+        t_stop: float,  # ms
     ):
-        self.v_T = v_T
+        self.rate = rate
         self.t_start = t_start
         self.t_stop = t_stop
+        self.next_spike: float = t_start
 
-    def update(self, time: n2.updates.time):
-        if self.t_stop > time > self.t_start:
-            # TODO:
-            # generate next spike based on Poisson process
-            pass
+    def update(self, time: n2.time):
+        pass
 
-    def send(self, time: n2.sends.time):
-        if 0 <= self.next_spike <= time:
-            n2.spike()
-            # TODO:
-            # generate next spike here
-            pass
+    def send(self, time: n2.time):
+        if self.t_start <= time <= self.t_stop:
+            if self.next_spike <= time:
+                n2.spike()
+                self.next_spike += -math.log(random.random()) / self.rate

@@ -120,7 +120,7 @@ class ConnectionBuilder:
             return self.target(Population(to, 1))
         if to.__class__ in edge_types:
             return self.fabric(Fabric(to))
-        if to in pattern_types or callable(to):
+        if to in pattern_types or type(to) in pattern_types or callable(to):
             return self.pattern(to)
         raise ValueError(f"Cannot connect to {to!r}")
 
