@@ -13,6 +13,16 @@ which evaluates (due to @ > >> precedence) as:
      └─ ConnectionBuilder(pop_a)
          .connect(_PartialConnection(edge, pattern))   # sets fabric + pattern
          .connect(pop_b)                               # sets target, returns Connection
+                                                       # and eagerly builds Topology
+
+Delay lives on Connection and is set after the connection is created, either via
+attribute assignment or the | pipe shorthand:
+
+    conn = pop_a >> edge @ pattern >> pop_b
+    conn.delay = 1.5                        # homogeneous scalar
+    conn.delay = delay_tensor               # per-link tensor
+
+    conn = pop_a >> edge @ pattern >> pop_b | delay_tensor  # pipe shorthand
 
 MAPPINGS
 Two maps can be set on a connection:
@@ -32,19 +42,20 @@ from .fabric import Fabric
 from .nodes import node_types
 from .patterns import pattern_types
 from .population import Population
+from .topology import Topology
 
 
 class ConnectionBuilder:
     def __init__(self, source: Population):
-        self.source: Population = source
-        # Private state — underscore-prefixed so builder methods (target, fabric,
-        # pattern …) are not shadowed by same-named instance attributes.
+        self._source: Population = source
         self._target: Population = None
         self._fabric: Fabric = None
         self._pattern: Callable = None
+        self._topology: Topology = None
         self._target_port: str = None
         self._source_map: dict[str, str | Set[str]] = None
         self._fabric_map: dict[str, str] = None
+        self._target_shape: tuple[int, ...] = (1,)
 
     # ------------------------------------------------------------------ builder API
 
@@ -55,9 +66,13 @@ class ConnectionBuilder:
             else:
                 raise ValueError(f"target {target!r} is not a Population")
         self._target = target
-        self.source.network += target.network
+        self._source.network += target.network
+        if self._pattern is not None:
+            self._topology = Topology.build(
+                self._pattern, self._source.shape, target.shape
+            )
         conn = Connection(self)
-        self.source.network.connections.add(conn)
+        self._source.network.connections.add(conn)
         return conn
 
     def fabric(self, fabric: Fabric) -> "ConnectionBuilder":
@@ -79,9 +94,13 @@ class ConnectionBuilder:
         if not isinstance(target_port, str):
             raise ValueError("target port must be a string")
         if self._target is None:
-            raise ValueError(f"Cannot set target port '{target_port}' before target is set")
+            raise ValueError(
+                f"Cannot set target port '{target_port}' before target is set"
+            )
         if target_port not in self._target.ports:
-            raise ValueError(f"target port '{target_port}' does not exist in {self._target!r}")
+            raise ValueError(
+                f"target port '{target_port}' does not exist in {self._target!r}"
+            )
         self._target_port = target_port
         return self
 
@@ -100,18 +119,11 @@ class ConnectionBuilder:
     # ------------------------------------------------------------------ connect dispatch
 
     def connect(self, to) -> "ConnectionBuilder | Connection":
-        """
-        Dispatch-based connect: figures out what `to` is and applies it.
-
-        Accepts:
-          _PartialConnection  — unpacks fabric + pattern (result of edge @ pattern)
-          Population          — sets as target, finalises the connection
-          node class instance — auto-wrapped into a size-1 Population, then target
-          edge instance       — wraps in Fabric and sets as fabric
-          pattern callable    — sets as pattern
-        """
+        """Dispatch-based connect: figures out what `to` is and applies it."""
         if isinstance(to, _PartialConnection):
-            self._fabric = Fabric(to.edge) if not isinstance(to.edge, Fabric) else to.edge
+            self._fabric = (
+                Fabric(to.edge) if not isinstance(to.edge, Fabric) else to.edge
+            )
             self._pattern = to.pattern
             return self
         if isinstance(to, Population):
@@ -124,35 +136,12 @@ class ConnectionBuilder:
             return self.pattern(to)
         raise ValueError(f"Cannot connect to {to!r}")
 
-    @property
-    def shape(self) -> tuple[int, ...]:
-        """Total connection count as a 1-D shape tuple, for pre-allocating weight/delay tensors.
-
-        Requires target to be set and the pattern to implement n_connections(N_x, N_y).
-        """
-        if self._target is None:
-            raise ValueError("shape requires target to be set first")
-        N_x = int(self.source.shape[0][1])
-        N_y = int(self._target.shape[0][1])
-        if not hasattr(self._pattern, "n_connections"):
-            raise NotImplementedError(
-                f"pattern {self._pattern!r} does not implement n_connections(N_x, N_y)"
-            )
-        return (self._pattern.n_connections(N_x, N_y),)
-
     def __rshift__(self, to) -> "ConnectionBuilder | Connection":
         return self.connect(to)
 
     # ------------------------------------------------------------------ at / @
 
     def at(self, place) -> "ConnectionBuilder":
-        """
-        Specify port or aliasing for the most recently set endpoint.
-
-        String argument → target port name.
-        Dict argument   → source_map or fabric_map depending on context
-                          (see MAPPINGS in module docstring).
-        """
         if isinstance(place, str):
             self.target_port(place)
             return self
@@ -164,28 +153,57 @@ class ConnectionBuilder:
         if self._fabric is None:
             self.source_map(place)
             return self
-        # Both fabric and target set: treat as fabric_map
         self.edge_map(place)
         return self
 
     def __matmul__(self, mapping_or_port) -> "ConnectionBuilder":
         return self.at(mapping_or_port)
 
+    # -------------------------------------------------------------------- properties
+    @property
+    def shape(self) -> tuple[int, ...]:
+        if self._topology is None:
+            raise ValueError("shape requires target to be set first")
+        return self._topology.shape
+
 
 class Connection:
-    """
-    A fully or partially specified connection between two populations.
-
-    While not finished, attribute access is forwarded to the builder so the
-    connection can continue to be configured after creation.
-    """
+    """A fully or partially specified connection between two populations."""
 
     def __init__(self, builder: ConnectionBuilder):
         self.builder = builder
         self.finished = False
+        self._delay = None
 
     def finish(self):
         self.finished = True
+
+    # Properties defined on the class take precedence over __getattr__,
+    # so these are readable without forwarding to the builder.
+
+    @property
+    def source(self) -> Population:
+        return self.builder._source
+
+    @property
+    def topology(self) -> Topology:
+        return self.builder._topology
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.builder.shape
+
+    @property
+    def delay(self):
+        return self._delay
+
+    @delay.setter
+    def delay(self, value):
+        self._delay = value
+
+    def __or__(self, value) -> "Connection":
+        self.delay = value
+        return self
 
     def __getattr__(self, name):
         if not self.finished:

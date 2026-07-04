@@ -1,21 +1,23 @@
-import torch
 from abc import ABC
+
+import torch
 
 
 class Position(ABC):
     """
-    A single point in a neuron's coordinate space.
+    A single point in a Population's coordinate space.
 
     Position is the source_id passed to a pattern callback — it identifies
-    one specific neuron within a source Region. The concrete subtype mirrors
-    the Region it is drawn from: neurons in an IndexBox are identified by
-    IndexPosition, neurons in a ContinuousBox by ContinuousPosition.
+    one specific node within a source Region. The concrete subtype mirrors
+    the Region it is drawn from: nodes in an IndexBox are identified by
+    IndexPosition, nodes in a ContinuousBox by ContinuousPosition.
 
     Tensor shape: rank-1, [ndim], where ndim is the dimensionality of the
-    coordinate space (1 for a flat population, 2 for a cortical sheet, etc.).
+    coordinate space (1 for a flat population, 2 for a sheet, etc.).
 
-    Position is an ABC so that isinstance(x, Position) works for type
-    verification in pattern Hook.verify() and connection validation.
+    Subtypes:
+    - IndexPosition
+    - ContinuousPosition
     """
 
 

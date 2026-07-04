@@ -14,11 +14,12 @@ Weights: PSC amplitudes in nA from spec PSP J=0.15 mV via
   J_unit(tau_m=10, tau_s=0.5, R_m=40) ≈ 0.08781 nA (excitatory),
   -4 × J_unit ≈ -0.35124 nA (inhibitory), 2 × J_unit ≈ 0.17562 nA (E23→E4).
 
-Neuron: exact propagator integration (Rotter & Diesmann 1999) with fixed dt=0.1 ms.
+Neuron: exact propagator integration (Rotter & Diesmann 1999) with dynamic dt,
+  so the same code works for fixed-step and event-driven simulation.
   Background input (nu_ext=8 Hz × K_cortical) approximated as DC via V_rest shift;
   full spec requires explicit Poisson background generators.
 
-Pending framework support: per-synapse delay routing, initial V tensor assignment.
+Pending framework support: per-synapse delay routing in propagation kernel.
 """
 
 _J_E = 0.08781  # nA — excitatory PSC amplitude
@@ -93,8 +94,8 @@ def build(desc: dict = description):
             conn = (
                 populations[source] >> PD14_synapse() @ pattern >> populations[target]
             )
+            conn.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
             weights = torch.normal(w_mean, w_std, conn.shape)
             conn.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
-            conn.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
 
     return populations["T"].network

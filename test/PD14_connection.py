@@ -17,10 +17,6 @@ class PD14_connection:
     def __init__(self, probability: float):
         self.probability = probability
 
-    def n_connections(self, N_x: int, N_y: int) -> int:
-        Q_yx = math.log(1 - self.probability) / math.log(1 - 1 / (N_x * N_y))
-        return max(1, round(Q_yx))
-
     def __call__(
         self, position: Position, source_region: Region, target_region=None
     ) -> Region:
