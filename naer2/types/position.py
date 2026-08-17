@@ -57,6 +57,11 @@ class _BasePosition(Position):
     def __repr__(self):
         return f"{type(self).__name__}({self._coords})"
 
+    def __eq__(self, other):
+        if not isinstance(other, type(self)):
+            return False
+        return self._coords == other._coords
+
     @staticmethod
     def _check_dtype(coords: torch.Tensor):
         raise NotImplementedError

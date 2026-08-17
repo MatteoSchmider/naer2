@@ -1,31 +1,25 @@
+import inspect
+
 import torch
 
+from naer2.types.position import Position
+
 from .types.box import _BaseBox
-from .types.points import _BasePoints
 from .types.region import Region
 
 
 class Topology:
     """
-    Sparse directed mapping from source nodes to target nodes.
+    Sparse directed mapping from source nodes to target nodes, in CSR format.
 
-    Built eagerly on the CPU by iterating every point in the source region
-    and running the pattern once per point. Stored in CSR format so per-source
-    fan-out is O(1) to look up.
+    Built by running a connection pattern once per source point. Each source
+    point is independent — the build is embarrassingly parallel and will be
+    moved to GPU in the future.
 
-    The build loop is embarrassingly parallel: each source point is independent.
-    Future GPU version: launch one thread per source point, call
-    source_region.position_at(program_id) to get the position, run the pattern
-    as a Triton kernel, and write targets into a pre-allocated output buffer.
+    source_offsets  [N_src + 1] int64 — CSR row pointers
+    target_indices  [n_links]   int64 — flat target node indices
 
-    Attributes:
-        source_offsets  [N_src + 1] int64 — CSR row pointers
-        target_indices  [n_links]   int64 — flat target node indices
-
-    TODO:
-    - parallelize build over source points (multiprocessing, then GPU)
-    - nD target indexing: flatten target position → linear index via target strides
-    - support all Region subtypes as both source and target
+    TODO: parallelize build; nD target flattening; support all Region subtypes
     """
 
     def __init__(self, source_offsets: torch.Tensor, target_indices: torch.Tensor):
@@ -40,33 +34,54 @@ class Topology:
         return len(self.target_indices)
 
     @staticmethod
-    def build(pattern, source_region: Region, target_region: Region) -> "Topology":
-        """Run pattern for every source point and accumulate results into CSR."""
-        offsets = [0]
+    def _build_target_region(pattern, source_region: Region):
+        target_points = []
+        for pos in enumerate(source_region.points):
+            for point in pattern(Position(pos), source_region):
+                target_points.append(point)
+        return Region(set(target_points))
+
+    @staticmethod
+    def build(pattern, source_region: Region, target_region: Region = None):
+        """
+        Run pattern for every source point and build CSR topology.
+
+        Returns Topology when target_region is given.
+        Returns (Topology, inferred_target_region) when target_region is None,
+        where the inferred region is the smallest 1D IndexBox covering all
+        generated indices. Use this form for self-defining patterns that produce
+        absolute target indices without needing a pre-specified target extent.
+
+        Patterns with a third parameter (target_region) receive it even when
+        None. Patterns with only (position, source_region) never receive it.
+        """
+        takes_target = len(inspect.signature(pattern.__call__).parameters) > 2
+
+        offsets = torch.zeros(len(source_region) + 1, dtype=torch.int64)
         rows: list[torch.Tensor] = []
 
-        for pos in source_region:
-            result = pattern(pos, source_region, target_region)
+        if target_region is None:
+            target_region = Topology._build_target_region(pattern, source_region)
 
-            if isinstance(result, _BasePoints):
-                targets = result.coords[:, 0].to(torch.int64)
-            elif isinstance(result, _BaseBox):
-                targets = torch.arange(
-                    int(result.start[0].item()),
-                    int(result.stop[0].item()),
-                    int(result.step[0].item()),
-                    dtype=torch.int64,
-                )
+        for i, pos in enumerate(source_region.points):
+            result = (
+                pattern(pos, source_region, target_region)
+                if takes_target
+                else pattern(pos, source_region)
+            )
+            # generate instantaneous target index rows
+            if target_region is not None:
+                row = torch.zeros(result.shape[0], dtype=torch.int64)
+                for i, target_pos in enumerate(result):
+                    row[i] = (target_region.points == target_pos.coords).nonzero(
+                        as_tuple=True
+                    )[0]
             else:
-                targets = torch.zeros(0, dtype=torch.int64)
-
-            rows.append(targets)
-            offsets.append(offsets[-1] + len(targets))
-
-        source_offsets = torch.tensor(offsets, dtype=torch.int64)
+                row = torch.zeros(0, dtype=torch.int64)
+            rows.append(row)
+            offsets[i + 1] = offsets[i] + len(row)
         target_indices = (
-            torch.cat(rows)
-            if rows and any(len(r) > 0 for r in rows)
-            else torch.zeros(0, dtype=torch.int64)
+            torch.cat(rows) if offsets[-1] > 0 else torch.zeros(0, dtype=torch.int64)
         )
-        return Topology(source_offsets, target_indices)
+        topology = Topology(offsets, target_indices)
+        return topology, target_region

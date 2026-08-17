@@ -34,12 +34,17 @@ class _BasePoints:
         self._check_dtype(value)
         self._coords = value
 
+    @property
+    def points(self):
+        return self._coords
+
     # ---------------------------------------------------------------------- iteration
 
     def __len__(self) -> int:
         return int(self._coords.shape[0])
 
     def __iter__(self):
+        # Optimize this to make it like in Box too...
         for i in range(len(self)):
             yield self.position_at(i)
 
@@ -86,6 +91,7 @@ class IndexPoints(_BasePoints):
 
     def _make_position(self, coords: torch.Tensor):
         from .position import IndexPosition
+
         return IndexPosition(coords)
 
 
@@ -99,6 +105,7 @@ class ContinuousPoints(_BasePoints):
 
     def _make_position(self, coords: torch.Tensor):
         from .position import ContinuousPosition
+
         return ContinuousPosition(coords)
 
 

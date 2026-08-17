@@ -45,25 +45,12 @@ class _BaseBox:
         else:
             self._coords = value
 
-    # ---------------------------------------------------------------------- views
-
-    @property
-    def start(self) -> torch.Tensor:
-        return self._coords[:, 0]
-
-    @property
-    def stop(self) -> torch.Tensor:
-        return self._coords[:, 1]
-
-    @property
-    def step(self) -> torch.Tensor:
-        return self._coords[:, 2]
-
     @property
     def sizes(self) -> torch.Tensor:
         """Number of lattice points per dimension."""
         return torch.ceil(
-            (self.stop.float() - self.start.float()) / self.step.float()
+            (self._coords[:, 1].float() - self._coords[:, 0].float())
+            / self._coords[:, 2].float()
         ).to(torch.int64)
 
     # ---------------------------------------------------------------------- iteration
@@ -71,31 +58,14 @@ class _BaseBox:
     def __len__(self) -> int:
         return int(self.sizes.prod().item())
 
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self.position_at(i)
-
-    def position_at(self, i: int):
-        """
-        Convert a flat linear index to a Position in this box.
-
-        Row-major: last dimension varies fastest. Pure arithmetic — substitute
-        a Triton program_id for i to parallelize over the full point set.
-        """
-        sizes = self.sizes
-        ndim = int(sizes.shape[0])
-        coords_list = []
-        remainder = i
-        for d in range(ndim - 1, -1, -1):
-            size_d = int(sizes[d].item())
-            coords_list.append(
-                self.start[d].item() + (remainder % size_d) * self.step[d].item()
-            )
-            remainder //= size_d
-        coords_list.reverse()
-        return self._make_position(torch.tensor(coords_list, dtype=self._coords.dtype))
-
-    # ---------------------------------------------------------------------- index / proxy
+    @property
+    def points(self):
+        return torch.cartesian_prod(
+            *[
+                torch.arange(self.coords[d, 0], self.coords[d, 1], self.coords[d, 2])
+                for d in range(self.coords.shape[0])
+            ]
+        )
 
     def __getitem__(self, idx):
         return self._coords[idx]
@@ -137,6 +107,7 @@ class IndexBox(_BaseBox):
 
     def _make_position(self, coords: torch.Tensor):
         from .position import IndexPosition
+
         return IndexPosition(coords)
 
 
@@ -154,6 +125,7 @@ class ContinuousBox(_BaseBox):
 
     def _make_position(self, coords: torch.Tensor):
         from .position import ContinuousPosition
+
         return ContinuousPosition(coords)
 
 
