@@ -135,7 +135,7 @@ class Topology:
         If the pattern class exposes target_region(source_region) analytically,
         that is called instead of the infer pass (option B — not yet implemented).
         """
-        takes_target = len(inspect.signature(pattern.__call__).parameters) > 2
+        takes_target = len(inspect.signature(pattern).parameters) > 2
 
         def call(pos):
             return (
