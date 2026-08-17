@@ -44,9 +44,8 @@ class _BasePoints:
         return int(self._coords.shape[0])
 
     def __iter__(self):
-        # Optimize this to make it like in Box too...
-        for i in range(len(self)):
-            yield self.position_at(i)
+        for row in self._coords:
+            yield self._make_position(row)
 
     def position_at(self, i: int):
         """

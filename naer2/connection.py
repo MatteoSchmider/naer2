@@ -71,7 +71,7 @@ class ConnectionBuilder:
         else:
             self._target = target
             if self._pattern is not None:
-                self._topology, _ = Topology.build(
+                self._topology = Topology.build(
                     self._pattern, self._source.shape, target.shape
                 )
         self._source.network += self._target.network

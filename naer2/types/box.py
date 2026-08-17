@@ -10,13 +10,11 @@ class _BaseBox:
     [ndim, 2] tensor, a default step column is appended automatically.
 
     Iteration and position_at(i) expose every lattice point in the box in
-    row-major order (last dimension varies fastest). For a 1D IndexBox [0, N, 1]
-    this is just the N integers 0 … N-1. For nD it is the Cartesian product.
+    row-major order (last dimension varies fastest). position_at(i) is pure
+    arithmetic — no materialisation — making it GPU-parallel: substitute a
+    Triton program_id for i and the computation is modulo + multiply-add.
 
-    position_at(i) is designed to be GPU-parallel: replace i with a Triton
-    program_id and the computation is pure arithmetic — no branches, no loops.
-    For IndexBox that means integer modulo + multiply-add; for ContinuousBox
-    the same in floating point.
+    points materialises all lattice points as [n, ndim] — useful for batch ops.
 
     Boxes serve two roles:
       1. Population shape — the full extent of a population's neuron space.
@@ -40,10 +38,23 @@ class _BaseBox:
             )
         self._check_dtype(value)
         if value.shape[1] == 2:
-            step = self._default_step(value)
-            self._coords = torch.cat([value, step.unsqueeze(1)], dim=1)
+            self._coords = torch.cat([value, self._default_step(value).unsqueeze(1)], dim=1)
         else:
             self._coords = value
+
+    # ---------------------------------------------------------------------- views
+
+    @property
+    def start(self) -> torch.Tensor:
+        return self._coords[:, 0]
+
+    @property
+    def stop(self) -> torch.Tensor:
+        return self._coords[:, 1]
+
+    @property
+    def step(self) -> torch.Tensor:
+        return self._coords[:, 2]
 
     @property
     def sizes(self) -> torch.Tensor:
@@ -59,13 +70,47 @@ class _BaseBox:
         return int(self.sizes.prod().item())
 
     @property
-    def points(self):
-        return torch.cartesian_prod(
-            *[
-                torch.arange(self.coords[d, 0], self.coords[d, 1], self.coords[d, 2])
-                for d in range(self.coords.shape[0])
-            ]
-        )
+    def points(self) -> torch.Tensor:
+        """All lattice points as [n, ndim] — row-major order."""
+        ranges = [
+            torch.arange(
+                self._coords[d, 0].item(),
+                self._coords[d, 1].item(),
+                self._coords[d, 2].item(),
+                dtype=self._coords.dtype,
+            )
+            for d in range(self._coords.shape[0])
+        ]
+        pts = torch.cartesian_prod(*ranges)
+        if pts.ndim == 1:  # cartesian_prod on a single range returns 1D
+            pts = pts.unsqueeze(1)
+        return pts
+
+    def position_at(self, i: int):
+        """
+        Convert flat linear index to Position — pure arithmetic, no materialisation.
+
+        Row-major: last dimension varies fastest. GPU-parallel: substitute a
+        Triton program_id for i.
+        """
+        sizes = self.sizes
+        ndim = int(sizes.shape[0])
+        coords_list = []
+        remainder = i
+        for d in range(ndim - 1, -1, -1):
+            size_d = int(sizes[d].item())
+            coords_list.append(
+                self._coords[d, 0].item() + (remainder % size_d) * self._coords[d, 2].item()
+            )
+            remainder //= size_d
+        coords_list.reverse()
+        return self._make_position(torch.tensor(coords_list, dtype=self._coords.dtype))
+
+    def __iter__(self):
+        for row in self.points:   # points computed once; rows are tensor views
+            yield self._make_position(row)
+
+    # ---------------------------------------------------------------------- index / proxy
 
     def __getitem__(self, idx):
         return self._coords[idx]
@@ -107,7 +152,6 @@ class IndexBox(_BaseBox):
 
     def _make_position(self, coords: torch.Tensor):
         from .position import IndexPosition
-
         return IndexPosition(coords)
 
 
@@ -125,7 +169,6 @@ class ContinuousBox(_BaseBox):
 
     def _make_position(self, coords: torch.Tensor):
         from .position import ContinuousPosition
-
         return ContinuousPosition(coords)
 
 
