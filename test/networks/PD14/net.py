@@ -1,9 +1,9 @@
 import torch
 
-from .PD14_connection import PD14_connection
-from .PD14_neuron import PD14_neuron
-from .PD14_poisson import PD14_poisson
-from .PD14_synapse import PD14_synapse
+from .connection import PD14_connection
+from .neuron import PD14_neuron
+from .poisson import PD14_poisson
+from .synapse import PD14_synapse
 
 """
 Implementation notes (Potjans & Diesmann 2014):

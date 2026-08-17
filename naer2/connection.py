@@ -128,7 +128,7 @@ class ConnectionBuilder:
         if isinstance(to, Population):
             return self.target(to)
         if to.__class__ in node_types:
-            return self.target(Population(to, 1))
+            return self.target(to)  # target() handles size-1 vs infer
         if to.__class__ in edge_types:
             return self.fabric(Fabric(to))
         if to in pattern_types or type(to) in pattern_types or callable(to):
