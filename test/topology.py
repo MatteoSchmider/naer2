@@ -41,7 +41,7 @@ pop_3 = lif_cd(v_thresh=-50, v_reset=-65, t_mem=0.99) * 3
 
 conn1 = pop_4 >> static_synapse(weight=1.0) @ all_to_all >> pop_3
 
-topo1 = conn1._topology
+topo1 = conn1.fabric.topology
 assert len(topo1) == 12
 for i in range(4):
     s, e = int(topo1.source_offsets[i]), int(topo1.source_offsets[i + 1])
@@ -82,7 +82,7 @@ pop_tgt = Population(lif_cd(v_thresh=-50, v_reset=-65, t_mem=0.99), ContinuousPo
 
 conn2 = pop_src >> static_synapse(weight=1.0) @ by_distance(0.3) >> pop_tgt
 
-topo2 = conn2._topology
+topo2 = conn2.fabric.topology
 assert len(topo2) == 7
 assert [int(topo2.source_offsets[i+1]) - int(topo2.source_offsets[i]) for i in range(3)] == [2, 3, 2]
 print("2. distance-threshold ContinuousPoints ✓")
@@ -118,7 +118,7 @@ pop_grid_tgt = lif_cd(v_thresh=-50, v_reset=-65, t_mem=0.99) * (3, 3)
 
 conn3 = pop_grid_src >> static_synapse(weight=1.0) @ neighborhood_4 >> pop_grid_tgt
 
-topo3 = conn3._topology
+topo3 = conn3.fabric.topology
 assert len(topo3) == 24
 s, e = int(topo3.source_offsets[4]), int(topo3.source_offsets[5])  # flat index 4 = (1,1)
 assert sorted(topo3.target_indices[s:e].tolist()) == [1, 3, 5, 7]
@@ -143,7 +143,7 @@ def double_index(pos: Position, src: Region):  # src unused — pattern depends 
 pop_5 = lif_cd(v_thresh=-50, v_reset=-65, t_mem=0.99) * 5
 conn4 = pop_5 >> static_synapse(weight=1.0) @ double_index >> lif_cd(v_thresh=-50, v_reset=-65, t_mem=0.99)
 
-topo4 = conn4._topology
+topo4 = conn4.fabric.topology
 assert len(topo4) == 10
 assert len(conn4._target.shape) == 10  # inferred: neurons 0..9
 for i in range(5):

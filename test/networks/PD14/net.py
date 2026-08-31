@@ -94,8 +94,8 @@ def build(desc: dict = description):
             conn = (
                 populations[source] >> PD14_synapse() @ pattern >> populations[target]
             )
-            conn.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
+            conn.fabric.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
             weights = torch.normal(w_mean, w_std, conn.shape)
-            conn.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
+            conn.fabric.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
 
     return populations["T"].network

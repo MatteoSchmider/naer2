@@ -1,3 +1,109 @@
+think through what is needed from fabric from the POV of making a single kernel to update all the things in one go with minimal memory reuse
+and choose what fabric owns and who owns fabric and who owns connection from there
+
+
+def pop_kernel_pseudo_code(
+        num_spikes: tl.tensor,
+        spike_times: tl.tensor,
+        spike_targets: tl.tensor,
+        spike_sources: tl.tensor,
+        pop_dyn_attr1: tl.tensor,
+        pop_dyn_attr2: tl.tensor
+        fabric1_dyn_attr1: tl.tensor,
+        fabric1_dyn_attr2: tl.tensor,
+        fabric2_dyn_attr1: tl.tensor,
+        fabric2_dyn_attr2: tl.tensor
+        current_time: tl.tensor
+        prev_time: tl.tensor
+):
+    # update population to current timestep
+    update_population(pop_dyn_attr1, pop_dyn_attr2, current_time, prev_time)
+    # see if spikes were generated
+    send_poopulation(pop_dyn_attr1, pop_dyn_attr2, current_time, prev_time)
+    # receive spikes
+    for i in range(num_spikes):
+        source = spike_sources[i]
+        target = spike_targets[i]
+        time = spike_times[i]
+        update_fabric(source, target, fabric1_dyn_attr1, fabric1_dyn_attr2, fabric2_dyn_attr1, fabric2_dyn_attr2, current_time, prev_time)
+        send_fabric(source, target, fabric1_dyn_attr1, fabric1_dyn_attr2, fabric2_dyn_attr1, fabric2_dyn_attr2, current_time, prev_time)
+
+
+
+
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Object ownership and simulation architecture (agreed 2026-08-17)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Network                         — orchestrator only
+#   populations: Set[Population]
+#   connections: Set[Connection]  — kept for inspection / compilation passes
+#
+# Population                      — N neurons
+#   node: Node                    — type info + hook ASTs (@n2.node)
+#   state: dict[str, Tensor]      — [N] per-neuron tensors
+#   incoming: List[Connection]    — connections targeting this population (assigned by target())
+#   last_update: float            — timestamp of the last kernel execution
+#   advance(t)                    — called by Network.step; decides if kernel is needed
+#
+# Connection                      — source → fabric → target (owns Fabric)
+#   source: Population
+#   target: Population
+#   fabric: Fabric
+#
+# Fabric                          — M edges (self-contained edge bundle)
+#   edge: Edge                    — type info + hook ASTs (@n2.edge)
+#   topology: Topology            — CSR: source_offsets [N_src+1], target_indices [M]
+#   state: dict[str, Tensor]      — [M] per-link tensors (weight, delay, …)
+#   dynamic_attrs / static_attrs  — which attributes are per-link vs constant
+#   forward(spike_mask, src, tgt) — edge kernel stub (eventual Triton kernel)
+#
+# KEY DECISIONS:
+#
+#   Topology lives in Fabric, not Connection.  They belong together because M
+#   (the link count) determines the shape of every per-link tensor in state.
+#
+#   Per-link tensors (weight, delay, …) are fabric attributes routed to
+#   fabric.state by __setattr__/__getattr__: fabric.weight = tensor is
+#   equivalent to fabric.state['weight'] = tensor.
+#
+#   Populations own their incoming connections.  The update kernel receives
+#   spikes via the CSR topology of each incoming Fabric, updates per-link edge
+#   state, then applies the weighted inputs to the population's neurons — all
+#   in one kernel that touches only local memory.
+#
+#   Population.advance(t) decides whether to run the kernel:
+#     - autonomous dynamics (update hook assigns state): run every sub-step
+#     - input-only (update hook assigns nothing): run only when
+#       t - last_update >= min(incoming delay across all incoming connections)
+#
+#   Network.step(t_step) finds the smallest such delay across all input-only
+#   populations and uses it as sub_dt.  It then loops, advancing self.t by
+#   sub_dt and broadcasting to all populations, until t_step is consumed.
+#
+#   Network.step(dt) is the single entry point for fixed-step simulation.
+#   It iterates populations in order; ordering policy (within-step vs
+#   next-step delivery) is the one thing only the network can decide.
+#
+#   In event-driven mode, spikes can propagate along outgoing connections
+#   without a global loop: each population push es to its outgoing fabrics,
+#   which push to their target populations.  Network still needed as entry
+#   point for non-fully-connected graphs.
+#
+# EXECUTION MODEL (deferred):
+#   - update+send kernel: compiled per Population from node hooks
+#   - edge forward kernel: compiled per Fabric from edge hooks + topology
+#   - spike routing: spike_mask [N] → CSR scatter → PSC accumulation in target
+#   - delay buffering: deferred (ring buffer or event queue per connection)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 # entirely new approach:
 # populations are sets!
 # => patterns generate 1D indices!

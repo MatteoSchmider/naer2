@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import naer2\")"
+      "Bash(python -c \"import naer2\")",
+      "Bash(python -m test.simulation)"
     ]
   }
 }

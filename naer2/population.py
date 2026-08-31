@@ -1,4 +1,7 @@
+import math
 from logging import debug
+
+import torch
 
 from .network import Network
 from .nodes import Node, node_types
@@ -28,6 +31,8 @@ class Population:
             else:
                 self.dynamic_attrs[member] = instance.__dict__[member].__class__
         self.instance = instance
+        self.incoming: list = []  # Connection objects whose target is this population
+        self.last_update: float = -math.inf
 
         self.network: Network = Network(self)
 
@@ -82,20 +87,67 @@ class Population:
         return self.node.receive.keys()
 
     @property
-    def incoming_connections(self):
-        return [c for c in self.network.connections if c._target is self]
+    def has_autonomous_dynamics(self) -> bool:
+        """True when the update hook modifies state, so the network clock must drive it."""
+        return bool(self.node.update.assigned_members)
+
+    def _min_incoming_delay(self) -> float:
+        """Smallest per-link delay across all incoming connections."""
+        min_d = math.inf
+        for conn in self.incoming:
+            d = getattr(conn.fabric, "delay", None)
+            if d is None:
+                continue
+            min_d = min(
+                min_d,
+                float(d.min().item()) if isinstance(d, torch.Tensor) else float(d),
+            )
+        return min_d
+
+    def advance(self, t: float):
+        """Called by Network.step — run both kernels if an update is due at time t."""
+        if self.has_autonomous_dynamics:
+            self._execute_gather_kernel(t)
+            self._execute_update_kernel(t)
+            self.last_update = t
+        else:
+            min_d = self._min_incoming_delay()
+            if min_d < math.inf and t - self.last_update >= min_d:
+                self._execute_gather_kernel(t)
+                self._execute_update_kernel(t)
+                self.last_update = t
+
+    def _execute_gather_kernel(self, t: float):
+        """Kernel 1 stub: collect incoming spikes from all incoming connections,
+        interleave and sort them by arrival time, producing a merged spike buffer
+        (spike_tgt, spike_link per connection) for the update kernel.
+        """
+        pass
+
+    def _execute_update_kernel(self, t: float):
+        """Kernel 2 stub: merged update-receive-send.
+        Consumes the spike buffer produced by the gather kernel, applies receive
+        hooks per connection, then runs the update and send hooks across all neurons.
+        """
+        pass
 
     def __rshift__(self, right):
         from .connection import ConnectionBuilder
 
         return ConnectionBuilder(self).connect(right)
 
-    def compile(self):  # returns ast.Module
+    def compile(self) -> "ast.Module":
+        """Compile the merged update-receive-send kernel for this population.
+
+        Pairs each incoming connection with its transpiled receive-hook stmts,
+        then feeds them — along with the update and send sections — into
+        UpdateKernelTemplate to produce the final ast.Module.
+        """
         import ast
 
         from .transpiler.context import TranspilerContext
         from .transpiler.hook_transpiler import HookTranspiler
-        from .transpiler.kernel_builder import KernelBuilder
+        from .transpiler.templates.update_kernel import UpdateKernelTemplate
 
         ctx = TranspilerContext(
             static_attrs={
@@ -106,12 +158,17 @@ class Population:
             dynamic_attrs=self.dynamic_attrs,
         )
 
-        kernel_ast = (
-            KernelBuilder(ctx)
-            .add_section(HookTranspiler(self.node.update, ctx).emit())
-            .add_section(HookTranspiler(self.node.send, ctx).emit())
-            .add_arg("spikes")
-            .build()
-        )
+        # one transpiled receive section per incoming connection
+        incoming_with_hooks = []
+        for conn in self.incoming:
+            port = conn._target_port or "receive"
+            hook = self.node.receive.get(port)
+            recv_stmts = HookTranspiler(hook, ctx).emit() if hook else []
+            incoming_with_hooks.append((conn, recv_stmts))
 
-        return kernel_ast
+        update_section = HookTranspiler(self.node.update, ctx).emit()
+        send_section = HookTranspiler(self.node.send, ctx).emit()
+
+        return UpdateKernelTemplate(ctx, incoming_with_hooks).build(
+            update_section, send_section
+        )

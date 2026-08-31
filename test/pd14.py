@@ -47,17 +47,17 @@ print(
     f"\n--- Connection: {type(src.instance).__name__}(n={int(src.shape[0][1])}) "
     f"→ {type(tgt.instance).__name__}(n={int(tgt.shape[0][1])}) ---"
 )
-print(f"  edge:   {type(conn._fabric.instance).__name__}")
+print(f"  edge:   {type(conn.fabric.instance).__name__}")
 print(
-    f"  weight: mean={conn.weight.mean():.5f}, std={conn.weight.std():.5f}, "
-    f"range=[{conn.weight.min():.5f}, {conn.weight.max():.5f}]"
+    f"  weight: mean={conn.fabric.weight.mean():.5f}, std={conn.fabric.weight.std():.5f}, "
+    f"range=[{conn.fabric.weight.min():.5f}, {conn.fabric.weight.max():.5f}]"
 )
 print(
-    f"  delay:  mean={conn.delay.mean():.3f}, std={conn.delay.std():.3f}, "
-    f"range=[{conn.delay.min():.3f}, {conn.delay.max():.3f}]"
+    f"  delay:  mean={conn.fabric.delay.mean():.3f}, std={conn.fabric.delay.std():.3f}, "
+    f"range=[{conn.fabric.delay.min():.3f}, {conn.fabric.delay.max():.3f}]"
 )
 
-topo = conn._topology
+topo = conn.fabric.topology
 fan_out = topo.source_offsets[1:] - topo.source_offsets[:-1]
 print(f"\n--- Topology ---")
 print(f"  n_sources={len(topo.source_offsets)-1}, n_links={len(topo)}")

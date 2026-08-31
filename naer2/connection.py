@@ -46,11 +46,20 @@ class ConnectionBuilder:
         self._target: Population = None
         self._fabric: Fabric = None
         self._pattern: Callable = None
-        self._topology: Topology = None
         self._target_port: str = None
         self._source_map: dict[str, str | Set[str]] = None
         self._fabric_map: dict[str, str] = None
         self._delay: int | float | torch.Tensor = None
+
+    # ------------------------------------------------------------------ properties
+
+    @property
+    def fabric(self) -> Fabric:
+        return self._fabric
+
+    @property
+    def _topology(self):
+        return self._fabric.topology if self._fabric is not None else None
 
     # ------------------------------------------------------------------ builder API
 
@@ -60,9 +69,10 @@ class ConnectionBuilder:
                 if self._pattern is None:
                     self._target = Population(target, 1)
                 else:
-                    self._topology, inferred_region = Topology.build(
+                    topology, inferred_region = Topology.build(
                         self._pattern, self._source.shape
                     )
+                    self._fabric.topology = topology
                     self._target = Population(target, inferred_region)
             else:
                 raise ValueError(
@@ -71,15 +81,16 @@ class ConnectionBuilder:
         else:
             self._target = target
             if self._pattern is not None:
-                self._topology = Topology.build(
+                self._fabric.topology = Topology.build(
                     self._pattern, self._source.shape, target.shape
                 )
         self._source.network += self._target.network
         conn = Connection(self)
         self._source.network.connections.add(conn)
+        self._target.incoming.append(conn)
         return conn
 
-    def fabric(self, fabric: Fabric) -> "ConnectionBuilder":
+    def _set_fabric(self, fabric: "Fabric | object") -> "ConnectionBuilder":
         if not isinstance(fabric, Fabric):
             if fabric.__class__ in edge_types:
                 fabric = Fabric(fabric)
@@ -130,7 +141,7 @@ class ConnectionBuilder:
         if to.__class__ in node_types:
             return self.target(to)  # target() handles size-1 vs infer
         if to.__class__ in edge_types:
-            return self.fabric(Fabric(to))
+            return self._set_fabric(Fabric(to))
         if to in pattern_types or type(to) in pattern_types or callable(to):
             return self.pattern(to)
         raise ValueError(f"Cannot connect to {to!r}")
