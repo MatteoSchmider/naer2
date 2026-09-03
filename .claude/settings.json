@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -c \"import naer2\")",
       "Bash(python -m test.simulation)",
-      "Bash(python -m test.mini_ei)"
+      "Bash(python -m test.mini_ei)",
+      "Bash(python -c ' *)"
     ]
   }
 }
