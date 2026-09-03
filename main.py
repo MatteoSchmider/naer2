@@ -7,6 +7,4 @@ logging.basicConfig(
 
 import runpy
 
-runpy.run_module("test.pd14", run_name="__main__")
-print()
-runpy.run_module("test.topology", run_name="__main__")
+runpy.run_module("test.mini_ei", run_name="__main__")

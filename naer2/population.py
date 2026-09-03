@@ -158,13 +158,31 @@ class Population:
             dynamic_attrs=self.dynamic_attrs,
         )
 
-        # one transpiled receive section per incoming connection
+        # one transpiled receive + edge-forward section per incoming connection
         incoming_with_hooks = []
         for conn in self.incoming:
             port = conn._target_port or "receive"
             hook = self.node.receive.get(port)
-            recv_stmts = HookTranspiler(hook, ctx).emit() if hook else []
-            incoming_with_hooks.append((conn, recv_stmts))
+            recv_stmts = (
+                HookTranspiler(hook, ctx).emit_for_spike_loop(set(self.dynamic_attrs))
+                if hook
+                else []
+            )
+
+            # edge forward hook (updates per-link edge state inside the spike loop)
+            edge_fwd_hook = conn.fabric.edge.get("forward")
+            if edge_fwd_hook is not None and edge_fwd_hook.assigned_members:
+                edge_ctx = TranspilerContext(
+                    static_attrs=conn.fabric.static_attrs,
+                    dynamic_attrs=conn.fabric.dynamic_attrs,
+                )
+                edge_fwd_stmts = HookTranspiler(edge_fwd_hook, edge_ctx).emit_for_spike_loop(
+                    set(conn.fabric.dynamic_attrs)
+                )
+            else:
+                edge_fwd_stmts = []
+
+            incoming_with_hooks.append((conn, recv_stmts, edge_fwd_stmts))
 
         update_section = HookTranspiler(self.node.update, ctx).emit()
         send_section = HookTranspiler(self.node.send, ctx).emit()
