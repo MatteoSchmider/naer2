@@ -48,6 +48,27 @@ class Fabric:
             if k not in dynamic_attrs
         })
 
+    # ------------------------------------------------------------------ derived
+
+    @property
+    def tensor_attrs(self) -> set[str]:
+        """Attrs that need a real per-link tensor: assigned by forward/backward
+        (dynamic_attrs), or given an explicit per-link override from outside
+        (state) even though nothing in the edge code ever assigns them — e.g.
+        a static synapse's weight set as conn.fabric.weight = tensor(...).
+
+        static_attrs is computed once at __init__ from the raw instance dict
+        and never updated when a later `fabric.attr = tensor` overrides one of
+        those names, so it alone isn't enough to tell "needs a load" apart from
+        "inline as a literal constant"; this property is the actual answer.
+        """
+        return set(self.dynamic_attrs) | set(self.state)
+
+    @property
+    def constant_attrs(self) -> dict[str, object]:
+        """Static attrs with no tensor override — safe to inline as AST literals."""
+        return {k: v for k, v in self.static_attrs.items() if k not in self.state}
+
     # ------------------------------------------------------------------ state routing
 
     def __setattr__(self, name, value):

@@ -4,7 +4,19 @@
       "Bash(python -c \"import naer2\")",
       "Bash(python -m test.simulation)",
       "Bash(python -m test.mini_ei)",
-      "Bash(python -c ' *)"
+      "Bash(python -m test.counter)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(python -c ' *)",
+      "Bash(python main.py)",
+      "Bash(cat)",
+      "Bash(python -m test.blocked)",
+      "Bash(python - *)",
+      "Bash(python -m test.semantics)",
+      "Bash(python -m test.lowering)",
+      "Bash(echo \"main exit: $?\")"
+    ],
+    "additionalDirectories": [
+      "/home/matteo/Documents/triton-test/naer2/transpiler/templates"
     ]
   }
 }

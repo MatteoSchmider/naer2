@@ -84,6 +84,14 @@ class ConnectionBuilder:
                 self._fabric.topology = Topology.build(
                     self._pattern, self._source.shape, target.shape
                 )
+        if (
+            self._target_port is not None
+            and self._target_port not in self._target.ports
+        ):
+            raise ValueError(
+                f"target_port '{self._target_port}' not in {self._target!r}"
+            )
+
         self._source.network += self._target.network
         conn = Connection(self)
         self._source.network.connections.add(conn)
@@ -108,9 +116,9 @@ class ConnectionBuilder:
     def target_port(self, target_port: str) -> "ConnectionBuilder":
         if not isinstance(target_port, str):
             raise ValueError("target port must be a string")
-        if self._target is None:
-            raise ValueError(f"Cannot set target_port before target is set")
-        if target_port not in self._target.ports:
+        # Port name may be set before the target is known (e.g. in the pre->>
+        # edge chain); validated against the target's ports once it is set.
+        if self._target is not None and target_port not in self._target.ports:
             raise ValueError(f"target_port '{target_port}' not in {self._target!r}")
         self._target_port = target_port
         return self
@@ -118,13 +126,13 @@ class ConnectionBuilder:
     def source_map(self, source_map: dict[str, str | Set[str]]) -> "ConnectionBuilder":
         if not isinstance(source_map, dict):
             raise ValueError("source_map must be a dict")
-        self._source_map = source_map
+        self._source_map = {**(self._source_map or {}), **source_map}
         return self
 
     def fabric_map(self, fabric_map: dict[str, str]) -> "ConnectionBuilder":
         if not isinstance(fabric_map, dict):
             raise ValueError("fabric_map must be a dict")
-        self._fabric_map = fabric_map
+        self._fabric_map = {**(self._fabric_map or {}), **fabric_map}
         return self
 
     # ------------------------------------------------------------------ connect dispatch
@@ -135,6 +143,10 @@ class ConnectionBuilder:
                 Fabric(to.edge) if not isinstance(to.edge, Fabric) else to.edge
             )
             self._pattern = to.pattern
+            if to.port is not None:
+                self.target_port(to.port)
+            if to.fabric_map:
+                self.fabric_map(to.fabric_map)
             return self
         if isinstance(to, Population):
             return self.target(to)
@@ -155,10 +167,13 @@ class ConnectionBuilder:
             return self
         if not isinstance(place, dict):
             raise ValueError("at() expects a port name (str) or mapping (dict)")
-        if self._target is None or self._fabric is None:
+        # Disambiguation is purely by whether the edge (fabric) is known yet:
+        # before an edge is set, a mapping renames source attributes; once the
+        # edge is set, a mapping renames edge attributes for the target's receive.
+        if self._fabric is None:
             self.source_map(place)
-            return self
-        self.fabric_map(place)
+        else:
+            self.fabric_map(place)
         return self
 
     def __matmul__(self, mapping_or_port) -> "ConnectionBuilder":
@@ -195,6 +210,27 @@ class Connection:
 
     def __or__(self, value):
         self.builder.delay(value)
+        return self
+
+    def __matmul__(self, other) -> "Connection":
+        # Post-target mapping/port, once the whole chain is already a Connection:
+        #   (A >> edge @ pattern >> B) @ {"weight": "w"}
+        # The edge is always already set by this point, so a dict here is
+        # unambiguously a fabric_map (at()'s own disambiguation confirms this).
+        #
+        # TODO: this only fires with the explicit parens shown above. Written
+        # bare — `A >> edge @ pattern >> B @ {"weight": "w"}` — @ binds tighter
+        # than >>, so `B @ {"weight": "w"}` evaluates first, hits
+        # Population.__matmul__, and produces a source_map builder for B as a
+        # brand-new source instead of a fabric_map on this Connection. A prior
+        # design used deliberately different operator binding strengths
+        # (mirroring how | already binds looser than >> for delay(), enabling
+        # `... >> B | 1.5` to work bare) so post-target @ would just work
+        # without parens; we dropped that for the current type-dispatch design,
+        # which is more robust to a user not remembering precedence rules
+        # (see Population.__matmul__'s TODO). Revisit if bare post-target
+        # chaining turns out to matter enough.
+        self.builder.at(other)
         return self
 
     def __getattr__(self, name):

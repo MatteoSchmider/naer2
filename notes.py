@@ -2,6 +2,10 @@ think through what is needed from fabric from the POV of making a single kernel 
 and choose what fabric owns and who owns fabric and who owns connection from there
 
 
+TODO next:
+- multiple input connections from different input node types
+
+
 def pop_kernel_pseudo_code(
         num_spikes: tl.tensor,
         spike_times: tl.tensor,

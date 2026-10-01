@@ -136,6 +136,29 @@ class Population:
 
         return ConnectionBuilder(self).connect(right)
 
+    def __matmul__(self, mapping):
+        """A @ {real_name: hook_name} — source_map, before any edge is known.
+
+        Returns an incomplete ConnectionBuilder (no fabric/target yet) meant to
+        be finished with >>, e.g. A @ {"potential": "src_pot"} >> edge @ pattern >> B.
+
+        TODO: this claims @ on every Population unconditionally, which is why
+        `>> B @ {mapping}` (bare, no parens) can't mean "post-target fabric_map
+        on B" — @ binds tighter than >>, so `B @ {mapping}` evaluates first and
+        hits this method, treating B as a brand-new source. Post-target mapping
+        currently requires explicit parens: `(A >> edge @ pattern >> B) @ {...}`.
+        A prior design used deliberately different operator binding strengths
+        (mirroring how | already binds looser than >> for delay()) to make bare
+        post-target chaining just work; we dropped that in favor of the current
+        type-dispatch design since it's more robust to a user not remembering
+        precedence rules. If we want bare post-target @ back, revisit that.
+        """
+        from .connection import ConnectionBuilder
+
+        if not isinstance(mapping, dict):
+            raise ValueError("Population @ mapping expects a dict (source_map)")
+        return ConnectionBuilder(self).source_map(mapping)
+
     def compile(self) -> "ast.Module":
         """Compile the merged update-receive-send kernel for this population.
 
@@ -145,6 +168,7 @@ class Population:
         """
         import ast
 
+        from .transpiler.analyzers.used_members import UsedMemberFinder
         from .transpiler.context import TranspilerContext
         from .transpiler.hook_transpiler import HookTranspiler
         from .transpiler.templates.update_kernel import UpdateKernelTemplate
@@ -163,26 +187,111 @@ class Population:
         for conn in self.incoming:
             port = conn._target_port or "receive"
             hook = self.node.receive.get(port)
+            edge_fwd_hook = conn.fabric.edge.get("forward")
+            edge_bwd_hook = conn.fabric.edge.get("backward")
+
+            # Which source.attr names (real, post-source_map) do this connection's
+            # hooks actually reference? Only those need a per-spike gather load —
+            # a source population can have dynamic attrs no connection here uses.
+            source_rename = {
+                hook_name: real for real, hook_name in (conn._source_map or {}).items()
+            }
+            used_source_names = set()
+            if hook is not None:
+                used_source_names |= UsedMemberFinder(hook.ast, "source").run()
+            if edge_fwd_hook is not None:
+                used_source_names |= UsedMemberFinder(edge_fwd_hook.ast, "source").run()
+            real_source_attrs = {source_rename.get(n, n) for n in used_source_names}
+
+            source_pop = conn._source
+            for attr in real_source_attrs:
+                if attr not in source_pop.dynamic_attrs and attr not in source_pop.instance.__dict__:
+                    raise ValueError(
+                        f"source.{attr} referenced but '{attr}' does not exist on {source_pop!r}"
+                    )
+            source_dynamic_attrs = {a for a in real_source_attrs if a in source_pop.dynamic_attrs}
+            source_static_attrs = {
+                a: source_pop.instance.__dict__[a]
+                for a in real_source_attrs
+                if a not in source_dynamic_attrs
+            }
+
+            # Which edge attrs (real, post-fabric_map) does this connection actually
+            # reference — via edge.attr in receive, or self.attr in forward/backward?
+            # Fabric.dynamic_attrs (forward/backward's *assigned* members) alone is
+            # not a reliable signal here: an attr can be read-only in backward (not
+            # yet wired into the kernel, but still worth accounting for now) without
+            # ever being assigned anywhere, or referenced only from receive and
+            # nowhere in the edge's own code at all — UsedMemberFinder catches both,
+            # same treatment as source.attr above.
+            edge_rename = {
+                hook_name: real for real, hook_name in (conn._fabric_map or {}).items()
+            }
+            used_edge_names = set()
+            if hook is not None:
+                used_edge_names |= UsedMemberFinder(hook.ast, "edge").run()
+            real_used_edge_from_receive = {edge_rename.get(n, n) for n in used_edge_names}
+            used_self_forward = (
+                UsedMemberFinder(edge_fwd_hook.ast, "self").run() if edge_fwd_hook else set()
+            )
+            used_self_backward = (
+                UsedMemberFinder(edge_bwd_hook.ast, "self").run() if edge_bwd_hook else set()
+            )
+            referenced_edge_attrs = (
+                real_used_edge_from_receive | used_self_forward | used_self_backward
+            )
+
+            for attr in referenced_edge_attrs:
+                if attr not in conn.fabric.dynamic_attrs and attr not in conn.fabric.static_attrs:
+                    raise ValueError(
+                        f"edge.{attr}/self.{attr} referenced but '{attr}' does not exist on {conn.fabric!r}"
+                    )
+            # Tensor-backed = assigned by forward/backward, or given an explicit
+            # per-link override from outside (conn.fabric.state) — same test as
+            # Fabric.tensor_attrs, just restricted to names actually referenced here.
+            edge_tensor_attrs = {
+                a for a in referenced_edge_attrs
+                if a in conn.fabric.dynamic_attrs or a in conn.fabric.state
+            }
+            edge_constant_attrs = {
+                a: conn.fabric.static_attrs[a]
+                for a in referenced_edge_attrs
+                if a not in edge_tensor_attrs
+            }
+
             recv_stmts = (
-                HookTranspiler(hook, ctx).emit_for_spike_loop(set(self.dynamic_attrs))
+                HookTranspiler(hook, ctx).emit_for_spike_loop(
+                    set(self.dynamic_attrs),
+                    fabric_map=conn._fabric_map,
+                    source_map=conn._source_map,
+                    edge_static_attrs=edge_constant_attrs,
+                    source_static_attrs=source_static_attrs,
+                )
                 if hook
                 else []
             )
 
             # edge forward hook (updates per-link edge state inside the spike loop)
-            edge_fwd_hook = conn.fabric.edge.get("forward")
             if edge_fwd_hook is not None and edge_fwd_hook.assigned_members:
                 edge_ctx = TranspilerContext(
-                    static_attrs=conn.fabric.static_attrs,
-                    dynamic_attrs=conn.fabric.dynamic_attrs,
+                    static_attrs=edge_constant_attrs,
+                    dynamic_attrs=edge_tensor_attrs,
                 )
-                edge_fwd_stmts = HookTranspiler(edge_fwd_hook, edge_ctx).emit_for_spike_loop(
-                    set(conn.fabric.dynamic_attrs)
+                edge_fwd_stmts = HookTranspiler(
+                    edge_fwd_hook, edge_ctx, self_prefix="lk_"
+                ).emit_for_spike_loop(
+                    edge_tensor_attrs,
+                    source_map=conn._source_map,
+                    source_static_attrs=source_static_attrs,
+                    mask_target=False,
+                    lane_mask="_lk_valid",
                 )
             else:
                 edge_fwd_stmts = []
 
-            incoming_with_hooks.append((conn, recv_stmts, edge_fwd_stmts))
+            incoming_with_hooks.append(
+                (conn, recv_stmts, edge_fwd_stmts, source_dynamic_attrs, edge_tensor_attrs)
+            )
 
         update_section = HookTranspiler(self.node.update, ctx).emit()
         send_section = HookTranspiler(self.node.send, ctx).emit()

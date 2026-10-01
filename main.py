@@ -8,3 +8,6 @@ logging.basicConfig(
 import runpy
 
 runpy.run_module("test.mini_ei", run_name="__main__")
+runpy.run_module("test.coverage", run_name="__main__")
+runpy.run_module("test.blocked", run_name="__main__")
+runpy.run_module("test.lowering", run_name="__main__")
