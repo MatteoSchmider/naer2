@@ -1,3 +1,5 @@
+/.claude
+/.pytest_cache
 /.venv
 /.vscode
 /__pycache__

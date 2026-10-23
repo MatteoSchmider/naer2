@@ -1,10 +1,7 @@
 # naer2 — status, findings, and plan
 
-Last updated after the link-tiling / blocked-CSR work. Run everything with
-`python main.py` (mini_ei, coverage, blocked-topology tests) and
-`python -m test.semantics` (kernel vs serial reference on Triton's CPU
-interpreter; standalone because `TRITON_INTERPRET` must be set before triton is
-first imported).
+Last updated after the test-suite restructure. See README.md for the directory
+layout. Run everything with `python -m pytest`.
 
 ## Planned order of work
 
@@ -16,12 +13,22 @@ first imported).
 2. **A new test network**, exercised **on the CPU first**, at a small and a large
    scale, before anything touches a GPU-style path.
 3. **Only then**: get kernels compiling under Triton and confirm their behavior
-   matches the CPU results. `test/semantics.py` and the compile check in
-   `test/coverage.py` are early scaffolding for this, not the plan itself;
-   the compile check is deliberately left in place but is a later-stage concern.
+   matches the CPU results — a system-test tier (needs a machine actually
+   capable of running them), deliberately not built yet. See README.md's "What's
+   deliberately not here yet". Until it exists, kernel correctness is checked by
+   unit and integration tests inspecting the generated AST.
 
 ## Done
 
+- **Test suite restructured**: `unit/` (mirrors `naer2/`'s layout 1:1, pytest,
+  no network built), `test/` (reusable nodes/edges/patterns/networks — a small
+  components library versioned with naer2 — plus `test_*.py` integration tests
+  that compile real networks and check kernel structure), `showcases/` (narrated
+  demos, not part of the test suite). Dropped everything that invoked the real
+  Triton compiler or ran a kernel (the CPU-interpreter semantics check, the
+  per-backend compile check) — that's the system-test tier from item 3 above,
+  intentionally not built yet. Old `test/misc/` scratch deleted (still in git
+  history). See README.md.
 - **Renames / fixtures.** `counter` node -> `relay`, counter test -> `coverage`.
   Population D takes three inputs through one receive port: A and B via
   `static_synapse`, C via `plastic_synapse` (different edge type -> different
@@ -38,8 +45,8 @@ first imported).
   `send` is now the single source of truth for firing (two cases: far past
   threshold -> extra spike at `time + 1.0`; else a plain spike). Spikes from
   receive and from update are still covered, with thresholds that can never
-  trigger (`1e6`), just to exercise the lowering. `test/coverage.py` pins the
-  number of emission sites per link tile.
+  trigger (`1e6`), just to exercise the lowering. `test/test_coverage.py` pins
+  the number of emission sites per link tile.
 - **Link loop vectorized (option A).** A spike's row is walked `LINK_BLOCK`
   links at a time. Two lane spaces, kept apart by name: link lanes `lk_<attr>`
   (`[LINK_BLOCK]`, edge forward runs here and stores back) and neuron lanes
@@ -56,7 +63,7 @@ first imported).
   argument, so separate tensors can't be indexed by `pid` without a pointer table
   or one launch per group; the flat layout *is* the concatenation of them.
   Per-link tensors go through `to_blocked` / `from_blocked` (permutation).
-  Tests: `test/blocked.py` (layout faithful to canonical CSR).
+  Tests: `unit/test_topology.py` (layout faithful to canonical CSR).
 - **Per-spike scalar loads.** Triton can't integer-index a tensor, so each
   unrolled spike slot loads `time`, `spike_src_j`, `spike_conn_j` directly.
 - **Math lowering.** `MathLoweringTransformer` (runs in `HookTranspiler.emit()`
@@ -68,12 +75,14 @@ first imported).
   builtin `abs` / 2-arg `min` / `max`. All-constant calls (common once static attrs
   inline) are folded at transpile time; `math.pi/e/tau` fold too. An unlisted
   `math.*` call raises instead of leaving an undefined name. Note `floor`/`ceil`/
-  `trunc` return floats in Triton. Tests: `test/lowering.py` (compiles all 30
-  functions for a CUDA and a gfx1100 target), plus a numeric check in
-  `test/semantics.py` (`probe`).
+  `trunc` return floats in Triton. The whitelist was manually verified against
+  real Triton (both a CUDA and a gfx1100 target) while developing this, but that
+  check isn't part of the live suite (system-test tier); if the whitelist grows,
+  re-verify by hand. Tests: `unit/transpiler/transformers/test_math_lowering_transformer.py`.
 - **Top-level `n2.spike()`** (outside any `if`) fires every lane the hook runs on:
   the root mask, i.e. the whole group in update / final-pass send, and just the
   delivered neurons inside a per-link receive/send (via `MaskAliasTransformer`).
+  Tests: `unit/transpiler/transformers/test_if_transformer.py`.
 - **Edge forward if-branches** now root at the link tile's validity mask
   (`_lk_valid`) via `MaskAliasTransformer(alias)`, not the neuron-group mask.
 - **Edge attr / source attr resolution**: `UsedMemberFinder` decides what to load;
@@ -83,12 +92,19 @@ first imported).
 ## Findings
 
 - **The generated kernels had never been compiled by Triton** and originally did
-  not compile at all (`unsupported tensor index` on `x[j]`). The coverage kernels
-  A-D now compile through a fake-sm_80 target (frontend -> IR -> PTX).
-- **The old serial link loop had a real bug**: every program walked every link and
-  ran the plastic weight update and store on it, so all P programs updated each
-  link. Found via a negative control in the interpreter harness (weights 1.6
-  instead of 1.2). Structurally fixed by the blocked layout.
+  not compile at all (`unsupported tensor index` on `x[j]`), confirmed by manually
+  compiling the coverage kernels A-D through a fake-sm_80 target (frontend -> IR
+  -> PTX) while developing the blocked layout and scalar per-spike loads. Not
+  re-checked automatically now (system-test tier) — the structural fix (no more
+  integer tensor indexing) is what the integration tests assert on instead.
+- **The old (pre-blocked-CSR) serial link loop had a real bug**: every program
+  walked every link and ran the plastic weight update and store on it, so all P
+  programs updated each link. Found via a negative control in a CPU-interpreter
+  harness (weights came out at 1.6 instead of 1.2) while developing the blocked
+  layout; that harness is gone (system-test tier) but the bug was structurally
+  fixed by the blocked layout itself (ownership is now positional, not a runtime
+  mask) and is covered by `unit/test_topology.py` + `test/test_coverage.py`'s
+  `_own`-mask-absence assertions.
 - *(Resolved)* mini_ei's kernels didn't compile because PD14's update hook uses
   `math.exp` on tensors; now lowered, and E and I compile. A bare top-level
   `n2.spike()` used to pass through untouched; now lowered.
@@ -123,7 +139,12 @@ first imported).
   `Population.__matmul__` / `Connection.__matmul__`.
 - A warp-uniform `if any(is_target)` around receive/send per tile is possible, but
   much less useful now that a program's tile lanes are all its own links.
-- The interpreter runs programs **sequentially**, so `test/semantics.py` checks
-  semantics, not races between programs. Nothing has run on a GPU or been timed.
+- Nothing has run on a GPU, under the Triton interpreter, or been timed, since
+  the last restructure removed that tier from the live suite — see README.md.
 - Caching/preloading connection data (source attrs, offsets) per spike block may
   pay off in some networks; needs benchmarking, likely network-dependent.
+- **Gap, not yet started**: `AttrPrefixTransformer`, `SelfAttrTransformer`,
+  `TargetMaskTransformer`, and `UsedMemberFinder`/`AssignedMemberFinder` have no
+  direct `unit/` tests yet — only exercised indirectly through `test/test_*.py`'s
+  whole-network compiles. `unit/transpiler/transformers/` and
+  `unit/transpiler/analyzers/` are the natural homes once written.

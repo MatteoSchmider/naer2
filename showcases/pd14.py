@@ -1,10 +1,10 @@
 """
-PD14 integration test — builds the full Potjans & Diesmann 2014 cortical
+PD14 showcase — builds the full Potjans & Diesmann 2014 cortical
 microcircuit and reports network statistics.
 
 Run from the project root:
-    python -m test.pd14
-    PYTHONPATH=. python test/pd14.py
+    python -m showcases.pd14
+    PYTHONPATH=. python showcases/pd14.py
 """
 import os
 import sys

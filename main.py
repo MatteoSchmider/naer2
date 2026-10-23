@@ -5,9 +5,5 @@ logging.basicConfig(
 )
 # to let 780M (gfx1103) be used: export HSA_OVERRIDE_GFX_VERSION=11.0.0
 
-import runpy
-
-runpy.run_module("test.mini_ei", run_name="__main__")
-runpy.run_module("test.coverage", run_name="__main__")
-runpy.run_module("test.blocked", run_name="__main__")
-runpy.run_module("test.lowering", run_name="__main__")
+# The test suite runs under pytest now (see README.md): `python -m pytest`.
+# This entry point is reserved for running naer2 on real hardware.

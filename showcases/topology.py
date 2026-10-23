@@ -9,8 +9,8 @@ population's coordinate space.  The builder maps those coordinates to linear
 indices to produce the CSR topology.  Four canonical patterns are shown below.
 
 Run from the project root:
-    python -m test.topology
-    PYTHONPATH=. python test/topology.py
+    python -m showcases.topology
+    PYTHONPATH=. python showcases/topology.py
 """
 import os
 import sys

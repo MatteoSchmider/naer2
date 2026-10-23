@@ -13,7 +13,9 @@
       "Bash(python - *)",
       "Bash(python -m test.semantics)",
       "Bash(python -m test.lowering)",
-      "Bash(echo \"main exit: $?\")"
+      "Bash(echo \"main exit: $?\")",
+      "Bash(.venv/bin/python -m pytest unit/ -q)",
+      "Bash(.venv/bin/python -m pytest -q)"
     ],
     "additionalDirectories": [
       "/home/matteo/Documents/triton-test/naer2/transpiler/templates"
