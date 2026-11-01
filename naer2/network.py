@@ -45,6 +45,30 @@ class Network:
                 sub_dt = d
         return sub_dt
 
+    def gather(self, t_hi: float, carry_cap: int = 64, per_src_cap: int = 64) -> dict:
+        """Two-phase spike management across the whole network (see
+        naer2/spike_gather.py and TODO.md): every population's compact()
+        first — a source can feed multiple targets, so this must run
+        exactly once per population, not once per consumer, and every
+        source's compaction must finish before any target's merge reads it
+        — then merge_incoming() for every population that has incoming
+        connections. Populations with no incoming connections have nothing
+        to merge and are omitted from the returned dict.
+
+        Every population must have had set_fresh_output() called on it this
+        round before this runs. Phase ordering is enforced by Python-level
+        sequencing here, not an explicit GPU sync: both phases launch on the
+        same (default) CUDA stream, so in-order execution already
+        guarantees phase 1 finishes before phase 2's kernels run.
+        """
+        for pop in self.populations:
+            pop.compact(t_hi, carry_cap)
+        results = {}
+        for pop in self.populations:
+            if pop.incoming:
+                results[pop] = pop.merge_incoming(per_src_cap)
+        return results
+
     def step(self, t_step: float):
         """Advance the network by t_step.
 

@@ -5,6 +5,9 @@ import torch
 
 from .network import Network
 from .nodes import Node, node_types
+from .spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes
+from .spike_gather import compact as _compact
+from .spike_gather import merge as _merge
 from .types import Region
 
 
@@ -33,6 +36,12 @@ class Population:
         self.instance = instance
         self.incoming: list = []  # Connection objects whose target is this population
         self.last_update: float = -math.inf
+
+        # Spike lifecycle (see naer2/spike_gather.py and TODO.md): _carry
+        # persists across calls, _fresh/_due are this round's only.
+        self._carry: CarryBuffer | None = None
+        self._fresh: BlockedSpikes | None = None
+        self._due: CompactedSpikes | None = None
 
         self.network: Network = Network(self)
 
@@ -130,6 +139,50 @@ class Population:
         hooks per connection, then runs the update and send hooks across all neurons.
         """
         pass
+
+    def set_fresh_output(self, blocked: BlockedSpikes) -> None:
+        """Hand off this round's freshly emitted, GROUP-blocked spikes for
+        compact() to fold in. This is the real integration seam
+        `_execute_update_kernel`'s own flush step will eventually call
+        automatically, once it stops globally compacting into one flat
+        array and leaves its local buffers blocked instead (see TODO.md) —
+        until then, callers (tests, for now) set this directly."""
+        self._fresh = blocked
+
+    def compact(self, t_hi: float, carry_cap: int = 64) -> CompactedSpikes:
+        """This population's own lifecycle step (naer2/spike_gather.py):
+        fold this round's `_fresh` (see set_fresh_output) into `_carry`
+        (created on first call, persists across calls on this population),
+        split on `t_hi`, store the due entries as `_due` for any target's
+        merge_incoming() to read this round, and return them.
+
+        Must run for every population before ANY of them call
+        merge_incoming() — a target's merge reads its sources' `_due`,
+        which this call just (re)produces; see Network.gather().
+        """
+        if self._fresh is None:
+            raise ValueError(f"{self!r} has no fresh spike output set for this round (see set_fresh_output)")
+        if self._carry is None:
+            self._carry = CarryBuffer(carry_cap, self._fresh.time.device)
+        self._due = _compact(self._fresh, self._carry, t_hi)
+        return self._due
+
+    def merge_incoming(self, per_src_cap: int = 64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """This population's merge step (naer2/spike_gather.py): combine
+        every incoming connection's source population's already-compact()ed
+        `_due` (this round) into the sorted (time, src, conn) buffer this
+        population's own update kernel would consume. conn ids are each
+        connection's index in `self.incoming`, matching compile()'s
+        conn{i}_... pointer numbering. Every source must have already run
+        compact() this round."""
+        sources = []
+        for conn in self.incoming:
+            src_due = conn._source._due
+            if src_due is None:
+                raise ValueError(f"{conn._source!r} has not run compact() this round yet")
+            sources.append(src_due)
+        conns = list(range(len(self.incoming)))
+        return _merge(sources, conns, per_src_cap)
 
     def __rshift__(self, right):
         from .connection import ConnectionBuilder

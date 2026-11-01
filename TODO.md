@@ -7,14 +7,16 @@ layout. Run everything with `python -m pytest`.
 
 1. **Spike management handling** (host side): turn each population's compacted
    output `(node, time)` buffer into the per-connection merged, time-sorted input
-   buffers `(spike_time, spike_src, spike_conn)` the update kernel consumes
-   (`Population._execute_gather_kernel` / `_execute_update_kernel` are still
-   stubs). Includes delays, which the kernel currently ignores. To be designed together.
-   - **In progress — two real Triton kernels, tested on real hardware, not yet
-     wired into Population/Network (deliberately held off until the kernels
-     themselves were right).** `naer2/spike_gather.py`, tests in
-     `test/test_spike_gather_gpu.py` (GPU-only, no CPU reference — see the
-     "Stay on GPU" entry below for why one wasn't worth building this time).
+   buffers `(spike_time, spike_src, spike_conn)` the update kernel consumes.
+   The real logic now exists (`Population.compact`/`merge_incoming`,
+   `Network.gather` — see below) but isn't plugged into
+   `Population._execute_gather_kernel` / `_execute_update_kernel` (still
+   stubs) or `Network.step()` yet — see "still open" below. Includes delays,
+   which the kernel currently ignores. To be designed together.
+   - **In progress — two real Triton kernels, wired into Population/Network.**
+     `naer2/spike_gather.py`, tests in `test/test_spike_gather_gpu.py`
+     (GPU-only, no CPU reference — see the "Stay on GPU" entry below for why
+     one wasn't worth building this time).
      Split into two kernels once lifecycle (clearing consumed spikes,
      retaining not-yet-due ones) turned out to change where sorting belongs:
      - `compact()` — owned by one source population. Folds this call's fresh,
@@ -49,14 +51,37 @@ layout. Run everything with `python -m pytest`.
      (equal timestamps across connections) get a fully deterministic,
      documented tie-break (ascending by connection id, then node), not an
      incidental one — see `test_ties_break_ascending_by_connection_then_node`.
-     Not yet handled: a `compact()`/`merge()` call bigger than its fixed
-     capacity (both use a compile-time-sized single block); real connectivity
-     feeding `BlockedSpikes` from an actual running `update_kernel` instead
-     of hand-built test fixtures; and `merge()`'s host-side wrapper still
-     does one `.item()` sync per source to pack sources into its `[K,
-     per_src_cap]` layout — fine for a standalone test, but exactly the
-     per-transfer latency floor to avoid once this is wired up for real with
-     more than one connection per target.
+     **Integration** (`Population.set_fresh_output/compact/merge_incoming`,
+     `Network.gather`), tested the same test-first way against real
+     Population/Network/Connection objects built through the normal DSL
+     (`test/networks/gather_net`: A, B -> C), in `test/test_network_gather.py`
+     — spikes controlled with static data via `set_fresh_output()` rather
+     than by running the update kernel, so this tests the *wiring* (each
+     population gets its own persistent `CarryBuffer`; `merge_incoming`'s
+     conn ids come from a connection's real index in `self.incoming`,
+     matching `compile()`'s `conn{i}_...` numbering; `Network.gather` runs
+     every population's `compact()` — a barrier — before any
+     `merge_incoming()`, both phases on the same CUDA stream so in-order
+     execution is the only sync needed), not `compact()`/`merge()`'s own
+     correctness again. Still open:
+     - `update_kernel.py`'s flush/atomic-add step hasn't changed, so nothing
+       calls `set_fresh_output()` for real yet — every real kernel run so far
+       (`test/test_gpu_hardware.py`) still produces one flat globally-
+       compacted array per call instead of leaving local buffers
+       GROUP-blocked, which is what `set_fresh_output()` actually expects.
+       `Network.step()`/`Population.advance()` aren't touched yet either —
+       `gather()` exists alongside them, not plugged into them.
+     - a `compact()`/`merge()` call bigger than its fixed capacity (both use
+       a compile-time-sized single block);
+     - `merge_incoming()`'s per-connection `.item()` sync (inherited from
+       `merge()`'s host wrapper) — fine at the connection counts tried so
+       far, but exactly the per-transfer latency floor to avoid once a
+       population has many incoming connections;
+     - true kernel concurrency across populations within a phase (`Network.
+       gather()` is correctly *phased* but still just a Python `for` loop
+       launching everything on one stream) — a performance follow-up, see
+       "parallelize kernel execution across populations" below, not a
+       correctness gap `gather()`'s phase ordering already covers that.
    - **Stay on GPU — now measured for real on the 780M, not just reasoned.**
      Earlier this was CPU-only timing plus literature-sourced PCIe/launch
      estimates (no GPU was available yet). With real hardware now working
@@ -230,22 +255,6 @@ layout. Run everything with `python -m pytest`.
   checks; per-program scratch and the output buffer are sized by the host.
 - **Per-link delays are ignored** in the kernel (all deliveries use the spike's
   arrival time). Edge **backward** is unimplemented (needs reverse CSR).
-- **Spike buffer lifecycle has a tested kernel-level design now (`compact()`
-  in `naer2/spike_gather.py`), but it isn't wired into `Population`/`Network`
-  yet.** A population's raw spike output can hold entries not yet due (an
-  explicit `n2.spike(time + delay)`) that must survive to a later call, and
-  entries already consumed that must not be double-counted; `compact()`
-  handles exactly this (see item 1 above), proven across a 3-round
-  carry-over sequence in `test/test_spike_gather_gpu.py`. What's still open:
-  giving `Population` an actual persistent `CarryBuffer`; sequencing a
-  network step as two phases (every population's `compact()` first, as a
-  barrier, then every target's `merge()` concurrently — a source can feed
-  multiple targets, so compaction must run exactly once per population, not
-  once per consumer); and `update_kernel.py`'s own flush/atomic-add step,
-  which still globally compacts into one flat array per call instead of
-  leaving local buffers GROUP-blocked for `compact()` to consume — unchanged
-  since this was flagged, so every population kernel run so far
-  (`test/test_gpu_hardware.py`) still uses the old flush path, not this one.
 - **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean
   post-target mapping because `@` binds tighter than `>>`; TODOs in
   `Population.__matmul__` / `Connection.__matmul__`.
