@@ -10,54 +10,94 @@ layout. Run everything with `python -m pytest`.
    buffers `(spike_time, spike_src, spike_conn)` the update kernel consumes
    (`Population._execute_gather_kernel` / `_execute_update_kernel` are still
    stubs). Includes delays, which the kernel currently ignores. To be designed together.
-   - **In progress**: source side stays blocked, not flushed (reasoned, not
-     benchmarked — no GPU here; see "Open items" below). CPU reference +
-     window semantics done and tested: `naer2/spike_gather.py`
-     (`BlockedSpikes`, `merge_blocked_spikes(sources, window)`), tests in
-     `unit/test_spike_gather.py`. `window = (t_lo, t_hi]` excludes both
-     not-yet-due (delayed) and already-consumed spikes; the function only
-     reads `sources`, never mutates them — see the lifecycle item below.
-     Current implementation is deliberately the simplest correct one
-     (concatenate + one full sort), the baseline to beat. Algorithm for the
-     actual kernel: direction settled on a k-way merge (exploits that
-     connections-per-population is small, 1-dozens, and each stream is
-     already near-sorted) over a counting/bucket sort (doesn't generalize to
-     event-driven windows the way it did for the old Naer's fixed-dt-grid
-     case, since naer2 uses float time and supports both clock- and
-     event-driven scheduling).
-     `merge_blocked_spikes_kway` (same file) is a second reference,
-     structured as a merge tree (`ceil(log2(k))` rounds of pairwise merges
-     over per-connection sorted streams) instead of one flat sort, tested
-     against the flat baseline for agreement across k=0..5 including the
-     odd-k carry-forward case. It does NOT yet implement either GPU-specific
-     technique the tree is meant to host (per-stream odd-even-transposition
-     sort exploiting near-sortedness; pairwise merge-path avoiding a full
-     re-sort) — both still fall back to a generic sort on CPU, so this only
-     validates the tree's *structure*, not yet any performance benefit.
-   - **Stay on GPU — reasoned conclusion, see below for the numbers.** CPU
-     sort time was actually measured here (no GPU to measure the other
-     side); GPU kernel-launch/PCIe figures are well-documented reference
-     values, not measured. At today's PD14-ish scale (tens of spike events
-     per population per window) the comparison is noise either way. At the
-     scale this library targets — reasoned in the conversation to land at
-     roughly hundreds of thousands of spike events per timestep *network-wide*
-     even for networks much larger than anything simulated before, because
-     firing rate and timestep size are both biologically bounded to a narrow
-     range while GPU memory (dominated by synapse storage, not neuron count)
-     is the actual ceiling on how large a network fits at all — measured CPU
-     sort time at N=100,000 is ~1.3ms best case (near-sorted) to ~6.5ms worst
-     case (random), while a well-batched GPU round trip is estimated at
-     roughly 150-400us, and an on-device kernel avoiding the round trip
-     entirely would be expected (not measured — no GPU here) to stay in the
-     tens-of-microseconds range regardless, since GPU parallelism absorbs
-     N-growth far better than a CPU thread count that measurably didn't help
-     here (multi-threaded torch sort was barely faster than single-threaded
-     for this operation). So CPU sorting is at best a wash at tiny N and a
-     clear loser at the N this library is actually for. If CPU sorting is
-     ever revisited anyway: batch all per-connection transfers into one call
-     per population, not one per connection — paying the fixed per-transfer
-     latency `k` times (k = connections) was the dominant cost in the
-     round-trip estimate, not bandwidth, at realistic k.
+   - **In progress — two real Triton kernels, tested on real hardware, not yet
+     wired into Population/Network (deliberately held off until the kernels
+     themselves were right).** `naer2/spike_gather.py`, tests in
+     `test/test_spike_gather_gpu.py` (GPU-only, no CPU reference — see the
+     "Stay on GPU" entry below for why one wasn't worth building this time).
+     Split into two kernels once lifecycle (clearing consumed spikes,
+     retaining not-yet-due ones) turned out to change where sorting belongs:
+     - `compact()` — owned by one source population. Folds this call's fresh,
+       GROUP-blocked output (`BlockedSpikes`) into whatever it's still holding
+       from previous calls (`CarryBuffer`, a persistent, already-sorted,
+       cross-call buffer the source population would own for real), splits
+       the combined result on `t_hi` into "due now" (returned, flat, sorted)
+       and "not yet due" (written back into `CarryBuffer` in place). Because
+       nothing `<= t_hi` ever survives a compaction, the old `window = (t_lo,
+       t_hi]` is gone — there's never anything left below the new floor, so
+       only `t_hi` is needed now.
+     - `merge()` — owned by one target population. Takes several already-
+       `compact()`ed sources (one per incoming connection), tags each with
+       that connection's id, interleaves them into the sorted `(time, src,
+       conn)` buffer the target's own kernel consumes. Never re-sorts a
+       source stream, since `compact()` already sorted it once — which
+       matters because one source commonly feeds multiple targets (e.g. one
+       population feeding two different connections), and sorting it once at
+       the source rather than once per downstream consumer is the entire
+       point of the split.
+     Both are single-block (`grid=(1,)`) kernels: realistic spike counts are
+     small enough (see the scale reasoning below) that one block sorting
+     everything at once beats tiling for now. Both turn their sort into one
+     `tl.sort` call by packing every field (time, a node index, for `merge()`
+     also a connection id) into one sortable integer key — `tl.sort` only
+     orders a single tensor, no attached payload, and Triton has no
+     argsort/key-value sort primitive. Floats are made integer-sortable via
+     the standard order-preserving bit flip (sign bit flip for positives, full
+     bit invert for negatives) — validated independently against
+     `torch.sort` across positives/negatives/zero/inf before being folded
+     into either kernel. A nice side effect of `merge()`'s packing: ties
+     (equal timestamps across connections) get a fully deterministic,
+     documented tie-break (ascending by connection id, then node), not an
+     incidental one — see `test_ties_break_ascending_by_connection_then_node`.
+     Not yet handled: a `compact()`/`merge()` call bigger than its fixed
+     capacity (both use a compile-time-sized single block); real connectivity
+     feeding `BlockedSpikes` from an actual running `update_kernel` instead
+     of hand-built test fixtures; and `merge()`'s host-side wrapper still
+     does one `.item()` sync per source to pack sources into its `[K,
+     per_src_cap]` layout — fine for a standalone test, but exactly the
+     per-transfer latency floor to avoid once this is wired up for real with
+     more than one connection per target.
+   - **Stay on GPU — now measured for real on the 780M, not just reasoned.**
+     Earlier this was CPU-only timing plus literature-sourced PCIe/launch
+     estimates (no GPU was available yet). With real hardware now working
+     (`test/test_gpu_hardware.py` is the first naer2 kernel ever actually
+     launched, as opposed to only compiled/inspected or interpreter-checked),
+     re-ran it as an actual
+     GPU-resident `torch.argsort` vs. a real D2H-copy + CPU-`argsort` +
+     H2D-copy round trip, both on this machine, same data, `torch.cuda.
+     synchronize()` bracketing every timed region:
+
+     ```
+              N | GPU argsort | CPU roundtrip | CPU-only sort | GPU wins by
+            100  |    34.9 us |       43.9 us |        3.1 us |      1.3x
+          1,000  |    43.6 us |       60.1 us |       10.6 us |      1.4x
+         10,000  |    84.7 us |      579.5 us |      480.1 us |      6.8x
+        100,000  |   817.6 us |     6439.3 us |     6164.4 us |      7.9x
+      1,000,000  |  4507.1 us |    75697.6 us |    72834.3 us |     16.8x
+     ```
+     (sync-only floor ~2.7us; a 1-element D2H copy alone is ~16us — the
+     round trip's cost is dominated by the CPU sort itself past N≈3,000,
+     not the transfer.)
+
+     GPU-resident sort wins at *every* size tested, including the smallest
+     (100 events) — there's no crossover where the round trip comes out
+     ahead, not even in principle at tiny N, because PyTorch's own op
+     dispatch overhead on the GPU path (~30-40us, well above the ~3-16us
+     transfer/sync floor) is still less than one extra CPU round trip once
+     a real sort has to happen on the other end. At this library's target
+     scale (reasoned earlier to land at roughly hundreds of thousands of
+     spike events per timestep *network-wide*, even for networks much
+     larger than anything simulated before, since firing rate and timestep
+     size are both biologically bounded while GPU memory — dominated by
+     synapse storage, not neuron count — is the actual ceiling on network
+     size) the margin is ~8x and still growing. This is still the naive
+     `torch.argsort`, not the k-way-merge/near-sortedness techniques above
+     — so it's a lower bound on the GPU-resident advantage, not the final
+     number. If CPU sorting is ever revisited anyway: batch all
+     per-connection transfers into one call per population, not one per
+     connection — paying the fixed per-transfer floor `k` times (k =
+     connections) was the dominant cost in the old round-trip estimate,
+     not bandwidth, at realistic k.
    - **New: parallelize kernel execution across populations.** `Network.step()`
      (`naer2/network.py`) is a plain host-side Python `for pop in
      self.populations: pop.advance(...)` loop — fully sequential, one
@@ -190,23 +230,32 @@ layout. Run everything with `python -m pytest`.
   checks; per-program scratch and the output buffer are sized by the host.
 - **Per-link delays are ignored** in the kernel (all deliveries use the spike's
   arrival time). Edge **backward** is unimplemented (needs reverse CSR).
-- **Spike buffer lifecycle is not handled anywhere yet.** A population's raw
-  spike output can hold entries not yet due (an explicit `n2.spike(time +
-  delay)`) that must survive to a later call, and entries already consumed
-  that must not be double-counted. `merge_blocked_spikes`'s `window` filters
-  correctly for one call, but nothing clears consumed entries or compacts the
-  buffer across calls — that can only be done by the population the spikes
-  belong to (it alone knows what it's already handed out), not by the merge
-  step. Currently assuming (not yet confirmed) that every outstanding delay
-  resolves within one update window, so there's never anything left over to
-  carry forward; true carry-over, if needed, is unimplemented.
+- **Spike buffer lifecycle has a tested kernel-level design now (`compact()`
+  in `naer2/spike_gather.py`), but it isn't wired into `Population`/`Network`
+  yet.** A population's raw spike output can hold entries not yet due (an
+  explicit `n2.spike(time + delay)`) that must survive to a later call, and
+  entries already consumed that must not be double-counted; `compact()`
+  handles exactly this (see item 1 above), proven across a 3-round
+  carry-over sequence in `test/test_spike_gather_gpu.py`. What's still open:
+  giving `Population` an actual persistent `CarryBuffer`; sequencing a
+  network step as two phases (every population's `compact()` first, as a
+  barrier, then every target's `merge()` concurrently — a source can feed
+  multiple targets, so compaction must run exactly once per population, not
+  once per consumer); and `update_kernel.py`'s own flush/atomic-add step,
+  which still globally compacts into one flat array per call instead of
+  leaving local buffers GROUP-blocked for `compact()` to consume — unchanged
+  since this was flagged, so every population kernel run so far
+  (`test/test_gpu_hardware.py`) still uses the old flush path, not this one.
 - **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean
   post-target mapping because `@` binds tighter than `>>`; TODOs in
   `Population.__matmul__` / `Connection.__matmul__`.
 - A warp-uniform `if any(is_target)` around receive/send per tile is possible, but
   much less useful now that a program's tile lanes are all its own links.
-- Nothing has run on a GPU, under the Triton interpreter, or been timed, since
-  the last restructure removed that tier from the live suite — see README.md.
+- Real GPU hardware is now available and used (`test/test_gpu_hardware.py`,
+  `test/test_spike_gather_gpu.py`, both skipped without a CUDA/ROCm device) —
+  this note is stale; nothing runs under the Triton CPU interpreter
+  specifically, since that tier was removed from the live suite — see
+  README.md — but real hardware now covers more than that tier did.
 - Caching/preloading connection data (source attrs, offsets) per spike block may
   pay off in some networks; needs benchmarking, likely network-dependent.
 - **Gap, not yet started**: `AttrPrefixTransformer`, `SelfAttrTransformer`,
