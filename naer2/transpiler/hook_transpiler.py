@@ -8,6 +8,7 @@ from .transformers import (
     IfTransformer,
     MaskAliasTransformer,
     MathLoweringTransformer,
+    RandomLoweringTransformer,
     SelfAttrTransformer,
     TargetMaskTransformer,
 )
@@ -21,13 +22,14 @@ class HookTranspiler:
     Base pipeline (emit):
       1. SelfAttrTransformer — resolves self.attr to constants or local names
       2. MathLoweringTransformer — math.exp etc. → per-element tl.* ops
-      3. IfTransformer       — lowers if/elif/else (and top-level n2.spike) to
+      3. RandomLoweringTransformer — random.random() etc. → per-lane tl.rand/randn
+      4. IfTransformer       — lowers if/elif/else (and top-level n2.spike) to
                                vectorized masked ops
 
     Extended pipeline for the spike loop (emit_for_spike_loop):
-      4. AttrPrefixTransformer("edge")   — edge.attr   → edge_attr
-      5. AttrPrefixTransformer("source") — source.attr → source_attr
-      6. TargetMaskTransformer           — wraps dynamic-attr writes with is_target
+      5. AttrPrefixTransformer("edge")   — edge.attr   → edge_attr
+      6. AttrPrefixTransformer("source") — source.attr → source_attr
+      7. TargetMaskTransformer           — wraps dynamic-attr writes with is_target
 
     Both receive hooks and edge forward hooks use emit_for_spike_loop; the prefix
     transformers are no-ops on edge forward hooks which contain no edge.X patterns.
@@ -50,8 +52,10 @@ class HookTranspiler:
         func_copy = copy.deepcopy(self.hook.ast)
         transformed = SelfAttrTransformer(self.context, self.self_prefix).visit(func_copy)
         # Before IfTransformer, which unparses branch tests and spike-time
-        # expressions into new statements: math calls there must already be lowered.
+        # expressions into new statements: math/random calls there must
+        # already be lowered.
         transformed = MathLoweringTransformer().visit(transformed)
+        transformed = RandomLoweringTransformer().visit(transformed)
         transformed = IfTransformer().visit(transformed)
         ast.fix_missing_locations(transformed)
         return transformed.body

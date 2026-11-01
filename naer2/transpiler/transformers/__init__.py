@@ -3,6 +3,7 @@ from .base import StmtTransformer
 from .if_transformer import IfTransformer
 from .mask_alias_transformer import MaskAliasTransformer
 from .math_lowering_transformer import MathLoweringTransformer
+from .random_lowering_transformer import RandomLoweringTransformer
 from .self_attr_transformer import SelfAttrTransformer
 from .target_mask_transformer import TargetMaskTransformer
 
@@ -11,6 +12,7 @@ __all__ = [
     "IfTransformer",
     "MaskAliasTransformer",
     "MathLoweringTransformer",
+    "RandomLoweringTransformer",
     "SelfAttrTransformer",
     "StmtTransformer",
     "TargetMaskTransformer",

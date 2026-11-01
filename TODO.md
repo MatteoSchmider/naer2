@@ -131,9 +131,67 @@ layout. Run everything with `python -m pytest`.
      latency lever than how spike management sorts, since every population
      pays its own full kernel-launch overhead in sequence regardless. Not
      started; flagged here per request.
-2. **A new test network**, exercised **on the CPU first**, at a small and a large
+2. **Get the full PD14 network (`test/networks/PD14/net.py`) actually running in
+   main.py**, as the first real-scale proof the whole stack holds together
+   rather than developing further pieces in a vacuum against small hand-built
+   networks. Deliberately **without per-link delays first**, as a sanity check
+   that isolates one variable at a time — passing this only proves the
+   execution plumbing works, not that the physiology is right (currents would
+   arrive instantly instead of after 0.75-1.5ms). Inventory of what's missing,
+   roughly in blocking order:
+   - **Done: per-lane GPU random number generation**, needed for
+     `PD14_poisson.send()`'s `random.random()`-based exponential inter-spike
+     interval. New `RandomLoweringTransformer` (same pipeline position/policy
+     as `MathLoweringTransformer`: whitelist-or-raise, runs before
+     `IfTransformer`), tests in
+     `unit/transpiler/transformers/test_random_lowering_transformer.py`.
+     Supports `random.random()` → `tl.rand(seed, offs)` and
+     `random.gauss`/`normalvariate` → `mu + sigma * tl.randn(seed, offs)`.
+     `seed` is `t` (the kernel's own per-call time boundary, already in scope
+     everywhere, bit-reinterpreted as an int) XORed with a per-call-site salt
+     (so two different `random.*` calls in one hook body don't collide);
+     `offs` (the lane's global neuron index) makes different lanes draw
+     different numbers. Verified directly against Triton on real hardware
+     before and after wiring into the transformer: deterministic given the
+     same `(t, offs)`, differs across lanes and across `t`; then verified
+     `PD14_poisson` itself compiles and runs for real (2000 neurons, rate
+     0.12/ms, 100ms, observed/expected spike count ratio 1.09 — reasonable
+     for a coarse 1ms-step sanity check, not a precision claim) and that its
+     `next_spike` state evolves deterministically given the same `t`.
+     **Known limitation, accepted for now, not yet fixed:** seed has no
+     population identity folded in, so two *different* populations' kernels
+     draw IDENTICAL numbers for the same lane index at the same `t` —
+     randomness only differs within one population's own kernel, not
+     network-wide. Fix is each population owning its own seed, which needs to
+     be public (not hidden/derived oddly) for determinism/reproducibility to
+     stay possible — not done yet. Also not handled: an edge forward/backward
+     hook calling `random.*` would incorrectly use `offs` (neuron-lane-shaped)
+     instead of the link-tile lane variable; no edge hook does this yet.
+   - **Not started: `Population._execute_gather_kernel`/`_execute_update_kernel`
+     are still `pass` stubs.** `Network.step()` currently does nothing at all
+     — no kernel has ever been launched through the normal simulation loop,
+     only by hand in test scripts (`test/test_gpu_hardware.py` and friends).
+     This blocks everything below, independent of delays.
+   - **Not started: `update_kernel.py`'s flush step** still produces one flat,
+     already-compacted array per call instead of leaving local buffers
+     GROUP-blocked — the shape `compact()`/`Population.set_fresh_output()`
+     actually expects (see item 1 above). Needed before real kernel output
+     can feed the lifecycle kernels at all.
+   - **Not started: `compact()`/`merge()` capacity at PD14 scale.** Both are
+     fixed-capacity, single-Triton-block kernels sized for test scale (tens
+     to ~100 entries) — PD14's E_23 alone is ~20,683 neurons. Needs an actual
+     estimate of expected per-timestep spike counts at this scale before
+     assuming current capacities are fine; if not, needs tiling.
+   - **Not started/untested: the full PD14 network has never been compiled.**
+     `test/networks/PD14/net.py`'s `build()` has never been run by any test,
+     not even at the AST-inspection tier the rest of the suite relies on —
+     only `mini_ei` (a scaled-down variant that drops the Poisson population)
+     touches `PD14_neuron`/`PD14_synapse`/`PD14_connection`. Compile-time
+     surprises (at ~78k neurons, cortical-scale connection counts) are still
+     possible, separate from execution.
+3. **A new test network**, exercised **on the CPU first**, at a small and a large
    scale, before anything touches a GPU-style path.
-3. **Only then**: get kernels compiling under Triton and confirm their behavior
+4. **Only then**: get kernels compiling under Triton and confirm their behavior
    matches the CPU results — a system-test tier (needs a machine actually
    capable of running them), deliberately not built yet. See README.md's "What's
    deliberately not here yet". Until it exists, kernel correctness is checked by
