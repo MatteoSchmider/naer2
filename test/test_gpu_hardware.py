@@ -60,18 +60,23 @@ def _launch(fn, conn, N, n_blocks, potential, t, spike_time=(), spike_src=(), sp
         t=t,
         local_spike_node_ptr=torch.zeros(n_blocks * LOCAL_SPIKE_CAP, device=DEVICE, dtype=torch.int32),
         local_spike_time_ptr=torch.zeros(n_blocks * LOCAL_SPIKE_CAP, device=DEVICE, dtype=torch.float32),
-        out_spike_node_ptr=torch.full((N * 10,), -1, device=DEVICE, dtype=torch.int32),
-        out_spike_time_ptr=torch.zeros(N * 10, device=DEVICE, dtype=torch.float32),
-        out_spike_count_ptr=torch.zeros(1, device=DEVICE, dtype=torch.int32),
+        local_spike_count_ptr=torch.zeros(n_blocks, device=DEVICE, dtype=torch.int32),
     )
     args = {k: v for k, v in args.items() if k in fn.arg_names}
     fn[(n_blocks,)](**args, GROUP_SIZE=GROUP_SIZE, SPIKE_BLOCK=SPIKE_BLOCK, LINK_BLOCK=LINK_BLOCK, LOCAL_SPIKE_CAP=LOCAL_SPIKE_CAP)
     torch.cuda.synchronize()
 
-    cnt = int(args["out_spike_count_ptr"][0].item())
-    nodes = args["out_spike_node_ptr"][:cnt].tolist()
-    times = args["out_spike_time_ptr"][:cnt].tolist()
-    spikes = sorted(zip(nodes, times))
+    # local_spike_{node,time,count}_ptr together are exactly a BlockedSpikes
+    # (naer2/spike_gather.py) -- flatten its GROUP-blocked, unsorted layout
+    # into a plain (node, time) list for the hand-derived assertions below.
+    counts = args["local_spike_count_ptr"].tolist()
+    nodes_blocked = args["local_spike_node_ptr"].tolist()
+    times_blocked = args["local_spike_time_ptr"].tolist()
+    spikes = []
+    for g, c in enumerate(counts):
+        for i in range(c):
+            spikes.append((nodes_blocked[g * LOCAL_SPIKE_CAP + i], times_blocked[g * LOCAL_SPIKE_CAP + i]))
+    spikes.sort()
     return args["potential_ptr"].tolist(), spikes
 
 

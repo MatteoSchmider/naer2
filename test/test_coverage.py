@@ -188,15 +188,16 @@ def test_plastic_forward_on_link_lanes_stored_per_link(src_B, src_C):
 
 def test_spike_lowers_to_local_buffer_write_no_atomic(C_module, src_C):
     # Per-emission-site writes go into this program's private local_spike_*
-    # slice, no atomic — only the one-time flush at the very end does a single
-    # tl.atomic_add per program instance (see test_mini_ei.py's dedicated check
-    # for that; here we just confirm the per-site write and timing). send()
-    # calls bare n2.spike() (no time arg) -> time=None default records t, the
-    # kernel's own timestep boundary, not the contextual time.
+    # slice, no atomic anywhere — not even the one-time end-of-kernel count
+    # store (see test_mini_ei.py's dedicated check for that; here we just
+    # confirm the per-site write and timing). send() calls bare n2.spike()
+    # (no time arg) -> time=None default records t, the kernel's own
+    # timestep boundary, not the contextual time.
     arg_names_C = {a.arg for a in C_module.body[0].args.args}
-    assert {"local_spike_node_ptr", "local_spike_time_ptr"} <= arg_names_C
-    assert {"out_spike_node_ptr", "out_spike_time_ptr", "out_spike_count_ptr"} <= arg_names_C
+    assert {"local_spike_node_ptr", "local_spike_time_ptr", "local_spike_count_ptr"} <= arg_names_C
     assert "out_spike_ptr" not in arg_names_C, "old placeholder out_spike_ptr should be gone"
+    assert not any(a.startswith("out_spike_") for a in arg_names_C), \
+        "flush no longer compacts into a shared out_spike_* buffer"
     assert "LOCAL_SPIKE_CAP" in arg_names_C
     assert "tl.store(local_spike_node_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, offs, mask=_m0)" in src_C
     assert "tl.store(local_spike_time_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, t, mask=_m0)" in src_C, \

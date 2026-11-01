@@ -103,6 +103,16 @@ class BlockedSpikes:
         self.cap = cap
 
 
+def empty_blocked_spikes(n_groups: int, cap: int, device) -> BlockedSpikes:
+    """A BlockedSpikes reporting zero spikes for every group -- used as the
+    "nothing new this round" placeholder (Population's first-ever gather
+    call, and every round a population's update kernel doesn't run)."""
+    node = torch.zeros((n_groups * cap,), device=device, dtype=torch.int32)
+    time = torch.zeros((n_groups * cap,), device=device, dtype=torch.float32)
+    count = torch.zeros((n_groups,), device=device, dtype=torch.int32)
+    return BlockedSpikes(node, time, count, cap)
+
+
 class CarryBuffer:
     """A population's persistent, cross-call lifecycle state: whatever it's
     holding that wasn't due as of its last compact() call, already sorted.

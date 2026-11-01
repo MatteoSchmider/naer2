@@ -8,12 +8,14 @@ layout. Run everything with `python -m pytest`.
 1. **Spike management handling** (host side): turn each population's compacted
    output `(node, time)` buffer into the per-connection merged, time-sorted input
    buffers `(spike_time, spike_src, spike_conn)` the update kernel consumes.
-   The real logic now exists (`Population.compact`/`merge_incoming`,
-   `Network.gather` — see below) but isn't plugged into
-   `Population._execute_gather_kernel` / `_execute_update_kernel` (still
-   stubs) or `Network.step()` yet — see "still open" below. Includes delays,
-   which the kernel currently ignores. To be designed together.
-   - **In progress — two real Triton kernels, wired into Population/Network.**
+   **Done — real kernels, really launched, driven automatically by
+   `Network.step()`.** Includes delays in the sense that a spike's recorded
+   time (whatever the send hook's `n2.spike(...)` expression computed) is
+   respected; per-link delay — every link out of a firing source arriving at
+   the same instant regardless of the link's own delay value — is still the
+   known, intentional approximation noted lower in this file and in
+   `update_kernel.py`'s module docstring, unchanged by this item.
+   - **Done — two real Triton kernels, wired into Population/Network.**
      `naer2/spike_gather.py`, tests in `test/test_spike_gather_gpu.py`
      (GPU-only, no CPU reference — see the "Stay on GPU" entry below for why
      one wasn't worth building this time).
@@ -63,14 +65,58 @@ layout. Run everything with `python -m pytest`.
      every population's `compact()` — a barrier — before any
      `merge_incoming()`, both phases on the same CUDA stream so in-order
      execution is the only sync needed), not `compact()`/`merge()`'s own
-     correctness again. Still open:
-     - `update_kernel.py`'s flush/atomic-add step hasn't changed, so nothing
-       calls `set_fresh_output()` for real yet — every real kernel run so far
-       (`test/test_gpu_hardware.py`) still produces one flat globally-
-       compacted array per call instead of leaving local buffers
-       GROUP-blocked, which is what `set_fresh_output()` actually expects.
-       `Network.step()`/`Population.advance()` aren't touched yet either —
-       `gather()` exists alongside them, not plugged into them.
+     correctness again.
+     **Now also wired into real kernel execution end to end**
+     (`Population._execute_gather_kernel`/`_execute_update_kernel`,
+     `Network.step()`), not just the lifecycle plumbing above:
+     - `update_kernel.py`'s flush step no longer compacts into a shared
+       `out_spike_*` buffer with a global atomic — it stores this program
+       instance's own spike count into `local_spike_count_ptr[pid]` (plain
+       scalar, still no atomic) and leaves `local_spike_{node,time}_ptr`
+       GROUP-blocked, which together are now exactly a `BlockedSpikes` —
+       `_execute_update_kernel` wraps them directly and calls
+       `set_fresh_output()` itself, no separate compaction pass needed.
+     - `Network.step()` now actually runs three network-wide phases per
+       sub-time: gather (every population's `compact()`, unconditional —
+       `Population._execute_gather_kernel`, which also resets its own
+       `_fresh` to empty immediately after folding it in, so a population
+       that skips its update this round doesn't re-fold stale entries next
+       round), merge (`merge_incoming()` for populations with incoming
+       connections, stashed as `Population._merged`), then update
+       (`Population._execute_update_kernel`, gated by the new
+       `Population._is_due`, extracted unchanged from the old `advance()`
+       — removed, since nothing called it and `Network.step()` now needs
+       the three phases separated rather than interleaved per population).
+       One consequence worth naming: a spike is only visible to `compact()`
+       starting the *next* sub-step after it's emitted, even at nominally
+       zero delay — the emitting population's update kernel (which produces
+       the spike) and its own `compact()` call (which would fold that spike
+       in) never run in the other order within one `step()` call. Per-link
+       delay is unaffected by (and orthogonal to) this — it was already a
+       known approximation, see above.
+     - Two new per-population configuration points, resolved as defaults
+       rather than being required everywhere: Triton tile sizes
+       (`group_size=32, spike_block=32, link_block=64, local_spike_cap=64`,
+       all overridable per-`Population` at construction — previously only
+       ever hardcoded per test harness, e.g. `test_gpu_hardware.py`'s
+       `GROUP_SIZE=4`) and device placement (`Network.device`, auto-detected
+       once per `Network` as `cuda` if available else `cpu`; a population's
+       own per-neuron dynamic-attr tensors — set by user code as
+       `pop.attr = tensor`, e.g. `test/networks/*/net.py` — move there lazily
+       on that population's first real kernel launch via the new
+       `Population._ensure_on_device`, so no network-building code anywhere
+       had to change). Per-link tensors and blocked topology are instead
+       rebuilt/moved fresh on every `_execute_update_kernel` call rather than
+       cached — simple and correct, but recomputing `Topology.blocked()`
+       every step is wasted work worth revisiting if it ever shows up in a
+       profile.
+     - First real, fully-automatic end-to-end test —
+       `test/test_network_step.py` — calling `network.step()` on a real
+       `counter_net` with no manual `set_fresh_output`/`compact`/
+       `merge_incoming` calls anywhere, and hand-verifying the resulting
+       potentials/spike timing exactly like `test_gpu_hardware.py` does for
+       one bare kernel launch.
+     Still open:
      - a `compact()`/`merge()` call bigger than its fixed capacity (both use
        a compile-time-sized single block);
      - `merge_incoming()`'s per-connection `.item()` sync (inherited from
@@ -167,16 +213,12 @@ layout. Run everything with `python -m pytest`.
      stay possible — not done yet. Also not handled: an edge forward/backward
      hook calling `random.*` would incorrectly use `offs` (neuron-lane-shaped)
      instead of the link-tile lane variable; no edge hook does this yet.
-   - **Not started: `Population._execute_gather_kernel`/`_execute_update_kernel`
-     are still `pass` stubs.** `Network.step()` currently does nothing at all
-     — no kernel has ever been launched through the normal simulation loop,
-     only by hand in test scripts (`test/test_gpu_hardware.py` and friends).
-     This blocks everything below, independent of delays.
-   - **Not started: `update_kernel.py`'s flush step** still produces one flat,
-     already-compacted array per call instead of leaving local buffers
-     GROUP-blocked — the shape `compact()`/`Population.set_fresh_output()`
-     actually expects (see item 1 above). Needed before real kernel output
-     can feed the lifecycle kernels at all.
+   - **Done: `Population._execute_gather_kernel`/`_execute_update_kernel` and
+     `Network.step()`**, including the `update_kernel.py` flush-step change
+     this needed — see item 1 above for the full description (three-phase
+     `step()`, tile-size/device defaults, `test/test_network_step.py`). A
+     real kernel now launches through the normal simulation loop, not only
+     by hand in test scripts.
    - **Not started: `compact()`/`merge()` capacity at PD14 scale.** Both are
      fixed-capacity, single-Triton-block kernels sized for test scale (tens
      to ~100 entries) — PD14's E_23 alone is ~20,683 neurons. Needs an actual
@@ -337,3 +379,5 @@ layout. Run everything with `python -m pytest`.
 - see if same can be done with Topology
 - see if something similar can be done with regions/positions to make them lighter (doubt it though in that case)
 - edges, nodes, patterns, updates, receives, kernel, fabric all take up single files, maybe they can be packaged more tightly file-wise and reuse some things?
+- Population has become a god class (shape/config, dynamic_attrs bookkeeping, spike lifecycle state, compile(), kernel compile+cache, device placement, real kernel launch...) — split responsibilities out once the dust settles
+- update_kernel.py and population.py have piled up too many comments by now — shorten them once refactoring makes the code itself clearer

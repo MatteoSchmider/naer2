@@ -35,11 +35,14 @@ Kernel signature:
         local_spike_node_ptr,  # [num_programs * LOCAL_SPIKE_CAP] int32
         local_spike_time_ptr,  # [num_programs * LOCAL_SPIKE_CAP] float32
 
-        # compacted output spike buffer (shared across the whole grid; only
-        # touched once per program instance, in the flush step at the very end)
-        out_spike_node_ptr,    # [n_neurons * BUFFER_MULTIPLIER] int32   — firing neuron id
-        out_spike_time_ptr,    # [n_neurons * BUFFER_MULTIPLIER] float32 — its spike timestamp
-        out_spike_count_ptr,   # [1] int32 — shared atomic write-cursor, no overflow check yet
+        # this program's valid count within its own local_spike_{node,time}_ptr
+        # slice — written once, at the very end (see the flush step below).
+        # local_spike_{node,time,count}_ptr together are exactly a BlockedSpikes
+        # (naer2/spike_gather.py): one GROUP of entries per program instance,
+        # ready for Population.set_fresh_output()/compact() to consume directly
+        # with no separate compaction pass — no atomic needed here at all, since
+        # this is a plain scalar store into this program's own exclusive slot.
+        local_spike_count_ptr, # [num_programs] int32
 
         GROUP_SIZE: tl.constexpr,
         SPIKE_BLOCK: tl.constexpr,
@@ -126,20 +129,16 @@ timestamp) into this program's own private slice of local_spike_{node,time}_ptr
 (pid * LOCAL_SPIKE_CAP + local offset), bumping local_spike_count — a plain
 scalar, no atomic needed, since no other program instance ever touches this
 slice. See IfTransformer._lower_spike. Exactly once per program instance, at
-the very end of the kernel, that local buffer is flushed into the shared
-compacted out_spike_{node,time}_ptr buffer: one tl.atomic_add on
-out_spike_count_ptr reserves this program's whole range in one shot, then a
-masked vectorized copy moves everything over. This trades many contended
-global atomics (one per spike check — most CSR links visited on any given
-delivery, even though hardly any actually fire) for exactly one atomic per
-program instance, a standard GPU aggregation technique. LOCAL_SPIKE_CAP must
-be sized generously enough that one program instance's GROUP_SIZE neurons
-can't plausibly emit more spikes than that within a single kernel call — like
-BUFFER_MULTIPLIER, there is no overflow check, and it must be a power of 2 for
-tl.arange in the flush step. out_spike_{node,time}_ptr is sized by the host as
-n_neurons * n2.BUFFER_MULTIPLIER; there is no overflow check on that buffer
-either — acceptable for now since neuron counts are far smaller than synapse
-counts.
+the very end of the kernel, that count is stored to local_spike_count_ptr[pid]
+— a plain scalar store, still no atomic, since pid is this program's own
+exclusive slot. Nothing is compacted into a shared buffer here at all: the
+three local_spike_* arrays, taken together, are already exactly the shape
+Population.set_fresh_output()/compact() expect (BlockedSpikes — one GROUP's
+worth of entries per program instance, unsorted, not even unblocked) — see
+naer2/spike_gather.py and naer2/population.py. LOCAL_SPIKE_CAP must be sized
+generously enough that one program instance's GROUP_SIZE neurons can't
+plausibly emit more spikes than that within a single kernel call — there is
+no overflow check.
 
 Known gaps:
   - edge backward: deferred, needs reverse CSR.
@@ -210,19 +209,11 @@ mask = offs < n_neurons
         for attr in self.ctx.dynamic_attrs:
             body += _STMTS(f"tl.store({attr}_ptr + offs, {attr}, mask=mask)")
 
-        # Flush this program's locally-buffered spikes into the shared compacted
-        # output buffer: exactly one global atomic per program instance (not per
-        # spike check), reserving a contiguous range for everything this program
-        # accumulated, then a masked vectorized copy out of its private slice.
-        body += _STMTS("""\
-_global_base = tl.atomic_add(out_spike_count_ptr, local_spike_count)
-_flush_idx = tl.arange(0, LOCAL_SPIKE_CAP)
-_flush_mask = _flush_idx < local_spike_count
-_flush_node = tl.load(local_spike_node_ptr + pid * LOCAL_SPIKE_CAP + _flush_idx, mask=_flush_mask, other=0)
-_flush_time = tl.load(local_spike_time_ptr + pid * LOCAL_SPIKE_CAP + _flush_idx, mask=_flush_mask, other=0.0)
-tl.store(out_spike_node_ptr + _global_base + _flush_idx, _flush_node, mask=_flush_mask)
-tl.store(out_spike_time_ptr + _global_base + _flush_idx, _flush_time, mask=_flush_mask)
-""")
+        # Publish this program's own spike count — a plain scalar store into
+        # this program's exclusive slot, no atomic, no copy: local_spike_node_ptr
+        # /local_spike_time_ptr already hold this program's entries exactly
+        # where a BlockedSpikes expects them (see the module docstring).
+        body += _STMTS("tl.store(local_spike_count_ptr + pid, local_spike_count)")
 
         module = ast.Module(body=[self._func(body)], type_ignores=[])
         ast.fix_missing_locations(module)
@@ -478,16 +469,14 @@ tl.store(out_spike_time_ptr + _global_base + _flush_idx, _flush_time, mask=_flus
             for attr in source_dynamic_attrs:
                 args.append(ast.arg(arg=f"conn{i}_source_{attr}_ptr"))
 
-        # timestamp, per-program private spike scratch, and the compacted output
-        # spike buffer (shared across the grid, only touched once per program —
-        # see the flush step at the end of build())
+        # timestamp and this program's private spike scratch/output (see the
+        # flush step at the end of build() and the module docstring: these
+        # three arrays together are exactly a BlockedSpikes)
         args += [
             ast.arg(arg="t"),
             ast.arg(arg="local_spike_node_ptr"),
             ast.arg(arg="local_spike_time_ptr"),
-            ast.arg(arg="out_spike_node_ptr"),
-            ast.arg(arg="out_spike_time_ptr"),
-            ast.arg(arg="out_spike_count_ptr"),
+            ast.arg(arg="local_spike_count_ptr"),
         ]
 
         # constexpr tile sizes

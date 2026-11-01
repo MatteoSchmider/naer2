@@ -159,22 +159,24 @@ def test_spike_lowers_to_local_buffer_write_no_atomic(func_E, src_E):
     # (no time arg), so the time=None default should record t, the kernel's
     # own timestep boundary, not the contextual time.
     arg_names = {a.arg for a in func_E.args.args}
-    assert {"local_spike_node_ptr", "local_spike_time_ptr",
-            "out_spike_node_ptr", "out_spike_time_ptr", "out_spike_count_ptr"} <= arg_names
+    assert {"local_spike_node_ptr", "local_spike_time_ptr", "local_spike_count_ptr"} <= arg_names
     assert "out_spike_ptr" not in arg_names, "old placeholder out_spike_ptr should be gone"
+    assert not any(a.startswith("out_spike_") for a in arg_names), \
+        "flush no longer compacts into a shared out_spike_* buffer"
     assert "LOCAL_SPIKE_CAP" in arg_names
     assert "tl.store(local_spike_node_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, offs, mask=_m0)" in src_E
     assert "tl.store(local_spike_time_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, t, mask=_m0)" in src_E, \
         "bare n2.spike() should default to recording t, not the contextual time"
 
 
-def test_exactly_one_atomic_add_per_program_instance(src_E):
-    # Exactly one tl.atomic_add call (the end-of-kernel flush), not one per
-    # spike check — aggregation is the whole point of the local buffer.
-    assert src_E.count("tl.atomic_add(") == 1
-    assert "_global_base = tl.atomic_add(out_spike_count_ptr, local_spike_count)" in src_E
-    assert "tl.arange(0, LOCAL_SPIKE_CAP)" in src_E
-    assert "tl.store(out_spike_node_ptr + _global_base + _flush_idx, _flush_node, mask=_flush_mask)" in src_E
+def test_no_atomics_anywhere_in_the_kernel(src_E):
+    # The flush step used to do one tl.atomic_add per program instance to
+    # compact into a shared buffer; now it's a plain per-pid scalar store
+    # (local_spike_node/time_ptr are already laid out exactly as a
+    # BlockedSpikes wants -- see naer2/spike_gather.py), so there should be
+    # no atomics left in the kernel at all.
+    assert "tl.atomic_add(" not in src_E
+    assert "tl.store(local_spike_count_ptr + pid, local_spike_count)" in src_E
 
 
 def test_per_link_fire_check_rooted_at_is_target(src_E):

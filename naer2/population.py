@@ -1,20 +1,40 @@
+import ast
+import importlib.util
 import math
+import pathlib
+import tempfile
 from logging import debug
 
 import torch
 
 from .network import Network
 from .nodes import Node, node_types
-from .spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes
+from .spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes, empty_blocked_spikes
 from .spike_gather import compact as _compact
 from .spike_gather import merge as _merge
 from .types import Region
 
 
 class Population:
-    def __init__(self, instance, shape):
+    def __init__(
+        self,
+        instance,
+        shape,
+        group_size: int = 32,
+        spike_block: int = 32,
+        link_block: int = 64,
+        local_spike_cap: int = 64,
+    ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
         self.shape: Region = Region(shape)
+
+        # Triton tile sizes for this population's compiled kernel (see
+        # naer2/transpiler/templates/update_kernel.py). Defaults sized for
+        # small test networks; override per-population for real scale.
+        self.group_size = group_size
+        self.spike_block = spike_block
+        self.link_block = link_block
+        self.local_spike_cap = local_spike_cap
 
         # Check that instance's type was decorated and registered
         if instance.__class__ not in node_types.keys():
@@ -42,6 +62,13 @@ class Population:
         self._carry: CarryBuffer | None = None
         self._fresh: BlockedSpikes | None = None
         self._due: CompactedSpikes | None = None
+        self._merged: tuple | None = None  # this round's merge_incoming() result, set by Network.step()
+
+        # Real kernel execution (see _execute_update_kernel): compiled lazily
+        # on first real launch, then cached -- a population's compiled source
+        # never changes once its connections/hooks are fixed.
+        self._kernel_fn = None
+        self._compiled_incoming_meta: list[tuple[set, set]] = []  # parallel to self.incoming, set by compile()
 
         self.network: Network = Network(self)
 
@@ -100,6 +127,12 @@ class Population:
         """True when the update hook modifies state, so the network clock must drive it."""
         return bool(self.node.update.assigned_members)
 
+    @property
+    def n_blocks(self) -> int:
+        """Number of program instances this population's kernel launches
+        with -- also the number of GROUPs (BlockedSpikes' n_groups)."""
+        return -(-len(self.shape) // self.group_size)
+
     def _min_incoming_delay(self) -> float:
         """Smallest per-link delay across all incoming connections."""
         min_d = math.inf
@@ -113,40 +146,145 @@ class Population:
             )
         return min_d
 
-    def advance(self, t: float):
-        """Called by Network.step — run both kernels if an update is due at time t."""
+    def _is_due(self, t: float) -> bool:
+        """Whether this population's update kernel needs to run at time t --
+        see Network.step(), which calls this after every population's gather
+        phase has already run (gather is unconditional, every sub-step, for
+        every population: a population's carried spikes may need to surface
+        for a downstream target even on a round it itself has nothing new to
+        compute)."""
         if self.has_autonomous_dynamics:
-            self._execute_gather_kernel(t)
-            self._execute_update_kernel(t)
-            self.last_update = t
+            return True
+        min_d = self._min_incoming_delay()
+        return min_d < math.inf and t - self.last_update >= min_d
+
+    def _ensure_on_device(self, device) -> None:
+        """Move this population's own per-neuron dynamic-attr tensors onto
+        `device` in place (idempotent), so they're the right device both to
+        read and to tl.store into from this point on. Called on `self`
+        before this population's own kernel launches, and on a connection's
+        `_source` before reading its state as a source_{attr} pointer --
+        since the "lazy move on first kernel launch" policy must hold
+        regardless of which population's kernel happens to run first on a
+        given round."""
+        for attr in self.dynamic_attrs:
+            tensor = getattr(self, attr)
+            if tensor.device != device:
+                setattr(self, attr, tensor.to(device))
+
+    def _execute_gather_kernel(self, t: float) -> None:
+        """Kernel 1: this population's own compact() step (naer2/spike_gather.py).
+
+        Folding several already-compact()ed sources into the one sorted
+        buffer a target's update kernel consumes (merge()) is a network-wide
+        concern -- a source can feed multiple targets, so every source must
+        compact before any target reads it -- and so lives in
+        Network.step()/merge_incoming(), not here; see TODO.md.
+
+        Runs every sub-step for every population regardless of whether its
+        own update kernel is due this round (see Network.step()): a
+        population's carry may hold a now-due spike even on a round it has
+        nothing new to contribute, and compact() is the only thing that
+        checks.
+        """
+        device = self.network.device
+        if self._fresh is None:
+            self._fresh = empty_blocked_spikes(self.n_blocks, self.local_spike_cap, device)
+        self.compact(t)
+        # self._fresh is now folded into _carry/_due; reset it to "nothing
+        # new" so a round where this population's update kernel doesn't run
+        # doesn't re-fold the same entries again next time.
+        self._fresh.count.zero_()
+
+    def _execute_update_kernel(self, t: float) -> None:
+        """Kernel 2: merged update-receive-send, actually compiled and
+        launched on `self.network.device` (naer2/transpiler/templates/
+        update_kernel.py). Consumes self._merged (this round's
+        merge_incoming() result, set by Network.step() before this is
+        called), applies receive per incoming connection, then runs update
+        and send across all neurons. Publishes this round's freshly emitted
+        spikes via set_fresh_output() for the NEXT round's gather phase to
+        fold in -- see the module docstring on the one-round pipeline
+        latency this implies, even for a nominally zero delay.
+        """
+        device = self.network.device
+        self._ensure_on_device(device)
+        fn = self._kernel()
+        n_neurons = len(self.shape)
+        n_blocks = self.n_blocks
+
+        if self._merged is not None:
+            spike_time, spike_src, spike_conn, spike_count = self._merged
+            n_spikes = int(spike_count[0].item())
         else:
-            min_d = self._min_incoming_delay()
-            if min_d < math.inf and t - self.last_update >= min_d:
-                self._execute_gather_kernel(t)
-                self._execute_update_kernel(t)
-                self.last_update = t
+            spike_time = torch.zeros(1, device=device, dtype=torch.float32)
+            spike_src = torch.zeros(1, device=device, dtype=torch.int32)
+            spike_conn = torch.zeros(1, device=device, dtype=torch.int32)
+            n_spikes = 0
 
-    def _execute_gather_kernel(self, t: float):
-        """Kernel 1 stub: collect incoming spikes from all incoming connections,
-        interleave and sort them by arrival time, producing a merged spike buffer
-        (spike_tgt, spike_link per connection) for the update kernel.
-        """
-        pass
+        args: dict = {}
+        for attr in self.dynamic_attrs:
+            args[f"{attr}_ptr"] = getattr(self, attr)
+        args["n_neurons"] = n_neurons
+        args["spike_time_ptr"] = spike_time
+        args["spike_src_ptr"] = spike_src
+        args["spike_conn_ptr"] = spike_conn
+        args["n_spikes"] = n_spikes
 
-    def _execute_update_kernel(self, t: float):
-        """Kernel 2 stub: merged update-receive-send.
-        Consumes the spike buffer produced by the gather kernel, applies receive
-        hooks per connection, then runs the update and send hooks across all neurons.
-        """
-        pass
+        for i, conn in enumerate(self.incoming):
+            source_dynamic_attrs, edge_tensor_attrs = self._compiled_incoming_meta[i]
+            conn._source._ensure_on_device(device)
+            bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
+            args[f"conn{i}_src_offsets_ptr"] = bt.offsets.flatten().to(device=device, dtype=torch.int64)
+            args[f"conn{i}_target_indices_ptr"] = bt.target_local.to(device=device, dtype=torch.int32)
+            for attr in edge_tensor_attrs:
+                canonical = getattr(conn.fabric, attr)
+                args[f"conn{i}_{attr}_ptr"] = bt.to_blocked(canonical).to(device=device)
+            for attr in source_dynamic_attrs:
+                args[f"conn{i}_source_{attr}_ptr"] = getattr(conn._source, attr)
+
+        args["t"] = t
+        cap = self.local_spike_cap
+        local_spike_node = torch.zeros(n_blocks * cap, device=device, dtype=torch.int32)
+        local_spike_time = torch.zeros(n_blocks * cap, device=device, dtype=torch.float32)
+        local_spike_count = torch.zeros(n_blocks, device=device, dtype=torch.int32)
+        args["local_spike_node_ptr"] = local_spike_node
+        args["local_spike_time_ptr"] = local_spike_time
+        args["local_spike_count_ptr"] = local_spike_count
+
+        args = {k: v for k, v in args.items() if k in fn.arg_names}
+        fn[(n_blocks,)](
+            **args,
+            GROUP_SIZE=self.group_size,
+            SPIKE_BLOCK=self.spike_block,
+            LINK_BLOCK=self.link_block,
+            LOCAL_SPIKE_CAP=cap,
+        )
+
+        self.set_fresh_output(BlockedSpikes(local_spike_node, local_spike_time, local_spike_count, cap))
+        self._merged = None
+
+    def _kernel(self):
+        """Compile (once) and return the loaded @triton.jit update_kernel
+        function for this population. Cached on self._kernel_fn -- a
+        population's compiled source never changes once its connections and
+        hooks are fixed."""
+        if self._kernel_fn is None:
+            module = self.compile()
+            source = "import triton\nimport triton.language as tl\n\n" + ast.unparse(module) + "\n"
+            path = pathlib.Path(tempfile.mkdtemp()) / f"naer2_kernel_{id(self)}.py"
+            path.write_text(source)
+            spec = importlib.util.spec_from_file_location(path.stem, path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._kernel_fn = mod.update_kernel
+        return self._kernel_fn
 
     def set_fresh_output(self, blocked: BlockedSpikes) -> None:
         """Hand off this round's freshly emitted, GROUP-blocked spikes for
-        compact() to fold in. This is the real integration seam
-        `_execute_update_kernel`'s own flush step will eventually call
-        automatically, once it stops globally compacting into one flat
-        array and leaves its local buffers blocked instead (see TODO.md) —
-        until then, callers (tests, for now) set this directly."""
+        compact() to fold in. Called automatically by _execute_update_kernel
+        after every real kernel launch; tests may also call it directly to
+        control spikes without running the update kernel."""
         self._fresh = blocked
 
     def compact(self, t_hi: float, carry_cap: int = 64) -> CompactedSpikes:
@@ -348,6 +486,14 @@ class Population:
 
         update_section = HookTranspiler(self.node.update, ctx).emit()
         send_section = HookTranspiler(self.node.send, ctx).emit()
+
+        # Which source/edge attrs each connection's compiled branch actually
+        # needs a conn{i}_... pointer for -- _execute_update_kernel reads
+        # this back to build the real launch args with matching names.
+        self._compiled_incoming_meta = [
+            (source_dynamic_attrs, edge_tensor_attrs)
+            for (_, _, _, source_dynamic_attrs, edge_tensor_attrs) in incoming_with_hooks
+        ]
 
         return UpdateKernelTemplate(ctx, incoming_with_hooks).build(
             update_section, send_section
