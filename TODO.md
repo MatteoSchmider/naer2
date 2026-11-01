@@ -10,6 +10,62 @@ layout. Run everything with `python -m pytest`.
    buffers `(spike_time, spike_src, spike_conn)` the update kernel consumes
    (`Population._execute_gather_kernel` / `_execute_update_kernel` are still
    stubs). Includes delays, which the kernel currently ignores. To be designed together.
+   - **In progress**: source side stays blocked, not flushed (reasoned, not
+     benchmarked — no GPU here; see "Open items" below). CPU reference +
+     window semantics done and tested: `naer2/spike_gather.py`
+     (`BlockedSpikes`, `merge_blocked_spikes(sources, window)`), tests in
+     `unit/test_spike_gather.py`. `window = (t_lo, t_hi]` excludes both
+     not-yet-due (delayed) and already-consumed spikes; the function only
+     reads `sources`, never mutates them — see the lifecycle item below.
+     Current implementation is deliberately the simplest correct one
+     (concatenate + one full sort), the baseline to beat. Algorithm for the
+     actual kernel: direction settled on a k-way merge (exploits that
+     connections-per-population is small, 1-dozens, and each stream is
+     already near-sorted) over a counting/bucket sort (doesn't generalize to
+     event-driven windows the way it did for the old Naer's fixed-dt-grid
+     case, since naer2 uses float time and supports both clock- and
+     event-driven scheduling).
+     `merge_blocked_spikes_kway` (same file) is a second reference,
+     structured as a merge tree (`ceil(log2(k))` rounds of pairwise merges
+     over per-connection sorted streams) instead of one flat sort, tested
+     against the flat baseline for agreement across k=0..5 including the
+     odd-k carry-forward case. It does NOT yet implement either GPU-specific
+     technique the tree is meant to host (per-stream odd-even-transposition
+     sort exploiting near-sortedness; pairwise merge-path avoiding a full
+     re-sort) — both still fall back to a generic sort on CPU, so this only
+     validates the tree's *structure*, not yet any performance benefit.
+   - **Stay on GPU — reasoned conclusion, see below for the numbers.** CPU
+     sort time was actually measured here (no GPU to measure the other
+     side); GPU kernel-launch/PCIe figures are well-documented reference
+     values, not measured. At today's PD14-ish scale (tens of spike events
+     per population per window) the comparison is noise either way. At the
+     scale this library targets — reasoned in the conversation to land at
+     roughly hundreds of thousands of spike events per timestep *network-wide*
+     even for networks much larger than anything simulated before, because
+     firing rate and timestep size are both biologically bounded to a narrow
+     range while GPU memory (dominated by synapse storage, not neuron count)
+     is the actual ceiling on how large a network fits at all — measured CPU
+     sort time at N=100,000 is ~1.3ms best case (near-sorted) to ~6.5ms worst
+     case (random), while a well-batched GPU round trip is estimated at
+     roughly 150-400us, and an on-device kernel avoiding the round trip
+     entirely would be expected (not measured — no GPU here) to stay in the
+     tens-of-microseconds range regardless, since GPU parallelism absorbs
+     N-growth far better than a CPU thread count that measurably didn't help
+     here (multi-threaded torch sort was barely faster than single-threaded
+     for this operation). So CPU sorting is at best a wash at tiny N and a
+     clear loser at the N this library is actually for. If CPU sorting is
+     ever revisited anyway: batch all per-connection transfers into one call
+     per population, not one per connection — paying the fixed per-transfer
+     latency `k` times (k = connections) was the dominant cost in the
+     round-trip estimate, not bandwidth, at realistic k.
+   - **New: parallelize kernel execution across populations.** `Network.step()`
+     (`naer2/network.py`) is a plain host-side Python `for pop in
+     self.populations: pop.advance(...)` loop — fully sequential, one
+     population's kernel launches at a time, with no batching across
+     populations into a single launch. This is a separate, likely larger
+     latency lever than how spike management sorts, since every population
+     pays its own full kernel-launch overhead in sequence regardless. Not
+     started; flagged here per request.
 2. **A new test network**, exercised **on the CPU first**, at a small and a large
    scale, before anything touches a GPU-style path.
 3. **Only then**: get kernels compiling under Triton and confirm their behavior
@@ -134,6 +190,16 @@ layout. Run everything with `python -m pytest`.
   checks; per-program scratch and the output buffer are sized by the host.
 - **Per-link delays are ignored** in the kernel (all deliveries use the spike's
   arrival time). Edge **backward** is unimplemented (needs reverse CSR).
+- **Spike buffer lifecycle is not handled anywhere yet.** A population's raw
+  spike output can hold entries not yet due (an explicit `n2.spike(time +
+  delay)`) that must survive to a later call, and entries already consumed
+  that must not be double-counted. `merge_blocked_spikes`'s `window` filters
+  correctly for one call, but nothing clears consumed entries or compacts the
+  buffer across calls — that can only be done by the population the spikes
+  belong to (it alone knows what it's already handed out), not by the merge
+  step. Currently assuming (not yet confirmed) that every outstanding delay
+  resolves within one update window, so there's never anything left over to
+  carry forward; true carry-over, if needed, is unimplemented.
 - **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean
   post-target mapping because `@` binds tighter than `>>`; TODOs in
   `Population.__matmul__` / `Connection.__matmul__`.
@@ -148,3 +214,10 @@ layout. Run everything with `python -m pytest`.
   direct `unit/` tests yet — only exercised indirectly through `test/test_*.py`'s
   whole-network compiles. `unit/transpiler/transformers/` and
   `unit/transpiler/analyzers/` are the natural homes once written.
+
+# Human written:
+## Refactoring Ideas
+- delete BlockedSpikes, just use some plain tensors
+- see if same can be done with Topology
+- see if something similar can be done with regions/positions to make them lighter (doubt it though in that case)
+- edges, nodes, patterns, updates, receives, kernel, fabric all take up single files, maybe they can be packaged more tightly file-wise and reuse some things?
