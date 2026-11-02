@@ -133,6 +133,21 @@ class Population:
         with -- also the number of GROUPs (BlockedSpikes' n_groups)."""
         return -(-len(self.shape) // self.group_size)
 
+    @property
+    def uses_per_link_delay_kernel(self) -> bool:
+        """True when any incoming connection carries a real per-link delay
+        tensor, as opposed to no delay or one uniform scalar for the whole
+        connection -- selects which update-kernel variant compile() produces
+        (see naer2/transpiler/templates/). This is population-wide: if any
+        ONE incoming connection is per-link-delayed, every incoming
+        connection's edge forward/backward callbacks are disallowed, not
+        just that connection's own -- see per_link_delay_update_kernel.py's
+        module docstring for why."""
+        return any(
+            isinstance(getattr(conn.fabric, "delay", None), torch.Tensor)
+            for conn in self.incoming
+        )
+
     def _min_incoming_delay(self) -> float:
         """Smallest per-link delay across all incoming connections."""
         min_d = math.inf
@@ -265,19 +280,22 @@ class Population:
         self._merged = None
 
     def _kernel(self):
-        """Compile (once) and return the loaded @triton.jit update_kernel
-        function for this population. Cached on self._kernel_fn -- a
+        """Compile (once) and return the loaded @triton.jit update-kernel
+        function for this population -- whichever variant compile() produced
+        (its ast.FunctionDef name is read back rather than hardcoded, so this
+        works for either template). Cached on self._kernel_fn -- a
         population's compiled source never changes once its connections and
         hooks are fixed."""
         if self._kernel_fn is None:
             module = self.compile()
+            func_name = module.body[0].name
             source = "import triton\nimport triton.language as tl\n\n" + ast.unparse(module) + "\n"
             path = pathlib.Path(tempfile.mkdtemp()) / f"naer2_kernel_{id(self)}.py"
             path.write_text(source)
             spec = importlib.util.spec_from_file_location(path.stem, path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            self._kernel_fn = mod.update_kernel
+            self._kernel_fn = getattr(mod, func_name)
         return self._kernel_fn
 
     def set_fresh_output(self, blocked: BlockedSpikes) -> None:
@@ -353,16 +371,20 @@ class Population:
     def compile(self) -> "ast.Module":
         """Compile the merged update-receive-send kernel for this population.
 
-        Pairs each incoming connection with its transpiled receive-hook stmts,
-        then feeds them — along with the update and send sections — into
-        UpdateKernelTemplate to produce the final ast.Module.
+        Selects between the two update-kernel variants first
+        (uses_per_link_delay_kernel) -- see per_link_delay_update_kernel.py's
+        module docstring for why that switch disallows edge callbacks
+        population-wide rather than per-connection. Otherwise, pairs each
+        incoming connection with its transpiled receive-hook stmts, then
+        feeds them — along with the update and send sections — into
+        NoDelayUpdateKernelTemplate to produce the final ast.Module.
         """
         import ast
 
         from .transpiler.analyzers.used_members import UsedMemberFinder
         from .transpiler.context import TranspilerContext
         from .transpiler.hook_transpiler import HookTranspiler
-        from .transpiler.templates.update_kernel import UpdateKernelTemplate
+        from .transpiler.templates.no_delay_update_kernel import NoDelayUpdateKernelTemplate
 
         ctx = TranspilerContext(
             static_attrs={
@@ -372,6 +394,13 @@ class Population:
             },
             dynamic_attrs=self.dynamic_attrs,
         )
+
+        if self.uses_per_link_delay_kernel:
+            from .transpiler.templates.per_link_delay_update_kernel import (
+                PerLinkDelayUpdateKernelTemplate,
+            )
+
+            return PerLinkDelayUpdateKernelTemplate(ctx, self).build()
 
         # one transpiled receive + edge-forward section per incoming connection
         incoming_with_hooks = []
@@ -495,6 +524,6 @@ class Population:
             for (_, _, _, source_dynamic_attrs, edge_tensor_attrs) in incoming_with_hooks
         ]
 
-        return UpdateKernelTemplate(ctx, incoming_with_hooks).build(
+        return NoDelayUpdateKernelTemplate(ctx, incoming_with_hooks).build(
             update_section, send_section
         )

@@ -42,7 +42,7 @@ def _load_update_kernel(population):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.update_kernel
+    return mod.no_delay_update_kernel
 
 
 def _launch(fn, conn, N, n_blocks, potential, t, spike_time=(), spike_src=(), spike_conn=()):

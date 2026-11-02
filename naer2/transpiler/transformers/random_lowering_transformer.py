@@ -30,8 +30,8 @@ class RandomLoweringTransformer(StmtTransformer):
     independent) has no per-lane state to carry across calls, so every draw
     is reseeded from scratch:
       - offs (the lane's global neuron index — every kernel already computes
-        this once, see UpdateKernelTemplate) makes different lanes in the
-        same call draw different numbers.
+        this once, see NoDelayUpdateKernelTemplate) makes different lanes in
+        the same call draw different numbers.
       - t (the kernel's own per-call time-boundary argument — also already
         in scope everywhere, node hook or spike loop alike — bit-
         reinterpreted as an int) makes the same lane draw a different number

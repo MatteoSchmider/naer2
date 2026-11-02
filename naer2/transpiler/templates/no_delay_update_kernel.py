@@ -1,13 +1,28 @@
 """
-Template for the merged update-receive-send Triton kernel.
+Template for the merged update-receive-send Triton kernel -- the NO-DELAY
+variant: every incoming delivery from one firing source neuron lands at that
+spike's own recorded time, for every link out of that source alike. Edge
+forward/backward callbacks (learned/plastic per-link state) are fully
+supported here.
 
-Every Population compiles to exactly this kernel.  The template provides the
-fixed outer structure; hook transpilation fills in the variable sections.
+A Population compiles to this kernel unless any incoming connection carries
+a real per-link delay tensor (Population.uses_per_link_delay_kernel), in
+which case it compiles to the sibling per_link_delay_update_kernel.py
+instead -- see that module's docstring and TODO.md for why the two are
+separate rather than one kernel handling both: once per-link delay is
+real, a single delivery's processing cost and shape changes enough (one
+entry per synapse activation instead of per firing neuron, no CSR walk,
+gather/scatter instead of a block-local vector load/store) that forcing
+both through one template would complicate this, simpler, far more common
+case for a feature only some connections use.
+
+The template provides the fixed outer structure; hook transpilation fills
+in the variable sections.
 
 Kernel signature:
 
     @triton.jit
-    def update_kernel(
+    def no_delay_update_kernel(
         # per-neuron dynamic state
         <attr>_ptr, ..., n_neurons,
 
@@ -153,9 +168,10 @@ _EXPR = lambda src: ast.parse(src, mode="eval").body
 _STMTS = lambda src: ast.parse(src).body
 
 
-class UpdateKernelTemplate:
+class NoDelayUpdateKernelTemplate:
     """
-    Assembles the ast.Module for the merged update-receive-send kernel.
+    Assembles the ast.Module for the merged update-receive-send kernel (the
+    no-per-link-delay variant -- see the module docstring).
 
     incoming_with_hooks — list of (Connection, recv_stmts, edge_fwd_stmts,
     source_dynamic_attrs, edge_tensor_attrs) in the same order as population.incoming.
@@ -490,7 +506,7 @@ mask = offs < n_neurons
 
     def _func(self, body: list[ast.stmt]) -> ast.FunctionDef:
         return ast.FunctionDef(
-            name="update_kernel",
+            name="no_delay_update_kernel",
             args=ast.arguments(
                 posonlyargs=[],
                 args=self._signature_args(),

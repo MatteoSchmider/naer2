@@ -128,6 +128,92 @@ layout. Run everything with `python -m pytest`.
        launching everything on one stream) — a performance follow-up, see
        "parallelize kernel execution across populations" below, not a
        correctness gap `gather()`'s phase ordering already covers that.
+   - **In progress — real per-link delay, split into two update-kernel
+     variants, design under discussion.** Today's kernel delivers every
+     link out of a firing source at that spike's own recorded time — fine
+     when delay is uniform/absent, wrong once delay genuinely varies per
+     link (arrival time is then `emission_time + delay[link]`, a per-link
+     quantity a single scalar `time` per spike-buffer entry can't carry).
+     Naming/selection landed; the actual per-link-delay kernel is still
+     just a stub, pending the design discussion below.
+     - `naer2/transpiler/templates/update_kernel.py` renamed to
+       `no_delay_update_kernel.py` (`UpdateKernelTemplate` →
+       `NoDelayUpdateKernelTemplate`, emitted function `update_kernel` →
+       `no_delay_update_kernel`) — unchanged behavior, just named for what
+       it now explicitly is: the variant that disallows nothing, forward/
+       backward edge callbacks fully supported, every incoming delivery
+       from one firing source arrives at the same instant. Not to be
+       touched for the per-link-delay work.
+     - New `naer2/transpiler/templates/per_link_delay_update_kernel.py`
+       (`PerLinkDelayUpdateKernelTemplate`) — stub, `build()` raises
+       `NotImplementedError`.
+     - New `Population.uses_per_link_delay_kernel`: true when any incoming
+       connection's `fabric.delay` is a real tensor (as opposed to absent
+       or one uniform scalar). `compile()` branches on this — a
+       population-wide switch, not per-connection: one delayed incoming
+       connection disables edge forward/backward callbacks on *every*
+       incoming connection of that population. Reason: once a delivery is
+       expanded and merged into arrival-time order (see the design below),
+       it no longer sits at a stable position a plastic/learned edge
+       attribute could be written back to without an expensive scatter —
+       judged not worth supporting awkwardly. A population needing both
+       per-link delay on one connection and a learned edge attribute on
+       another isn't representable; split into two populations if that
+       ever comes up.
+     - `test/networks/mini_ei/net.py` had a real per-link `delay` tensor on
+       every connection (inherited from PD14-style realism) that was
+       previously inert — nothing read `delay` at all before this. It now
+       switches E and I to the (stubbed) per-link-delay kernel, which broke
+       14 AST-shape tests that have nothing to do with delay (nothing in
+       `test_mini_ei.py` even references `delay`). Removed it from that
+       fixture, since `test_mini_ei.py` exists specifically to cover the
+       no-delay kernel's shape — a dedicated delay-carrying fixture belongs
+       with the per-link-delay kernel's own tests once it exists.
+     - **Consequence worth naming:** `test/networks/PD14/net.py` sets a
+       real per-link delay tensor on *every* connection — there is no
+       delay-free path through it at all. That means compiling PD14 (item 2
+       below) is now blocked on the per-link-delay kernel actually existing,
+       not just a nice-to-have; the "deliberately without per-link delays
+       first" sanity-check framing in item 2 needs revisiting once this is
+       settled (PD14 as currently written can't take that path at all).
+     - New `test/test_update_kernel_selection.py` (4 tests, no GPU needed —
+       pure AST/metadata, like `test_coverage.py`): no delay and a uniform
+       scalar delay both stay on the no-delay kernel; a real tensor delay on
+       any one incoming connection switches the whole population and raises
+       `NotImplementedError` via the stub, even when another incoming
+       connection has no delay of its own.
+     - **Design discussion in progress, nothing beyond the stub implemented
+       yet:** sort each source row's outgoing links by delay once,
+       statically, at connection-build time (alongside `Topology.blocked()`)
+       — a firing source's own expansion is then already arrival-time
+       ordered for free (fixed emission time + ascending delay). At runtime,
+       combine multiple simultaneously-firing sources' pre-sorted rows via a
+       **dedicated fixed-width merge-network kernel** (preferred over
+       reusing the existing bit-packed `tl.sort` machinery on a fully
+       expanded buffer, to keep cost closer to an optimal merge — one
+       persistent kernel where fixed-width sorting heads exit or keep
+       merging across the `log n` passes depending on parity relative to
+       the current stage, rather than one kernel launch per pass) —
+       needs a standalone benchmark before committing, since `tl.sort` is
+       already proven fast at realistic scale and the merge network is new,
+       bespoke kernel code. Do the same across connections. Lands on one
+       single-target-per-entry buffer; the update kernel then needs no CSR
+       walk for this connection at all — each GPU lane is one delivery, not
+       one target neuron, so per-neuron state access becomes a gather/
+       scatter by each lane's own target id. Collision guard, simplified
+       from the first pass at this (comparing source+time) to just comparing
+       targets directly: two co-processed lanes can never share a target if
+       they're both links out of the same firing source (no-multapses,
+       already assumed by today's CSR walk), so the mask only needs "do any
+       two co-processed lanes share a target," nothing about source/time.
+       Open questions: merge-network vs. reuse-the-sort (needs measuring);
+       whether this lives as its own standalone, independently-testable
+       kernel (matching `compact()`/`merge()`'s style) or inlined into the
+       update kernel's per-connection branch (more efficient per the
+       "combine multiple steps" idea, but not unit-testable in isolation);
+       realistic synapse-activation-count scale to benchmark at, since this
+       turns "spikes processed" into "synapse activations processed" and
+       could be a large multiplier at PD14 fan-out.
    - **Stay on GPU — now measured for real on the 780M, not just reasoned.**
      Earlier this was CPU-only timing plus literature-sourced PCIe/launch
      estimates (no GPU was available yet). With real hardware now working

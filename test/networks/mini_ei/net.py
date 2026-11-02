@@ -55,17 +55,22 @@ def build():
     I_pop.potential = torch.normal(-65.0, 5.0, (N_I,))
 
     # ── connections ─────────────────────────────────────────────────────────
-    def _connect(src, dst, prob, w_mean, w_std, d_mean):
+    # Deliberately no per-link delay: this network exists to exercise the
+    # no-delay update kernel's AST shape (test_mini_ei.py), and a real
+    # per-link delay tensor would switch it to the (currently stubbed)
+    # per-link-delay kernel instead -- see Population.uses_per_link_delay_kernel
+    # and TODO.md. A dedicated delay-carrying fixture belongs with that
+    # kernel's own tests once it exists.
+    def _connect(src, dst, prob, w_mean, w_std):
         conn = src >> PD14_synapse() @ PD14_connection(prob) >> dst
         w = torch.normal(w_mean, abs(w_mean) * 0.1, conn.shape)
         conn.fabric.weight = w.clamp(min=0) if w_mean >= 0 else w.clamp(max=0)
-        conn.fabric.delay  = torch.normal(d_mean, d_mean * 0.5, conn.shape).clamp(min=0.1)
         return conn
 
-    _connect(E_pop, E_pop, _P_EE, _J_E, abs(_J_E) * 0.1, 1.5)
-    _connect(E_pop, I_pop, _P_EI, _J_E, abs(_J_E) * 0.1, 1.5)
-    _connect(I_pop, E_pop, _P_IE, _J_I, abs(_J_I) * 0.1, 0.75)
-    _connect(I_pop, I_pop, _P_II, _J_I, abs(_J_I) * 0.1, 0.75)
+    _connect(E_pop, E_pop, _P_EE, _J_E, abs(_J_E) * 0.1)
+    _connect(E_pop, I_pop, _P_EI, _J_E, abs(_J_E) * 0.1)
+    _connect(I_pop, E_pop, _P_IE, _J_I, abs(_J_I) * 0.1)
+    _connect(I_pop, I_pop, _P_II, _J_I, abs(_J_I) * 0.1)
 
     network = E_pop.network
     pops = {"E": E_pop, "I": I_pop}

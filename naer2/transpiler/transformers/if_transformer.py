@@ -23,12 +23,12 @@ class IfTransformer(ast.NodeTransformer):
     with that mask so only firing lanes actually store anything, and the
     local write-cursor (local_spike_count) is bumped by plain scalar
     arithmetic — no atomic needed, since this slice belongs exclusively to
-    this program instance. The single global atomic that reserves this
-    program's range in the final compacted output buffer happens exactly
-    once, at the very end of the kernel — see UpdateKernelTemplate.build's
-    flush step. This trades many contended global atomics (one per spike
-    check, which is most CSR links visited) for one per program instance,
-    an aggregation technique standard in GPU histogram/counting kernels.
+    this program instance. That count is published once, at the very end of
+    the kernel, with a plain scalar store (also no atomic) — see
+    NoDelayUpdateKernelTemplate.build's flush step and naer2/spike_gather.py:
+    the local scratch buffers this writes into are already laid out exactly
+    as a BlockedSpikes, so nothing needs compacting into a shared buffer at
+    all, let alone with a contended global atomic.
     time=None (default, no argument) records `t`; an expression is spliced in
     verbatim as the timestamp instead — see naer2.sends.spike's docstring.
     Whatever mask this ends up gated by (root "mask", or "is_target" after
