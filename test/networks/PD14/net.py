@@ -74,9 +74,15 @@ def build(desc: dict = description):
     )
     # T has no incoming connections and update() is a no-op -- send()'s own
     # clock (next_spike) is the only thing driving it, so nothing else would
-    # ever make it due (see Network._validate_schedulable). 1.0ms matches
-    # the delay scale already used elsewhere in this network.
-    populations["T"].timestep = 1.0
+    # ever make it due (see Network._validate_schedulable). 0.1ms matches
+    # the literature's accurate clock-driven comparison timestep for PD14 --
+    # and since no other population here declares its own explicit
+    # timestep, this is currently also the sole thing setting the whole
+    # network's cadence (Network._sub_dt takes the min across every
+    # population's declared constraint; every PD14_neuron population is
+    # autonomous with no timestep of its own, so none of them constrain it
+    # -- they just run every sub-step, whatever that ends up being).
+    populations["T"].timestep = 0.1
 
     for source, weight_mean, weight_std, delay_mean, delay_std, probs in zip(
         desc["connections"]["populations"],

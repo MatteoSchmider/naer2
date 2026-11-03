@@ -129,29 +129,85 @@ layout. Run everything with `python -m pytest`.
        "parallelize kernel execution across populations" below, not a
        correctness gap `gather()`'s phase ordering already covers that.
    - **Done — explicit per-population scheduling (`Population.timestep`),
-     a prerequisite the delay design below leans on.** Found while reasoning
-     through how PD14 actually schedules itself: a population driven
-     entirely by `send()`'s own clock, with no incoming connections and no
-     `update()` state (`PD14_poisson`/`T` — `next_spike` lives in `send()`,
-     `update()` is a no-op) was **never due** under the old
-     `has_autonomous_dynamics` (checks `update()` only) /
-     `_min_incoming_delay()` (needs an incoming connection) logic — neither
-     applied, so nothing would ever launch its kernel through
-     `Network.step()`. Fixed by adding `Population.timestep: float | None`
-     (constructor kwarg, like `group_size` etc.; default `None` preserves
-     every existing network's behavior exactly, no net.py elsewhere needed
-     a change). `Population._is_due` checks it first, ahead of both
-     defaults — it's how a population states its own re-check cadence,
-     overriding "every sub-step" (give an autonomous population a coarser
-     explicit interval) or "never" (give a source-only population the only
-     way it can become due at all). `Network._sub_dt` folds it into the
-     network-wide floor the same way `_min_incoming_delay` already did.
-     `Network._validate_schedulable()`, called at the top of `step()`,
-     raises clearly for a population that could never be due under any
-     `t_step` — the exact mistake above, now caught instead of silently
-     never running. Fixed for real: `test/networks/PD14/net.py`'s `T` now
-     sets `.timestep = 1.0`. Tests: `test/test_population_timestep.py` (6,
-     no GPU needed).
+     network-wide effective-period propagation, and a real retention bug
+     fix — together, a prerequisite the delay design below leans on.**
+     Started from one gap (found reasoning through how PD14 actually
+     schedules itself) and grew into two more once pushed on:
+
+     - **Gap 1 — a source-only population could never be due.** A
+       population driven entirely by `send()`'s own clock, with no
+       incoming connections and no `update()` state (`PD14_poisson`/`T` —
+       `next_spike` lives in `send()`, `update()` is a no-op) was never
+       due under the old `has_autonomous_dynamics` (checks `update()`
+       only) / `_min_incoming_delay()` (needs an incoming connection)
+       logic — neither applied. Fixed by adding `Population.timestep:
+       float | None` (constructor kwarg, like `group_size` etc.; default
+       `None` preserves every existing network's behavior exactly). Fixed
+       for real: `test/networks/PD14/net.py`'s `T` now sets `.timestep =
+       0.1` (the literature's accurate clock-driven comparison timestep
+       for PD14) — and since no cortical population declares its own
+       explicit `timestep` (all are autonomous, which by itself
+       constrains nothing), `T` is currently the sole thing setting the
+       whole network's cadence: every `PD14_neuron` population just runs
+       every sub-step unconditionally, whatever that works out to be, so
+       they end up ticking in lockstep with `T`'s declared rate by
+       composition, not by any PD14-specific awareness.
+     - **Gap 2 — a connection with no delay set contributed nothing.**
+       Asked directly: if a connection has no delay at all, its target
+       should sync to its *source's* own cadence, not fall out of the
+       computation entirely (which, combined with no autonomous dynamics
+       and no explicit timestep, is the exact same "never due" shape as
+       gap 1). This can't be answered per-population in isolation anymore
+       — a population's effective period can depend on its source's,
+       which can depend on *its* source's, recursively, including through
+       cycles (recurrent connectivity is normal in SNNs). Replaced the
+       old `_sub_dt`/`_is_due`-does-its-own-thing split with `Network.
+       _compute_effective_periods()`: one pass computing, for every
+       population, the coarsest safe re-check interval — explicit
+       `timestep` wins outright; else 0.0 if autonomous; else the minimum
+       over incoming connections of (that connection's own delay, or — if
+       it has none — the *source's* own period, recursively). Fixed-point
+       iteration over the whole network handles cycles (periods only ever
+       shrink, bounded below by 0.0, and anchored populations are never
+       revised, so a cycle of purely-derived populations can't regress
+       forever). `Population._is_due(t, period)` collapses to one
+       `t - last_update >= period` check for every case uniformly (0.0 =
+       every sub-step; `math.inf`, i.e. truly never-due, is specially
+       guarded against `-inf` initial `last_update` making `inf >= inf`
+       true in Python — an edge case a direct unit test caught). `_sub_dt`
+       and `_validate_schedulable` both now take the precomputed `periods`
+       dict rather than recomputing anything per population.
+     - **Gap 3 — a real, previously-silent correctness bug, found by
+       directly reproducing gap 2's scenario on real hardware rather than
+       just reasoning about it.** `Network.step()`'s merge phase ran
+       `pop._merged = pop.merge_incoming()` unconditionally every
+       sub-step — for a population ticking slower than the network's
+       `sub_dt`, this *overwrote* a previous round's merge result that
+       hadn't been consumed yet (the population wasn't due to run its
+       update kernel on that sub-step), silently losing it the moment the
+       next sub-step's result replaced it. Confirmed with a real run: a
+       slow consumer ended up seeing only its *most recent* sub-step's
+       contribution, not everything that had become due while it waited.
+       Fixed with a new kernel, `spike_gather.combine()` (structurally
+       close to `merge()`, but combining two already-`(time, node,
+       conn)`-tagged sorted streams rather than assigning a connection id
+       per source) — `Network.step()` now `combine()`s a pending
+       `_merged` with each round's fresh result instead of overwriting it;
+       `Population._execute_update_kernel` already cleared `_merged` to
+       `None` after consuming it, which is exactly the signal that lets
+       the next round start fresh instead of combining with stale data.
+     - New test nodes for exercising this (none of the existing ones fit:
+       `counter` is always autonomous and only fires once; nothing fires
+       repeatedly and deterministically without being autonomous) —
+       `test/nodes/ed_relay.py` (purely event-driven: `update()` is a
+       no-op) and `test/nodes/clock_source.py` (autonomous, fires
+       unconditionally every call). Tests: `test/test_spike_gather_gpu.py`
+       (`TestCombine`, 5, GPU), `test/test_population_timestep.py`
+       (scheduling/period-propagation logic, 11, no GPU),
+       `test/test_mixed_scheduling.py` (3, GPU — real `network.step()`
+       runs proving all three gaps fixed together, including a test that
+       pins the exact numbers gap 3's bug used to produce, 18 vs. the
+       bug's 9).
    - **In progress — real per-link delay, split into two update-kernel
      variants, design under discussion.** Today's kernel delivers every
      link out of a firing source at that spike's own recorded time — fine

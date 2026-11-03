@@ -34,50 +34,93 @@ class Network:
     def __iadd__(self, other):
         return self.merge(other)
 
-    def _sub_dt(self, t_step: float) -> float:
-        """Smallest interval the network must broadcast at.
+    def _compute_effective_periods(self) -> dict[Population, float]:
+        """For every population, the coarsest interval it can safely go
+        without being checked:
 
-        A population's own explicit `timestep` (see Population.__init__),
-        when set, always constrains this floor -- it's the user's own
-        statement of how often that population needs re-checking,
-        overriding both defaults below. Otherwise: a population with
-        autonomous dynamics (real update() state) needs the network clock
-        every sub-step, so it doesn't constrain this floor at all (it just
-        runs on whatever cadence other populations require); a purely
-        input-driven population's minimum incoming delay is the coarsest
-        interval at which it can safely skip updates, so that sets the
-        floor instead.
+          - its own explicit `timestep` (Population.__init__), if set --
+            always wins, never revised below;
+          - else 0.0 if it has autonomous dynamics (real update() state) --
+            needs checking every sub-step, also never revised;
+          - else the minimum, across its incoming connections, of: that
+            connection's own delay (scalar or tensor) if it has one, or
+            -- if it has NO delay set at all -- the SOURCE population's own
+            effective period, recursively. An undelayed connection has no
+            timing of its own; it just means "tick whenever my source
+            does." A population with no incoming connections and none of
+            the above gets `math.inf` ("never due" -- see
+            _validate_schedulable, which is what should catch this before
+            it matters).
+
+        Fixed-point iteration handles recurrent connectivity (a population
+        feeding back into something that, through some chain of undelayed
+        connections, feeds back into it): periods only ever shrink here,
+        bounded below by 0.0, so this always terminates, and a population
+        with an explicit/autonomous period is never revised once set, so
+        cycles through those are harmless anchors rather than infinite
+        regress.
         """
-        sub_dt = t_step
+        periods: dict[Population, float] = {}
+        fixed: dict[Population, bool] = {}
         for pop in self.populations:
             if pop.timestep is not None:
-                sub_dt = min(sub_dt, pop.timestep)
-            elif not pop.has_autonomous_dynamics:
-                d = pop._min_incoming_delay()
-                if 0.0 < d < sub_dt:
-                    sub_dt = d
+                periods[pop] = pop.timestep
+                fixed[pop] = True
+            elif pop.has_autonomous_dynamics:
+                periods[pop] = 0.0
+                fixed[pop] = True
+            else:
+                periods[pop] = math.inf
+                fixed[pop] = False
+
+        changed = True
+        while changed:
+            changed = False
+            for pop in self.populations:
+                if fixed[pop]:
+                    continue
+                best = periods[pop]
+                for conn in pop.incoming:
+                    d = getattr(conn.fabric, "delay", None)
+                    if d is None:
+                        cand = periods[conn._source]
+                    else:
+                        cand = float(d.min().item()) if isinstance(d, torch.Tensor) else float(d)
+                    if cand < best:
+                        best = cand
+                if best < periods[pop]:
+                    periods[pop] = best
+                    changed = True
+        return periods
+
+    def _sub_dt(self, t_step: float, periods: dict[Population, float]) -> float:
+        """Smallest interval the network must broadcast at: `t_step`
+        itself, unless some population's own effective period (see
+        _compute_effective_periods) is finer. A period of exactly 0.0
+        (autonomous, no override) doesn't constrain this -- such a
+        population just runs on whatever cadence other populations
+        require."""
+        sub_dt = t_step
+        for period in periods.values():
+            if 0.0 < period < sub_dt:
+                sub_dt = period
         return sub_dt
 
-    def _validate_schedulable(self) -> None:
+    def _validate_schedulable(self, periods: dict[Population, float]) -> None:
         """Raise clearly, before stepping, for a population that could
-        never become due under any t_step: no autonomous update() dynamics,
-        no incoming connection to be event-driven by, and no explicit
-        `timestep` set either. Such a population would just silently never
-        run -- e.g. a Poisson background generator (send() fires on its own
+        never become due under any t_step (effective period is `math.inf`)
+        -- e.g. a Poisson background generator (send() fires on its own
         clock, no incoming connections, update() a no-op) needs `timestep`
         set explicitly, since nothing else could ever make it due."""
-        for pop in self.populations:
-            if (
-                pop.timestep is None
-                and not pop.has_autonomous_dynamics
-                and pop._min_incoming_delay() == math.inf
-            ):
+        for pop, period in periods.items():
+            if period == math.inf:
                 raise ValueError(
                     f"{type(pop.instance).__name__} population would never be due: "
-                    f"no autonomous update() dynamics, no incoming connection, and no "
-                    f"explicit timestep set. Set population.timestep explicitly if this "
-                    f"population needs to be checked on its own clock (e.g. a Poisson "
-                    f"background generator driven by send() alone)."
+                    f"no autonomous update() dynamics, no incoming connection (or only "
+                    f"undelayed ones into other never-due populations), and no explicit "
+                    f"timestep set. Set population.timestep explicitly if this population "
+                    f"needs to be checked on its own clock (e.g. a Poisson background "
+                    f"generator driven by send() alone)."
                 )
 
     def gather(self, t_hi: float, carry_cap: int = 64, per_src_cap: int = 64) -> dict:
@@ -107,12 +150,14 @@ class Network:
     def step(self, t_step: float):
         """Advance the network by t_step.
 
-        Splits t_step into sub-steps when any input-only population has a
-        minimum incoming delay smaller than t_step, then runs each sub-time
-        as three network-wide phases, same ordering as gather() (see its
-        docstring for why phase 1 must finish for every population before
-        phase 2 reads any of them) plus a third phase for the kernels
-        themselves:
+        Splits t_step into sub-steps when any population's own effective
+        period (Population.timestep, autonomous dynamics, or incoming
+        delay -- see _compute_effective_periods, which also resolves an
+        undelayed connection to its source's own period) is finer than
+        t_step, then runs each sub-time as three network-wide phases, same
+        ordering as gather() (see its docstring for why phase 1 must finish
+        for every population before phase 2 reads any of them) plus a
+        third phase for the kernels themselves:
 
           1. gather  — every population's own compact() step
              (Population._execute_gather_kernel), unconditionally: a
@@ -120,20 +165,31 @@ class Network:
              have a carried spike surfacing for a downstream target.
           2. merge   — every population with incoming connections combines
              its sources' now-compact()ed output into this round's input
-             spike buffer (Population.merge_incoming), stashed on
-             Population._merged for phase 3 to consume.
+             spike buffer (Population.merge_incoming). If a PREVIOUS
+             round's merge result is still sitting unconsumed on
+             `_merged` (this population wasn't due yet to run its update
+             kernel), it is combine()d with -- not overwritten by -- this
+             round's result: a population ticking slower than the
+             network's sub_dt must still see everything that became due
+             while it was waiting, not just whatever happened to be due on
+             the one sub-step it finally runs. The result is stashed on
+             Population._merged for phase 3 to consume (and clear).
           3. update  — populations actually due at this sub-time
-             (Population._is_due) run their real compiled kernel
-             (Population._execute_update_kernel), consuming _merged and
-             publishing freshly emitted spikes for the NEXT sub-time's
-             phase 1 to fold in.
+             (Population._is_due, given this round's precomputed periods)
+             run their real compiled kernel (Population.
+             _execute_update_kernel), consuming _merged and publishing
+             freshly emitted spikes for the NEXT sub-time's phase 1 to
+             fold in.
 
         All three phases launch on the same (default) CUDA stream per
         population, same reasoning as gather(): in-order execution is the
         only sync needed, no explicit barrier.
         """
-        self._validate_schedulable()
-        sub_dt = self._sub_dt(t_step)
+        from .spike_gather import combine
+
+        periods = self._compute_effective_periods()
+        self._validate_schedulable(periods)
+        sub_dt = self._sub_dt(t_step, periods)
         t_end = self.t + t_step
         while self.t < t_end - 1e-10:
             self.t = min(self.t + sub_dt, t_end)
@@ -141,8 +197,13 @@ class Network:
                 pop._execute_gather_kernel(self.t)
             for pop in self.populations:
                 if pop.incoming:
-                    pop._merged = pop.merge_incoming()
+                    fresh_merged = pop.merge_incoming()
+                    pop._merged = (
+                        combine(pop._merged, fresh_merged)
+                        if pop._merged is not None
+                        else fresh_merged
+                    )
             for pop in self.populations:
-                if pop._is_due(self.t):
+                if pop._is_due(self.t, periods[pop]):
                     pop._execute_update_kernel(self.t)
                     pop.last_update = self.t

@@ -174,28 +174,30 @@ class Population:
             )
         return min_d
 
-    def _is_due(self, t: float) -> bool:
-        """Whether this population's update kernel needs to run at time t --
-        see Network.step(), which calls this after every population's gather
-        phase has already run (gather is unconditional, every sub-step, for
-        every population: a population's carried spikes may need to surface
-        for a downstream target even on a round it itself has nothing new to
-        compute).
+    def _is_due(self, t: float, period: float) -> bool:
+        """Whether this population's update kernel needs to run at time t,
+        given `period` -- the coarsest interval it can safely go without
+        being checked, computed network-wide by
+        Network._compute_effective_periods() (0.0 for autonomous with no
+        override, self.timestep if set, otherwise derived from incoming
+        delay -- recursively, through undelayed connections, from upstream
+        populations' own periods). A single `t - last_update >= period`
+        check covers every other case uniformly: period 0.0 means "every
+        sub-step" (always true), since last_update only ever moves forward.
+        period == math.inf ("never due" -- see Network._validate_schedulable,
+        which should already have raised before this matters) is special-
+        cased explicitly rather than left to fall out of the arithmetic:
+        last_update starts at -inf, so t - (-inf) is +inf, and +inf >= +inf
+        is True in Python -- the opposite of "never due."
 
-        self.timestep, when set, is checked first and takes priority over
-        both defaults below -- it's how a population overrides either "run
-        every sub-step" (give an autonomous population a coarser explicit
-        cadence) or "never due" (give a population with no incoming
-        connections and no update() dynamics -- e.g. a Poisson background
-        generator whose send() fires on its own clock -- the only way it can
-        ever become due at all; see Network._validate_schedulable).
-        """
-        if self.timestep is not None:
-            return t - self.last_update >= self.timestep
-        if self.has_autonomous_dynamics:
-            return True
-        min_d = self._min_incoming_delay()
-        return min_d < math.inf and t - self.last_update >= min_d
+        See Network.step(), which calls this after every population's
+        gather phase has already run (gather is unconditional, every
+        sub-step, for every population: a population's carried spikes may
+        need to surface for a downstream target even on a round it itself
+        has nothing new to compute)."""
+        if period == math.inf:
+            return False
+        return t - self.last_update >= period
 
     def _ensure_on_device(self, device) -> None:
         """Move this population's own per-neuron dynamic-attr tensors onto

@@ -12,7 +12,7 @@ Skipped entirely when no CUDA/ROCm device is visible to torch.
 import pytest
 import torch
 
-from naer2.spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes, compact, merge
+from naer2.spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes, combine, compact, merge
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -184,3 +184,52 @@ class TestMerge:
         n = int(count[0].item())
         result = list(zip(time[:n].tolist(), node[:n].tolist(), conn[:n].tolist()))
         assert result == [(1.0, 1, 1)]
+
+
+class TestCombine:
+    """combine() -- retention's building block (see Network.step() and
+    TODO.md): unlike merge(), neither input gets a connection id assigned
+    here, since both inputs are themselves already merge()/combine()
+    outputs (already (time, node, conn)-tagged)."""
+
+    def test_combines_two_already_tagged_streams(self):
+        a = merge([_compacted([(5.0, 1)])], conns=[0], per_src_cap=8)
+        b = merge([_compacted([(2.0, 7)])], conns=[1], per_src_cap=8)
+
+        time, node, conn, count = combine(a, b)
+
+        n = int(count[0].item())
+        result = list(zip(time[:n].tolist(), node[:n].tolist(), conn[:n].tolist()))
+        assert result == [(2.0, 7, 1), (5.0, 1, 0)]
+
+    def test_preserves_each_input_s_own_conn_tags_unchanged(self):
+        # a already combines conns 0 and 1; b is conn 2 alone -- combine()
+        # must not reassign or collapse any of these.
+        a = merge([_compacted([(1.0, 0)]), _compacted([(4.0, 9)])], conns=[0, 1], per_src_cap=8)
+        b = merge([_compacted([(2.0, 5)])], conns=[2], per_src_cap=8)
+
+        time, node, conn, count = combine(a, b)
+
+        n = int(count[0].item())
+        result = list(zip(time[:n].tolist(), node[:n].tolist(), conn[:n].tolist()))
+        assert result == [(1.0, 0, 0), (2.0, 5, 2), (4.0, 9, 1)]
+
+    def test_empty_a_is_a_pure_passthrough_of_b(self):
+        a = merge([_compacted([])], conns=[0], per_src_cap=8)
+        b = merge([_compacted([(3.0, 2)])], conns=[4], per_src_cap=8)
+
+        time, node, conn, count = combine(a, b)
+
+        n = int(count[0].item())
+        result = list(zip(time[:n].tolist(), node[:n].tolist(), conn[:n].tolist()))
+        assert result == [(3.0, 2, 4)]
+
+    def test_empty_b_is_a_pure_passthrough_of_a(self):
+        a = merge([_compacted([(3.0, 2)])], conns=[4], per_src_cap=8)
+        b = merge([_compacted([])], conns=[0], per_src_cap=8)
+
+        time, node, conn, count = combine(a, b)
+
+        n = int(count[0].item())
+        result = list(zip(time[:n].tolist(), node[:n].tolist(), conn[:n].tolist()))
+        assert result == [(3.0, 2, 4)]
