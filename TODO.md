@@ -393,17 +393,108 @@ layout. Run everything with `python -m pytest`.
        below), overridable per population (`Population.<something>`, not
        yet added — an event-driven population's own author knows their
        dynamics' tolerance better than a network-wide default could).
-       A connection's per-link delay is split into that many static,
-       quantile-balanced buckets (computed once, like `Topology.blocked()`
-       — no runtime sort, reusing the existing CSR-walk/densify-reduce
-       machinery per bucket, no gather/scatter-by-delivery redesign needed
-       at all) *within one population timestep* — i.e. `Population.
-       timestep` (see above) is exactly the width this bucketing needs to
-       know, which is why getting per-population scheduling right came
-       first. A connection whose whole delay spread already fits inside
-       one timestep collapses to effectively one bucket for free — "ignore
+       A connection's per-link delay is split into that many static
+       buckets (computed once, like `Topology.blocked()` — no runtime
+       sort, reusing the existing CSR-walk/densify-reduce machinery per
+       bucket, no gather/scatter-by-delivery redesign needed at all)
+       *within one population timestep* — i.e. `Population.timestep` (see
+       above) is exactly the width this bucketing needs to know, which is
+       why getting per-population scheduling right came first. A
+       connection whose whole delay spread already fits inside one
+       timestep collapses to effectively one bucket for free — "ignore
        small differences" falls out of the scheme rather than needing a
-       special case.
+       special case. Buckets are **equal-width** (`bucket_width =
+       timestep / n_buckets`, not quantile-balanced as first sketched —
+       equal-width ties directly to the population's own timestep as the
+       natural reference unit, with no separate quantile pass needed; the
+       collision-rate reasoning that motivated quantile balancing earlier
+       was for a different, since-abandoned design, see the historical
+       trail below).
+       - **Done — the static partitioning step, in isolation.**
+         `Topology.blocked(group_size, n_targets, delay=None, n_buckets=1,
+         timestep=None)`: new optional params, backward compatible by
+         construction (`n_buckets=1`, the default, runs the exact
+         pre-existing code path unchanged — same `offsets` shape, byte-
+         identical output; confirmed by a test that runs both and asserts
+         equality). `n_buckets > 1` sorts links by `(block, bucket,
+         source)` instead of `(block, source)` — structurally the same
+         "flatten two keys into one, argsort once" trick already used for
+         block-only layout, just with the group index generalized from
+         `block` to `block * n_buckets + bucket`; `offsets` gains a bucket
+         axis (`[n_blocks, n_buckets, N_src + 1]`), `block_base` (for
+         `block_slice()`/`to_blocked()`/`from_blocked()`, unchanged) is
+         recovered by taking every `n_buckets`-th entry of the finer
+         `group_base`, since the same block-major-contiguous property
+         holds one level up. A delay `>= timestep` (out of this part's
+         scope by definition) clamps into the last bucket rather than
+         erroring. Pure `torch`, no Triton, no kernel/Population changes
+         yet. Tests: `unit/test_topology.py` (+10: default-unchanged,
+         missing-args raises, two hand-picked small cases — one link per
+         bucket, and multiple links sharing a bucket — plus the existing
+         parametrized "faithful to canonical CSR" case regenerated with
+         bucketing on). One test-authoring bug caught and fixed along the
+         way: an early version of the parametrized test sliced each
+         bucket's range as `offsets[b, bk, 0]:offsets[b, bk, 1]` (source
+         0's own sub-range only, not the whole bucket) instead of
+         per-source `offsets[b, bk, s]:offsets[b, bk, s+1]` like the
+         existing non-bucketed test already does — failed 4 of 5
+         parametrized cases until corrected; the implementation itself
+         was right the whole time.
+       - **Done — wired into the real kernel/`Population`, verified on
+         real hardware against a real network.** `PerLinkDelayUpdateKernelTemplate`
+         (`naer2/transpiler/templates/per_link_delay_update_kernel.py`,
+         previously a stub) is now `no_delay_update_kernel.py` with one
+         real difference: `_csr_branch` unrolls `n_buckets` sequential
+         copies of the range-load-and-link-loop block (bucket 0's whole
+         range fully processed before bucket 1's starts — plain Python
+         generation at build time, the same trick `_conn_dispatch` already
+         uses to unroll per-connection branches, not a Triton loop
+         construct, since `n_buckets` is small and fixed per population),
+         each using that bucket's own representative arrival time
+         (`emission_time + bucket_index * bucket_width`, baked in as one
+         literal float per bucket — no new kernel argument needed).
+         `Population.compile()` now computes `incoming_with_hooks`
+         unconditionally first, then dispatches to whichever template at
+         the end (previously the per-link-delay branch returned before
+         any of that shared computation ran at all, which is why it could
+         only ever be a stub). The **adaptation point** flagged in
+         advance: `Population._effective_period()` (own `.timestep` if
+         set, else looked up from `Network._compute_effective_periods()`)
+         decides whether a connection's delay actually fits — `compile()`
+         raises `NotImplementedError` naming the actual delay and period
+         if any link's delay reaches or exceeds it (the cross-timestep
+         case, Part 2, still not implemented), otherwise builds the real
+         bucketed kernel. New `Population.n_delay_buckets` (default 8,
+         like `timestep`/`carry_cap` etc.) and `_execute_update_kernel`
+         building the delay-bucketed topology (falling a connection
+         with no real delay tensor of its own back to a uniform one, so
+         every connection on a per-link-delay population gets a
+         consistent bucketed offsets shape, not a per-connection mix).
+         Real network test (`test/test_per_link_delay_kernel.py`, 3
+         tests): one source neuron, all-to-all into 4 targets, weight
+         alternating `[1, 0, 1, 0]`, delay placing each target in a
+         different one of 4 buckets — only the weight-1 targets fire, each
+         at exactly its own bucket's arrival time, written into the local
+         spike buffer in ascending bucket order (checked directly, not
+         just the final who-fired set — see the test's docstring for the
+         exact hand-derived numbers). Two real node-authoring gotchas
+         found and fixed along the way, in the test's own node (not the
+         kernel): bare `n2.spike()` always records the outer kernel
+         boundary `t`, never the contextual `time` — needed `n2.spike
+         (time)` explicitly to capture a bucket's own arrival time; and
+         forgetting to reset `potential` after firing let the kernel's
+         *second*, unconditional final-propagation pass (Part 2, which
+         always re-runs `send()` once more for every neuron) fire a
+         second time at `t` for anyone who'd already fired once — both
+         are just restating existing, documented kernel semantics
+         (`naer2.sends.spike`'s own docstring, and `counter`'s own
+         receive/send already resetting on every branch) rather than
+         anything new the delay kernel introduced.
+       - **Still not revisited:** the "no edge callbacks on a per-link-
+         delay population" restriction (shipped under the abandoned
+         continuous-delay design) — bucketing doesn't reshuffle links at
+         all, so it's probably safe to lift for this kernel, just not
+         done yet.
        **Part 2 — cross-timestep delay (the part that still needs
        solving).** A delay that exceeds one population timestep pushes a
        delivery into a *later* timestep entirely, which is a different

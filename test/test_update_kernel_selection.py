@@ -38,8 +38,30 @@ def test_a_real_per_link_delay_tensor_switches_the_whole_population():
     B.incoming[0].fabric.delay = torch.rand(B.incoming[0].shape)
     assert B.uses_per_link_delay_kernel
 
-    with pytest.raises(NotImplementedError, match="per-link-delay"):
+
+def test_delay_exceeding_the_population_s_own_period_raises_not_implemented():
+    """counter is autonomous with no explicit timestep -> period 0.0 ("every
+    sub-step") -- any nonzero delay is a cross-timestep case by definition,
+    which isn't implemented (only intra-timestep bucketing is)."""
+    _, pops = build()
+    B = pops["B"]
+    B.incoming[0].fabric.delay = torch.rand(B.incoming[0].shape)
+
+    with pytest.raises(NotImplementedError, match="cross-timestep"):
         B.compile()
+
+
+def test_delay_within_the_population_s_own_timestep_compiles_for_real():
+    """The in-scope case: every delay value stays below the target's own
+    explicit timestep -> compiles to the real per-link-delay kernel instead
+    of raising."""
+    _, pops = build()
+    B = pops["B"]
+    B.timestep = 1.0
+    B.incoming[0].fabric.delay = torch.rand(B.incoming[0].shape) * 0.9  # all < 1.0
+
+    module = B.compile()
+    assert module.body[0].name == "per_link_delay_update_kernel"
 
 
 def test_edge_class_with_dynamic_attrs_raises_clearly_in_delay_mode():

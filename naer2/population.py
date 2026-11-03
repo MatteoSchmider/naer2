@@ -27,6 +27,7 @@ class Population:
         carry_cap: int = 64,
         per_src_cap: int = 64,
         timestep: float | None = None,
+        n_delay_buckets: int = 8,
     ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
         self.shape: Region = Region(shape)
@@ -62,6 +63,15 @@ class Population:
         # generator) has no other way to ever become due; see
         # Network._validate_schedulable and TODO.md.
         self.timestep = timestep
+
+        # Default bucket count for the intra-timestep per-link-delay kernel
+        # (naer2/transpiler/templates/per_link_delay_update_kernel.py) --
+        # only consulted when some incoming connection actually carries a
+        # real per-link delay tensor (uses_per_link_delay_kernel). A
+        # placeholder default (8); an event-driven population's own author
+        # knows their dynamics' delay-precision tolerance better than a
+        # network-wide default could, so this is overridable per population.
+        self.n_delay_buckets = n_delay_buckets
 
         # Check that instance's type was decorated and registered
         if instance.__class__ not in node_types.keys():
@@ -188,6 +198,20 @@ class Population:
             )
         return min_d
 
+    def _effective_period(self) -> float:
+        """This population's own effective re-check period -- its explicit
+        `timestep` if set, otherwise the network-wide computation (see
+        Network._compute_effective_periods, which this just looks itself
+        up in). Used by compile()/_execute_update_kernel to know the width
+        the per-link-delay kernel's buckets need to span; computing the
+        whole network's periods here is a bit more than strictly needed
+        for a single population, but it's cheap (one fixed-point pass over
+        populations, not data) and keeps this consistent with how
+        Network.step() derives the same number."""
+        if self.timestep is not None:
+            return self.timestep
+        return self.network._compute_effective_periods()[self]
+
     def _is_due(self, t: float, period: float) -> bool:
         """Whether this population's update kernel needs to run at time t,
         given `period` -- the coarsest interval it can safely go without
@@ -286,10 +310,33 @@ class Population:
         args["spike_conn_ptr"] = spike_conn
         args["n_spikes"] = n_spikes
 
+        delay_kernel = self.uses_per_link_delay_kernel
+        period = self._effective_period() if delay_kernel else None
+
         for i, conn in enumerate(self.incoming):
             source_dynamic_attrs, edge_tensor_attrs = self._compiled_incoming_meta[i]
             conn._source._ensure_on_device(device)
-            bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
+            if delay_kernel:
+                # Every connection on a per-link-delay population goes
+                # through the same bucketed layout, even one with no real
+                # delay of its own (scalar or unset) -- fall back to a
+                # uniform delay tensor so every connection lands in one
+                # consistent bucket (its own, or bucket 0 if unset), rather
+                # than needing the template to handle a per-connection mix
+                # of bucketed/unbucketed offset shapes.
+                d = getattr(conn.fabric, "delay", None)
+                if isinstance(d, torch.Tensor):
+                    delay_tensor = d
+                else:
+                    delay_tensor = torch.full(
+                        (len(conn.fabric.topology),), float(d) if d is not None else 0.0
+                    )
+                bt = conn.fabric.topology.blocked(
+                    self.group_size, n_neurons,
+                    delay=delay_tensor, n_buckets=self.n_delay_buckets, timestep=period,
+                )
+            else:
+                bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
             args[f"conn{i}_src_offsets_ptr"] = bt.offsets.flatten().to(device=device, dtype=torch.int64)
             args[f"conn{i}_target_indices_ptr"] = bt.target_local.to(device=device, dtype=torch.int32)
             for attr in edge_tensor_attrs:
@@ -450,12 +497,16 @@ class Population:
                         f"assignment and set any needed per-link tensor directly instead, "
                         f"e.g. conn.fabric.weight = tensor(...)."
                     )
-
-            from .transpiler.templates.per_link_delay_update_kernel import (
-                PerLinkDelayUpdateKernelTemplate,
-            )
-
-            return PerLinkDelayUpdateKernelTemplate(ctx, self).build()
+            period = self._effective_period()
+            for conn in self.incoming:
+                d = getattr(conn.fabric, "delay", None)
+                if isinstance(d, torch.Tensor) and float(d.max().item()) >= period:
+                    raise NotImplementedError(
+                        f"connection with max delay {float(d.max().item())} >= "
+                        f"{type(self.instance).__name__}'s own timestep/period ({period}) "
+                        f"-- cross-timestep per-link delay is not implemented yet, only "
+                        f"intra-timestep bucketing. See TODO.md."
+                    )
 
         # one transpiled receive + edge-forward section per incoming connection
         incoming_with_hooks = []
@@ -582,6 +633,16 @@ class Population:
             (source_dynamic_attrs, edge_tensor_attrs)
             for (_, _, _, source_dynamic_attrs, edge_tensor_attrs) in incoming_with_hooks
         ]
+
+        if self.uses_per_link_delay_kernel:
+            from .transpiler.templates.per_link_delay_update_kernel import (
+                PerLinkDelayUpdateKernelTemplate,
+            )
+
+            bucket_width = period / self.n_delay_buckets
+            return PerLinkDelayUpdateKernelTemplate(
+                ctx, incoming_with_hooks, self.n_delay_buckets, bucket_width
+            ).build(update_section, send_section)
 
         return NoDelayUpdateKernelTemplate(ctx, incoming_with_hooks).build(
             update_section, send_section

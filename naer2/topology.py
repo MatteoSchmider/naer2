@@ -119,7 +119,14 @@ class Topology:
     def __len__(self) -> int:
         return len(self.target_indices)
 
-    def blocked(self, group_size: int, n_targets: int) -> "BlockedTopology":
+    def blocked(
+        self,
+        group_size: int,
+        n_targets: int,
+        delay: torch.Tensor | None = None,
+        n_buckets: int = 1,
+        timestep: float | None = None,
+    ) -> "BlockedTopology":
         """
         Re-lay this topology out per target block, for the update kernel.
 
@@ -132,6 +139,19 @@ class Topology:
 
         group_size is the kernel's GROUP_SIZE and must match at launch —
         the layout is meaningless for any other value.
+
+        delay/n_buckets/timestep additionally partition each block's links
+        by delay bucket (bucket width = timestep / n_buckets), the same
+        block-major-then-source-major idea with one more level: block,
+        then bucket, then source. Scope for now: a connection whose whole
+        delay spread fits within one population timestep (delay beyond a
+        timestep -- the cross-timestep case -- isn't handled here; an
+        out-of-scope delay >= timestep just clamps into the last bucket
+        rather than erroring). n_buckets=1 (default) is the plain
+        block-only layout above, byte-for-byte -- delay/timestep are
+        ignored and `offsets` stays 2D ([n_blocks, N_src + 1]); n_buckets>1
+        requires both delay (one entry per link) and timestep, and
+        `offsets` gains a bucket axis ([n_blocks, n_buckets, N_src + 1]).
         """
         n_src = len(self.source_offsets) - 1
         n_blocks = -(-n_targets // group_size)
@@ -140,23 +160,59 @@ class Topology:
 
         src = torch.repeat_interleave(torch.arange(n_src), self.source_offsets.diff())
         block = self.target_indices // group_size
-        key = block * n_src + src
-        perm = torch.argsort(key, stable=True)  # stable: keeps target order within a row
 
-        counts = torch.bincount(key, minlength=n_blocks * n_src)
+        if n_buckets <= 1:
+            key = block * n_src + src
+            perm = torch.argsort(key, stable=True)  # stable: keeps target order within a row
+
+            counts = torch.bincount(key, minlength=n_blocks * n_src)
+            starts = torch.cumsum(counts, 0) - counts
+            block_base = torch.zeros(n_blocks + 1, dtype=torch.int64)
+            block_base[1:] = torch.cumsum(counts.view(n_blocks, n_src).sum(1), 0)
+
+            # offsets[b, s] : offsets[b, s + 1] are block b's links out of source s.
+            # Sorted order is block-major, so the end of a block's last source row is
+            # the start of the next block — no separate end table needed.
+            offsets = torch.empty(n_blocks, n_src + 1, dtype=torch.int64)
+            offsets[:, :n_src] = starts.view(n_blocks, n_src)
+            offsets[:, n_src] = block_base[1:]
+
+            target_local = (self.target_indices[perm] % group_size).to(torch.int32)
+            return BlockedTopology(offsets, target_local, perm, block_base, group_size, n_targets)
+
+        if delay is None or timestep is None:
+            raise ValueError("n_buckets > 1 needs both delay and timestep")
+        if len(delay) != len(self.target_indices):
+            raise ValueError("delay must have exactly one entry per link")
+
+        bucket_width = timestep / n_buckets
+        bucket = (delay / bucket_width).floor().clamp(0, n_buckets - 1).to(torch.int64)
+
+        n_groups = n_blocks * n_buckets
+        group = block * n_buckets + bucket
+        key = group * n_src + src
+        perm = torch.argsort(key, stable=True)
+
+        counts = torch.bincount(key, minlength=n_groups * n_src)
         starts = torch.cumsum(counts, 0) - counts
-        block_base = torch.zeros(n_blocks + 1, dtype=torch.int64)
-        block_base[1:] = torch.cumsum(counts.view(n_blocks, n_src).sum(1), 0)
+        group_base = torch.zeros(n_groups + 1, dtype=torch.int64)
+        group_base[1:] = torch.cumsum(counts.view(n_groups, n_src).sum(1), 0)
 
-        # offsets[b, s] : offsets[b, s + 1] are block b's links out of source s.
-        # Sorted order is block-major, so the end of a block's last source row is
-        # the start of the next block — no separate end table needed.
-        offsets = torch.empty(n_blocks, n_src + 1, dtype=torch.int64)
-        offsets[:, :n_src] = starts.view(n_blocks, n_src)
-        offsets[:, n_src] = block_base[1:]
+        offsets = torch.empty(n_groups, n_src + 1, dtype=torch.int64)
+        offsets[:, :n_src] = starts.view(n_groups, n_src)
+        offsets[:, n_src] = group_base[1:]
+        offsets = offsets.view(n_blocks, n_buckets, n_src + 1)
+
+        # block b's whole range (spanning all its buckets) is still exactly
+        # the flattened-contiguous trick above, one level up: group_base at
+        # every n_buckets-th group boundary.
+        block_base = group_base[:: n_buckets].clone()
 
         target_local = (self.target_indices[perm] % group_size).to(torch.int32)
-        return BlockedTopology(offsets, target_local, perm, block_base, group_size, n_targets)
+        return BlockedTopology(
+            offsets, target_local, perm, block_base, group_size, n_targets,
+            n_buckets=n_buckets, bucket_width=bucket_width,
+        )
 
     @staticmethod
     def build(pattern, source_region: Region, target_region: Region = None):
@@ -219,15 +275,21 @@ class BlockedTopology:
     """
     A Topology laid out block-major for the update kernel (see Topology.blocked).
 
-    offsets       [n_blocks, N_src + 1] int64 — ABSOLUTE positions into the flat
-                  link arrays: block b's links out of source s are positions
-                  offsets[b, s] : offsets[b, s + 1]
+    offsets       [n_blocks, N_src + 1] int64 (or [n_blocks, n_buckets,
+                  N_src + 1] when delay-bucketed, see Topology.blocked) —
+                  ABSOLUTE positions into the flat link arrays: block b's
+                  links out of source s are positions offsets[b, s] :
+                  offsets[b, s + 1]
     target_local  [n_links] int32 — target index within its block, 0..group_size-1
                   (the global target is block * group_size + target_local)
     perm          [n_links] int64 — perm[k] is the canonical link index of
                   blocked position k
     block_base    [n_blocks + 1] int64 — block b owns positions
-                  block_base[b] : block_base[b + 1]
+                  block_base[b] : block_base[b + 1] (spans all of a block's
+                  buckets when delay-bucketed)
+    n_buckets     delay buckets per block (1 = no bucketing, the default)
+    bucket_width  the delay span one bucket covers (timestep / n_buckets),
+                  or None when n_buckets == 1
 
     Per-link tensors (weights, ...) must be laid out the same way: to_blocked()
     before handing them to the kernel, from_blocked() to read results back in
@@ -235,13 +297,18 @@ class BlockedTopology:
     array[block_slice(b)] — a zero-copy slice, not a separate allocation.
     """
 
-    def __init__(self, offsets, target_local, perm, block_base, group_size, n_targets):
+    def __init__(
+        self, offsets, target_local, perm, block_base, group_size, n_targets,
+        n_buckets: int = 1, bucket_width: float | None = None,
+    ):
         self.offsets = offsets
         self.target_local = target_local
         self.perm = perm
         self.block_base = block_base
         self.group_size = group_size
         self.n_targets = n_targets
+        self.n_buckets = n_buckets
+        self.bucket_width = bucket_width
 
     @property
     def n_blocks(self) -> int:
