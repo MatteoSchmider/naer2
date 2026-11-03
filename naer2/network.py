@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from typing import TYPE_CHECKING, Set
 
 import torch
@@ -36,19 +37,48 @@ class Network:
     def _sub_dt(self, t_step: float) -> float:
         """Smallest interval the network must broadcast at.
 
-        For populations with autonomous dynamics the network clock is always
-        needed, so they don't constrain sub_dt.  For purely input-driven
-        populations the minimum incoming delay is the coarsest interval at
-        which they can safely skip updates, so it sets the floor.
+        A population's own explicit `timestep` (see Population.__init__),
+        when set, always constrains this floor -- it's the user's own
+        statement of how often that population needs re-checking,
+        overriding both defaults below. Otherwise: a population with
+        autonomous dynamics (real update() state) needs the network clock
+        every sub-step, so it doesn't constrain this floor at all (it just
+        runs on whatever cadence other populations require); a purely
+        input-driven population's minimum incoming delay is the coarsest
+        interval at which it can safely skip updates, so that sets the
+        floor instead.
         """
         sub_dt = t_step
         for pop in self.populations:
-            if pop.has_autonomous_dynamics:
-                continue
-            d = pop._min_incoming_delay()
-            if 0.0 < d < sub_dt:
-                sub_dt = d
+            if pop.timestep is not None:
+                sub_dt = min(sub_dt, pop.timestep)
+            elif not pop.has_autonomous_dynamics:
+                d = pop._min_incoming_delay()
+                if 0.0 < d < sub_dt:
+                    sub_dt = d
         return sub_dt
+
+    def _validate_schedulable(self) -> None:
+        """Raise clearly, before stepping, for a population that could
+        never become due under any t_step: no autonomous update() dynamics,
+        no incoming connection to be event-driven by, and no explicit
+        `timestep` set either. Such a population would just silently never
+        run -- e.g. a Poisson background generator (send() fires on its own
+        clock, no incoming connections, update() a no-op) needs `timestep`
+        set explicitly, since nothing else could ever make it due."""
+        for pop in self.populations:
+            if (
+                pop.timestep is None
+                and not pop.has_autonomous_dynamics
+                and pop._min_incoming_delay() == math.inf
+            ):
+                raise ValueError(
+                    f"{type(pop.instance).__name__} population would never be due: "
+                    f"no autonomous update() dynamics, no incoming connection, and no "
+                    f"explicit timestep set. Set population.timestep explicitly if this "
+                    f"population needs to be checked on its own clock (e.g. a Poisson "
+                    f"background generator driven by send() alone)."
+                )
 
     def gather(self, t_hi: float, carry_cap: int = 64, per_src_cap: int = 64) -> dict:
         """Two-phase spike management across the whole network (see
@@ -102,6 +132,7 @@ class Network:
         population, same reasoning as gather(): in-order execution is the
         only sync needed, no explicit barrier.
         """
+        self._validate_schedulable()
         sub_dt = self._sub_dt(t_step)
         t_end = self.t + t_step
         while self.t < t_end - 1e-10:

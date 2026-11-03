@@ -3,7 +3,6 @@ import torch
 from .connection import PD14_connection
 from .neuron import PD14_neuron
 from .poisson import PD14_poisson
-from .synapse import PD14_synapse
 
 """
 Implementation notes (Potjans & Diesmann 2014):
@@ -73,6 +72,11 @@ def build(desc: dict = description):
         PD14_poisson(desc["T"]["rate"], desc["T"]["start"], desc["T"]["stop"])
         * desc["T"]["size"]
     )
+    # T has no incoming connections and update() is a no-op -- send()'s own
+    # clock (next_spike) is the only thing driving it, so nothing else would
+    # ever make it due (see Network._validate_schedulable). 1.0ms matches
+    # the delay scale already used elsewhere in this network.
+    populations["T"].timestep = 1.0
 
     for source, weight_mean, weight_std, delay_mean, delay_std, probs in zip(
         desc["connections"]["populations"],
@@ -90,12 +94,9 @@ def build(desc: dict = description):
                 if source == "E_23" and target == "E_4"
                 else (weight_mean, weight_std)
             )
-            pattern = PD14_connection(prob)
-            conn = (
-                populations[source] >> PD14_synapse() @ pattern >> populations[target]
-            )
-            conn.fabric.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
+            conn = populations[source] >> PD14_connection(prob) >> populations[target]
+            conn.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
             weights = torch.normal(w_mean, w_std, conn.shape)
-            conn.fabric.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
+            conn.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
 
     return populations["T"].network

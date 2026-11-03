@@ -24,6 +24,7 @@ class Population:
         spike_block: int = 32,
         link_block: int = 64,
         local_spike_cap: int = 64,
+        timestep: float | None = None,
     ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
         self.shape: Region = Region(shape)
@@ -35,6 +36,18 @@ class Population:
         self.spike_block = spike_block
         self.link_block = link_block
         self.local_spike_cap = local_spike_cap
+
+        # This population's own, explicit re-check interval -- independent of
+        # (and taking priority over) both has_autonomous_dynamics' "every
+        # sub-step" default and _min_incoming_delay()'s event-driven floor.
+        # None (default) preserves existing behavior exactly: an autonomous
+        # population (real update() dynamics) runs every sub-step, a purely
+        # event-driven one only when due by incoming delay. Set this when
+        # neither applies -- e.g. a population whose send() fires on its own
+        # clock with no incoming connections at all (a Poisson background
+        # generator) has no other way to ever become due; see
+        # Network._validate_schedulable and TODO.md.
+        self.timestep = timestep
 
         # Check that instance's type was decorated and registered
         if instance.__class__ not in node_types.keys():
@@ -167,7 +180,18 @@ class Population:
         phase has already run (gather is unconditional, every sub-step, for
         every population: a population's carried spikes may need to surface
         for a downstream target even on a round it itself has nothing new to
-        compute)."""
+        compute).
+
+        self.timestep, when set, is checked first and takes priority over
+        both defaults below -- it's how a population overrides either "run
+        every sub-step" (give an autonomous population a coarser explicit
+        cadence) or "never due" (give a population with no incoming
+        connections and no update() dynamics -- e.g. a Poisson background
+        generator whose send() fires on its own clock -- the only way it can
+        ever become due at all; see Network._validate_schedulable).
+        """
+        if self.timestep is not None:
+            return t - self.last_update >= self.timestep
         if self.has_autonomous_dynamics:
             return True
         min_d = self._min_incoming_delay()
@@ -396,6 +420,21 @@ class Population:
         )
 
         if self.uses_per_link_delay_kernel:
+            for conn in self.incoming:
+                if conn.fabric.dynamic_attrs:
+                    edge_name = type(conn.fabric.instance).__name__
+                    raise ValueError(
+                        f"{type(self.instance).__name__} population uses a per-link-delay "
+                        f"kernel (some incoming connection has a real per-link delay "
+                        f"tensor), which disallows edge forward/backward callbacks on "
+                        f"every incoming connection -- but edge type '{edge_name}' "
+                        f"declares forward/backward-assigned per-link attrs "
+                        f"{sorted(conn.fabric.dynamic_attrs)}, which can never actually "
+                        f"change under this kernel. Use an edge with no forward/backward "
+                        f"assignment and set any needed per-link tensor directly instead, "
+                        f"e.g. conn.fabric.weight = tensor(...)."
+                    )
+
             from .transpiler.templates.per_link_delay_update_kernel import (
                 PerLinkDelayUpdateKernelTemplate,
             )
@@ -462,7 +501,11 @@ class Population:
             )
 
             for attr in referenced_edge_attrs:
-                if attr not in conn.fabric.dynamic_attrs and attr not in conn.fabric.static_attrs:
+                if (
+                    attr not in conn.fabric.dynamic_attrs
+                    and attr not in conn.fabric.static_attrs
+                    and attr not in conn.fabric.state
+                ):
                     raise ValueError(
                         f"edge.{attr}/self.{attr} referenced but '{attr}' does not exist on {conn.fabric!r}"
                     )

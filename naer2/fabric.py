@@ -21,30 +21,44 @@ class Fabric:
 
     Topology is set by ConnectionBuilder.target() after Topology.build() completes.
     Per-link tensors are populated by the user (or a future initializer) afterwards.
+
+    instance=None (no @n2.edge class at all) makes a bare Fabric: no forward/
+    backward hooks, no dynamic/static attrs of its own. This is what lets a
+    connection skip an edge class entirely for the common "just one or more
+    plain per-link tensors, no learning rule" case — see
+    Connection.__setattr__, which is the validated, ergonomic way to populate
+    one (conn.weight = tensor(...) rather than conn.fabric.weight = ...);
+    nothing loads such a tensor unless some hook actually references
+    edge.<name>, exactly as for a real edge class's unused attrs.
     """
 
-    def __init__(self, instance):
-        if instance.__class__ not in edge_types:
+    def __init__(self, instance=None):
+        if instance is not None and instance.__class__ not in edge_types:
             raise ValueError("edge needs to be decorated by the @n2.edge decorator")
 
         object.__setattr__(self, 'instance', instance)
-        object.__setattr__(self, 'edge', edge_types[instance.__class__])
+        object.__setattr__(
+            self,
+            'edge',
+            edge_types[instance.__class__] if instance is not None else {"forward": None, "backward": None},
+        )
         object.__setattr__(self, 'topology', None)
         object.__setattr__(self, 'state', {})
 
         dynamic_attrs: dict[str, type] = {}
-        assigned = (
-            self.edge["forward"].assigned_members
-            | self.edge["backward"].assigned_members
-        )
-        for member in assigned:
-            if member not in instance.__dict__:
-                raise ValueError(f"Edge instance needs to have a member '{member}'")
-            dynamic_attrs[member] = instance.__dict__[member].__class__
+        if instance is not None:
+            assigned = (
+                self.edge["forward"].assigned_members
+                | self.edge["backward"].assigned_members
+            )
+            for member in assigned:
+                if member not in instance.__dict__:
+                    raise ValueError(f"Edge instance needs to have a member '{member}'")
+                dynamic_attrs[member] = instance.__dict__[member].__class__
 
         object.__setattr__(self, 'dynamic_attrs', dynamic_attrs)
         object.__setattr__(self, 'static_attrs', {
-            k: v for k, v in instance.__dict__.items()
+            k: v for k, v in (instance.__dict__.items() if instance is not None else ())
             if k not in dynamic_attrs
         })
 

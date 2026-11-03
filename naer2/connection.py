@@ -61,6 +61,15 @@ class ConnectionBuilder:
     def _topology(self):
         return self._fabric.topology if self._fabric is not None else None
 
+    def _ensure_fabric(self) -> Fabric:
+        """A pattern with no edge at all (`A >> pattern >> B`) is valid --
+        it just means no forward/backward hooks and no per-link tensor
+        other than whatever gets set directly on the connection afterwards
+        (see Connection.__setattr__, Fabric(instance=None))."""
+        if self._fabric is None:
+            self._fabric = Fabric()
+        return self._fabric
+
     # ------------------------------------------------------------------ builder API
 
     def target(self, target: Population) -> "Connection":
@@ -72,7 +81,7 @@ class ConnectionBuilder:
                     topology, inferred_region = Topology.build(
                         self._pattern, self._source.shape
                     )
-                    self._fabric.topology = topology
+                    self._ensure_fabric().topology = topology
                     self._target = Population(target, inferred_region)
             else:
                 raise ValueError(
@@ -81,7 +90,7 @@ class ConnectionBuilder:
         else:
             self._target = target
             if self._pattern is not None:
-                self._fabric.topology = Topology.build(
+                self._ensure_fabric().topology = Topology.build(
                     self._pattern, self._source.shape, target.shape
                 )
         if (
@@ -203,6 +212,52 @@ class Connection:
 
     def __init__(self, builder: ConnectionBuilder):
         self.builder = builder
+
+    def __setattr__(self, name, value):
+        if name == "builder":
+            object.__setattr__(self, name, value)
+            return
+        if name == "delay":
+            # delay is read directly off fabric by the framework itself
+            # (Population._min_incoming_delay, uses_per_link_delay_kernel),
+            # never via edge.delay inside a hook -- so it's exempt from the
+            # "some receive hook must reference this name" check below.
+            setattr(self.builder._ensure_fabric(), name, value)
+            return
+        self._set_edge_attr(name, value)
+
+    def _set_edge_attr(self, name, value) -> None:
+        """conn.<name> = tensor -- the validated, ergonomic alternative to
+        conn.fabric.<name> = tensor (still available, unchecked), and what
+        makes an edge class optional for the common "just a per-link
+        tensor, no learning rule" case (see Fabric(instance=None)).
+
+        Only stores it if the target's receive hook at this connection's
+        port actually reads edge.<name> (after reversing fabric_map, same
+        resolution Population.compile() itself does) -- storing a tensor
+        nothing will ever load is almost certainly a mistake, and with no
+        edge class there's no other check (a real edge class's dynamic_attrs
+        validation) to catch it.
+        """
+        from .transpiler.analyzers.used_members import UsedMemberFinder
+
+        builder = self.builder
+        target = builder._target
+        port = builder._target_port or "receive"
+        hook = target.node.receive.get(port) if target is not None else None
+        if hook is None:
+            raise ValueError(
+                f"cannot set '{name}': target has no receive hook at port '{port}'"
+            )
+        used_edge_names = UsedMemberFinder(hook.ast, "edge").run()
+        edge_rename = {hook_name: real for real, hook_name in (builder._fabric_map or {}).items()}
+        real_used_edge_attrs = {edge_rename.get(n, n) for n in used_edge_names}
+        if name not in real_used_edge_attrs:
+            raise ValueError(
+                f"'{name}' is not used as edge.{name} by {target!r}'s receive hook "
+                f"(port '{port}') -- nothing would read this tensor"
+            )
+        setattr(builder._ensure_fabric(), name, value)
 
     def delay(self, value):
         self.builder.delay(value)

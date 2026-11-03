@@ -42,6 +42,51 @@ def test_a_real_per_link_delay_tensor_switches_the_whole_population():
         B.compile()
 
 
+def test_edge_class_with_dynamic_attrs_raises_clearly_in_delay_mode():
+    """A connection whose edge class has a real forward/backward-assigned
+    per-link attr (plastic_synapse) can never actually mutate it once the
+    population is in per-link-delay mode -- see
+    per_link_delay_update_kernel.py. This must raise a clear, specific
+    error naming the edge type, not fall through to the stub's generic
+    NotImplementedError."""
+    from test.edges import plastic_synapse
+    from test.nodes import counter
+    from test.patterns import all_to_all
+
+    A = counter() * 5
+    B = counter() * 5
+    A.potential = torch.zeros(5)
+    B.potential = torch.zeros(5)
+    conn = A >> plastic_synapse(0.0, 0.1) @ all_to_all >> B
+    conn.fabric.delay = torch.rand(conn.shape)
+
+    with pytest.raises(ValueError, match="plastic_synapse"):
+        B.compile()
+
+
+def test_static_edge_with_a_tensor_override_is_fine_in_delay_mode():
+    """A static edge (no forward/backward assignment) that merely has a
+    tensor OVERRIDE set from outside (conn.fabric.weight = tensor(...),
+    never written back by any hook) has no dynamic_attrs at all -- the
+    check above must not flag it, since nothing here was ever claimed to
+    change. Still hits the stub's NotImplementedError (the kernel itself
+    isn't implemented yet), not the ValueError."""
+    from test.edges import static_synapse
+    from test.nodes import counter
+    from test.patterns import all_to_all
+
+    A = counter() * 5
+    B = counter() * 5
+    A.potential = torch.zeros(5)
+    B.potential = torch.zeros(5)
+    conn = A >> static_synapse(0.0) @ all_to_all >> B
+    conn.fabric.weight = torch.rand(conn.shape)
+    conn.fabric.delay = torch.rand(conn.shape)
+
+    with pytest.raises(NotImplementedError):
+        B.compile()
+
+
 def test_one_delayed_incoming_connection_switches_the_whole_population():
     """Population-wide, not per-connection: even a population with a SECOND,
     non-delayed incoming connection switches entirely once ANY incoming
