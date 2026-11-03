@@ -208,6 +208,56 @@ layout. Run everything with `python -m pytest`.
        runs proving all three gaps fixed together, including a test that
        pins the exact numbers gap 3's bug used to produce, 18 vs. the
        bug's 9).
+     - **Gap 4 — found building a showcase at real (1,000s) population
+       scale, not a test-sized one: `combine()` itself had a scaling bug.**
+       It sized its output by each input's *allocated* capacity
+       (`a_time.shape[0]`), not how much was actually pending (`a_count`).
+       `merge()`/`combine()` always allocate a full padded buffer
+       regardless of live due-count, so retaining across repeated
+       sub-steps made capacity compound roughly geometrically per round
+       (`combine(2048, 2048) -> 4096 -> 8192 -> ...`) even when almost
+       nothing was actually pending. This surfaced as `compact()`/
+       `merge()`'s single-block `tl.sort` taking minutes to *compile* (not
+       run) at population sizes of just 1,000-2,000 — isolating it found
+       compile time scaling wildly superlinearly with the sort's width
+       (2048 -> 8192, a 4x width increase, was a measured ~145x compile
+       slowdown; see `Population.carry_cap`/`per_src_cap` below for why
+       the width grows the way it does). Fixed by sizing `combine()`'s
+       output from each input's live count (`a_count[0].item()`/
+       `b_count[0].item()`, one extra sync per side — same latency-floor
+       caveat `merge()`'s own host wrapper already carries) instead of
+       its allocated shape.
+     - **New: `Population.carry_cap`/`per_src_cap`, exposed for the first
+       time.** `compact()`/`merge_incoming()`'s capacities were hardcoded
+       to 64 at every real call site (`_execute_gather_kernel`, `Network.
+       step()`) — fine for every test network so far (3-10 neurons), but
+       at 1,000s of neurons with every one firing the same round, 64 isn't
+       enough (`compact()`'s own `TOTAL_CAP` is driven mostly by `n_blocks
+       * local_spike_cap` regardless of `carry_cap`, so raising
+       `group_size`, not just `carry_cap`/`per_src_cap`, is what actually
+       keeps that width — and therefore compile time — manageable at real
+       scale; see the showcase below for working numbers). Added as
+       `Population` constructor kwargs, same pattern as `group_size` etc.,
+       default 64 preserving every existing test exactly. Still not a fix
+       for the underlying "single fixed-capacity block" design — this
+       just makes the existing constant configurable instead of buried;
+       the "needs tiling" item right below is unchanged.
+     - New showcase, not a test: `showcases/hybrid_scheduling.py` —
+       2,000-wide generator/integrator/differentiator, deliberately
+       outside the SNN domain (no spiking neuron model at all) to show
+       the clock-driven/event-driven scheduling mechanism is generic.
+       Also surfaced a real, worth-documenting architectural property
+       while building it: a receive hook's `source.<attr>` reads the
+       source population's *current* live state, not a historical
+       snapshot pinned to the specific delivery — under retention (a
+       delivery sitting unconsumed across several of the source's own
+       updates), this means `source.attr` reflects the source's *latest*
+       value by the time it's finally read, not the value as of that
+       delivery's own recorded time. A spike's own `time`, by contrast,
+       is fixed forever once recorded. The showcase's nodes deliberately
+       read `time`, not a mutable `source` attribute, for exactly this
+       reason — worth keeping in mind for any future node design that
+       wants to carry a per-delivery value under retention/delay.
    - **In progress — real per-link delay, split into two update-kernel
      variants, design under discussion.** Today's kernel delivers every
      link out of a firing source at that spike's own recorded time — fine

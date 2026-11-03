@@ -24,6 +24,8 @@ class Population:
         spike_block: int = 32,
         link_block: int = 64,
         local_spike_cap: int = 64,
+        carry_cap: int = 64,
+        per_src_cap: int = 64,
         timestep: float | None = None,
     ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
@@ -36,6 +38,18 @@ class Population:
         self.spike_block = spike_block
         self.link_block = link_block
         self.local_spike_cap = local_spike_cap
+
+        # Spike-lifecycle capacities (naer2/spike_gather.py): carry_cap caps
+        # how many not-yet-due spikes this population can hold across
+        # rounds; per_src_cap caps how many due entries any ONE incoming
+        # connection can contribute to a merge. Both were hardcoded to 64 at
+        # every call site until this population-level override existed --
+        # see TODO.md's "compact()/merge() capacity" entry. Must exceed the
+        # population's own size for an all-firing-at-once worst case (e.g.
+        # every neuron spiking the same round); defaults preserve existing
+        # small-test-network behavior exactly.
+        self.carry_cap = carry_cap
+        self.per_src_cap = per_src_cap
 
         # This population's own, explicit re-check interval -- independent of
         # (and taking priority over) both has_autonomous_dynamics' "every
@@ -231,7 +245,7 @@ class Population:
         device = self.network.device
         if self._fresh is None:
             self._fresh = empty_blocked_spikes(self.n_blocks, self.local_spike_cap, device)
-        self.compact(t)
+        self.compact(t, self.carry_cap)
         # self._fresh is now folded into _carry/_due; reset it to "nothing
         # new" so a round where this population's update kernel doesn't run
         # doesn't re-fold the same entries again next time.

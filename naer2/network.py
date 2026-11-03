@@ -197,7 +197,7 @@ class Network:
                 pop._execute_gather_kernel(self.t)
             for pop in self.populations:
                 if pop.incoming:
-                    fresh_merged = pop.merge_incoming()
+                    fresh_merged = pop.merge_incoming(pop.per_src_cap)
                     pop._merged = (
                         combine(pop._merged, fresh_merged)
                         if pop._merged is not None

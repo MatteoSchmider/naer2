@@ -351,12 +351,27 @@ def combine(
     merge() (or combine()) outputs. This is what retention needs: a
     population not yet due for its own update must not lose a round's
     merge_incoming() result just because a later round's overwrites it --
-    see Network.step() and TODO.md. CAP_A/CAP_B are each input's allocated
-    (not live) size, same convention as merge()'s per_src_cap.
+    see Network.step() and TODO.md.
+
+    CAP_A/CAP_B are each input's LIVE count, not its allocated size -- an
+    earlier version used the allocated size (matching merge()'s own
+    per_src_cap convention), which seemed like the more obvious choice
+    but is wrong here specifically: merge()/combine() always allocate a
+    full padded buffer regardless of how much is actually due, so sizing
+    off that padding instead of the live count made capacity compound
+    roughly geometrically across repeated retention rounds (combine(2048,
+    2048) -> 4096 -> 8192 -> ... even when almost nothing was actually
+    pending) -- found by it making compact()/merge()'s single-block
+    tl.sort compile time blow up (minutes, not seconds) at a population
+    size of just 1,000-2,000 once a population needed to retain across a
+    couple of sub-steps. Reading the live count costs one extra .item()
+    sync per side (same latency-floor caveat merge()'s own host wrapper
+    already carries, see its docstring) but keeps the buffer honest.
     """
     a_time, a_node, a_conn, a_count = a
     b_time, b_node, b_conn, b_count = b
-    cap_a, cap_b = a_time.shape[0], b_time.shape[0]
+    cap_a = max(int(a_count[0].item()), 1)
+    cap_b = max(int(b_count[0].item()), 1)
     device = a_time.device
     total_cap = _next_pow2(max(cap_a + cap_b, 1))
 
