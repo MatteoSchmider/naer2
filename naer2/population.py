@@ -353,6 +353,11 @@ class Population:
         args["local_spike_node_ptr"] = local_spike_node
         args["local_spike_time_ptr"] = local_spike_time
         args["local_spike_count_ptr"] = local_spike_count
+        # Per-program [GROUP_SIZE] scratch, reused by every densify step
+        # (tl.histogram + atomic-scatter-add, see the update kernel templates)
+        # in this launch -- always allocated, even if this particular
+        # population's kernel never references it (then simply unused).
+        args["scratch_ptr"] = torch.zeros(n_blocks * self.group_size, device=device, dtype=torch.float32)
 
         args = {k: v for k, v in args.items() if k in fn.arg_names}
         fn[(n_blocks,)](

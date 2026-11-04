@@ -495,6 +495,209 @@ layout. Run everything with `python -m pytest`.
          continuous-delay design) — bucketing doesn't reshuffle links at
          all, so it's probably safe to lift for this kernel, just not
          done yet.
+       - **Done — re-verified at real multi-workgroup scale** (the N=4
+         test above only ever launched one program/workgroup, so it
+         couldn't have caught a `pid`-indexing bug). New
+         `test/test_per_link_delay_kernel_scaled.py`: same weight-0/
+         weight-1/bucket-order check, N=4000 targets, default `group_size`
+         (32) → `n_blocks=125`, genuinely multiple workgroups. Passes,
+         confirming the kernel's per-block `pid`-based offset arithmetic
+         (`_row = (pid * n_buckets + bk) * row_stride`) is correct across
+         blocks, not just within one.
+         - **Two gotchas found getting there, both tooling/test-authoring,
+           not kernel bugs:**
+           1. **Triton/ROCm doesn't fail fast on an invalid pointer
+              argument.** A hand-rolled diagnostic script that launched
+              the kernel manually (bypassing `Population.
+              _ensure_on_device`) passed a CPU tensor as a pointer arg;
+              instead of raising immediately, Triton churned (CPU-bound,
+              climbing RSS) for several minutes before eventually raising
+              `ValueError: Pointer argument (...) cannot be accessed from
+              Triton (cpu tensor?)`. Looked identical to a compile-time
+              blowup until a background-task failure notification
+              surfaced the real error. Lesson: when a manual/diagnostic
+              launch (as opposed to the real `_execute_update_kernel`
+              path) hangs, suspect a plain CPU-tensor-pointer bug before
+              assuming a genuine compile-time issue.
+           2. **`BlockedSpikes`' layout is per-block, not one flat
+              `0..count[0]` range** — `count` is `[n_blocks]`, and block
+              `b`'s valid entries are `node[b*cap : b*cap+count[b]]`
+              (already global neuron indices, since the kernel stores
+              `offs = pid*GROUP_SIZE + ...`, not a block-local index) —
+              see `naer2/spike_gather.py`'s `BlockedSpikes` docstring.
+              `test_per_link_delay_kernel.py`'s original N=4 test read
+              `B._fresh.count[0]`/`B._fresh.node[:count]` directly, which
+              only happened to be correct because `n_blocks=1` there. The
+              first draft of the N=4000 scaled test copied that same
+              (wrong, multi-block-unsafe) reading pattern and appeared to
+              show a severe correctness bug — only block 0's targets ever
+              showed up as fired — before realizing it was reading the
+              buffer wrong, not that the kernel was broken. Fixed by
+              unpacking every block's own `[b*cap : b*cap+count[b]]` slice
+              before comparing. Worth remembering for any future test
+              reading `Population._fresh`/`BlockedSpikes` directly at
+              `n_blocks > 1`.
+         - **Confirmed, genuine, separate compile-time scaling finding
+           (unrelated to either gotcha above):** the per-link-delay
+           kernel's compile time scales with `GROUP_SIZE * LINK_BLOCK *
+           n_buckets` — the unrolled densify matrix's total size *summed
+           across all unrolled buckets* — not with `n_blocks` (grid size
+           is a pure runtime launch parameter, baked into nothing in the
+           kernel body). Measured: `GROUP_SIZE=32, n_buckets=4` (total
+           8192) compiles+runs in ~0.3s; bumping *either* `GROUP_SIZE` to
+           256 (alone, n_buckets=4) *or* `n_buckets` to 8 (alone,
+           GROUP_SIZE=32) each independently pushed compile time past
+           several minutes (confirmed still climbing via `ps` CPU time
+           and RSS, not hung — no GPU-memory growth, ruling out the
+           earlier capacity-blowup pattern — before being stopped). This
+           is why the scaled test above deliberately keeps `group_size`
+           at its default (32) and uses `n_buckets=4` rather than the
+           default of 8, and scales workgroup count via `N` instead —
+           `n_blocks` is free, `GROUP_SIZE`/`n_buckets` are not. Worth
+           revisiting if the default `n_delay_buckets=8` is ever combined
+           with a larger `group_size` in practice.
+         - **Follow-up investigation (triggered by the finding above,
+           found a much bigger and more general culprit, not yet acted on
+           in the real templates):** scanned the generated kernel for
+           other constructs with similar shape. Two real findings, both
+           isolated and measured standalone (microbenchmarks in
+           `/tmp/.../scratchpad/is_target_bench.py`,
+           `edge_weight_bench.py`, `spike_block_scan.py` this session —
+           not committed, scratch only):
+           1. **`SPIKE_BLOCK` (`Population.spike_block`, default 32) is a
+              bigger, previously-unmeasured multiplier than `GROUP_SIZE *
+              n_buckets` alone.** The per-spike body — the whole
+              connection-dispatch chain, which for a per-link-delay
+              population includes every bucket's dense matrix — sits
+              inside `for j in tl.static_range(SPIKE_BLOCK)`, and
+              `tl.static_range`'s own docstring says it "guides the
+              compiler to unroll the loop aggressively" — confirmed real:
+              holding `GROUP_SIZE=32, n_buckets=4` fixed (the earlier
+              "fast" config) and varying only `SPIKE_BLOCK` gave
+              1.0s/4521 instrs (`SPIKE_BLOCK=1`) -> 2.7s/15502
+              (`=4`) -> 7.4s/30150 (`=8`) -> 23.0s/59464 (`=16`), still
+              climbing, not finished after 3 minutes at `=32` (the actual
+              default every population uses unless overridden) when
+              stopped. Instruction count scales roughly linearly with
+              `SPIKE_BLOCK` (confirming the whole per-spike body really is
+              duplicated that many times); compile time scales
+              noticeably worse than linear on top of that — same pattern
+              as the `GROUP_SIZE`/`n_buckets` superlinearity, now with a
+              third independent multiplier stacked on. This affects the
+              no-delay kernel too (smaller magnitude, since it has no
+              bucket multiplier), not just the per-link-delay one.
+           2. **The densify step itself (`_hit`, used for both
+              `is_target` and `edge_weight`) has a cheaper realization,
+              confirmed by direct comparison at the real slow tile size
+              (`GROUP_SIZE=256, LINK_BLOCK=64`).** `tl.histogram(x,
+              GROUP_SIZE, mask=valid) > 0` computes `is_target` alone in
+              0.0025s/307 AMDGCN instructions vs. the current one-hot-
+              compare-and-reduce's 0.31s/4872 (~125x/~16x) — and
+              inspecting the generated AMDGCN directly explains why:
+              `tl.histogram` already compiles to `ds_add_u32` (LDS/shared-
+              memory atomics) internally, while the current approach
+              compiles to long chains of `v_permlanex16_b32`/
+              `v_readlane_b32`/`v_mov_b32_dpp` (RDNA cross-lane shuffle
+              instructions implementing the `axis=1` reduction over
+              `LINK_BLOCK`) — categorically different, not just
+              differently-tuned, code. Splitting the same dense compare
+              into `GROUP_SIZE/CHUNK` smaller pieces and `tl.cat`-ing them
+              back together (an alternative hand-sketched independently)
+              does *not* help (0.34s/4679 instrs, same cost as today) —
+              confirms the win is specific to `tl.histogram` routing
+              through LDS, not just "smaller matrices." (One correctness
+              trap hit along the way: `tl.cat(..., can_reorder=True)`
+              silently permits the compiler to reorder elements — broke
+              the chunked variant's lane correspondence until switched to
+              `can_reorder=False`, which is also the documented
+              forward-compatible default going into Triton 3.10.)
+              `tl.histogram` only counts, though — no weighted variant
+              exists, so it alone doesn't help `edge_weight` (the
+              weighted delivery sum). Measured three full receive-tile
+              variants at the same tile size: today's shared-`_hit`
+              dense-both (1.35s compile, 8680 instrs) vs. histogram-
+              `is_target` + still-dense-`edge_weight` (0.25s, 4121 instrs
+              — better, but still paying a dense reduction for weight) vs.
+              histogram-`is_target` + `tl.atomic_add(scratch_ptr + x, w,
+              mask=valid, scope="cta")` + `tl.debug_barrier()` + reload
+              for `edge_weight` (0.038s, 351 instrs — ~35x/~25x over
+              today, and also fastest steady-state launch of the three).
+              The `scope="cta"` atomic add is mainline Triton (no Gluon
+              needed) and, critically, still hands the rest of the
+              generated hook code a plain register-resident `edge_weight`
+              tensor afterward — the receive/send hook codegen downstream
+              of densify wouldn't need to change at all, only how
+              `is_target`/`edge_weight` themselves get computed. Would
+              need a small per-block scratch buffer (size `GROUP_SIZE`,
+              re-zeroed before each tile's scatter — an `O(GROUP_SIZE)`
+              store, not `O(GROUP_SIZE * LINK_BLOCK)`) as a new kernel
+              argument, analogous to the existing `local_spike_*` buffers.
+           **Done — both fixes landed in the real templates (2026-11-04),
+           same day as the investigation above.** `no_delay_update_kernel.py`
+           and `per_link_delay_update_kernel.py` both: (1) `_spike_loop`'s
+           inner loop is now plain `range(SPIKE_BLOCK)`, not
+           `tl.static_range` — same compile-time-bounded trip count, no
+           longer force-unrolled; (2) `_csr_branch`'s densify is now
+           `is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0)
+           & mask` plus, per `edge_tensor_attr`, a zero/`tl.atomic_add(...,
+           scope="cta")`/barrier/reload cycle against a new `scratch_ptr`
+           kernel argument (one `[GROUP_SIZE]` scratch slice per program,
+           reused sequentially across every tile/attr/bucket in a kernel
+           call — `Population._execute_update_kernel` always allocates and
+           passes it, `n_blocks * group_size` floats, filtered out by the
+           existing `arg_names` check for any kernel that doesn't reference
+           it). No `_hit` left anywhere in either template. Verified:
+           - Full suite (138 tests) green, including `test/test_gpu_
+             hardware.py` (manual launches needed a `scratch_ptr` added to
+             their args dict) and `test/test_mini_ei.py`/`test_coverage.py`
+             (AST-text assertions updated off the literal old `_hit`
+             expressions and the now-inaccurate "no atomics anywhere"
+             claim — the flush step genuinely still has no atomic, densify
+             now legitimately does, so that test was narrowed to check the
+             flush statement specifically rather than the whole kernel).
+           - The originally-9.5-minutes-and-still-climbing config
+             (`GROUP_SIZE=256, n_buckets=8, SPIKE_BLOCK=32`, the real
+             default `spike_block`) now compiles+runs in **0.49s** end to
+             end via a real `network.step()`, in a fresh process (no
+             shared-warm-up confound).
+           - `test/test_per_link_delay_kernel_scaled.py` no longer needs to
+             dodge any default to stay fast — updated to leave `group_size`/
+             `n_delay_buckets`/`spike_block` all at their real defaults
+             (previously had to pin `n_delay_buckets=4` instead of the real
+             default 8 specifically to avoid the blowup); still passes, 6
+             tests (with the small N=4 test) in 2.48s.
+           - A from-scratch N=4000 run with *every* tile-size knob left at
+             its real out-of-the-box default (`group_size=32,
+             n_delay_buckets=8, spike_block=32`, 125 workgroups) compiles
+             and runs its first real step in 0.96s, steady-state 0.47s —
+             confirming the fix holds with no special-cased parameters at
+             all, not just the one specific config that was measured slow
+             before.
+           Separately isolated and confirmed along the way (microbenchmark:
+           `/tmp/.../scratchpad/unroll_vs_loop.py`, not committed): forcing
+           the `tl.static_range` unroll isn't merely a compile-time-only
+           cost with execution unaffected — at maximum real load (every
+           slot in a `SPIKE_BLOCK`-wide window genuinely firing, no
+           skipped/wasted iterations either way), the force-unrolled
+           version still ran ~1.7x *slower* (61.71µs vs 35.99µs) than the
+           equivalent real loop, confirmed via the generated AMDGCN to
+           compile to an exact, non-deduplicated repetition of the same
+           instruction sequence (`v_permlanex16_b32` occurred exactly
+           `32 × SPIKE_BLOCK` times, zero sharing across iterations) — so
+           much duplicated code pressures instruction fetch/cache enough to
+           lose even when none of the duplicated work was actually wasted.
+           At idle (nothing firing), both were equal (~13.3µs each),
+           confirming the cost is specifically about code size/compile
+           time, not about skipping runtime work differently.
+       **⚠ FLAG FOR WHEN WE GET HERE — open correctness concern, not yet
+       discussed.** The owner has flagged (2026-11-03) that something about
+       the *current* (Part 1, already-shipped) per-link-delay kernel looks
+       off to them once Part 2 is in view, but deliberately hasn't said
+       what yet — "there's something I don't understand about the kernel
+       there yet, but we'll only discuss it then." **Do not start
+       implementing Part 2 without raising this explicitly first** and
+       actually discussing it, rather than assuming Part 1 is settled.
+
        **Part 2 — cross-timestep delay (the part that still needs
        solving).** A delay that exceeds one population timestep pushes a
        delivery into a *later* timestep entirely, which is a different

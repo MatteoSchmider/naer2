@@ -97,6 +97,14 @@ mask = offs < n_neurons
     # ------------------------------------------------------------------ spike loop (unchanged from the no-delay template)
 
     def _spike_loop(self, send_section: list) -> list[ast.stmt]:
+        # NOTE: the inner loop below is plain range(SPIKE_BLOCK), not
+        # tl.static_range -- see no_delay_update_kernel.py's identical
+        # _spike_loop and TODO.md for why: tl.static_range forces a full
+        # compile-time unroll, physically duplicating the whole per-spike
+        # body (every connection, every bucket, every dense-matrix-shaped
+        # op) SPIKE_BLOCK times -- measured directly as a large, avoidable
+        # compile-time and even runtime cost, worse here than in the
+        # no-delay kernel since it multiplies with n_buckets too.
         per_spike_body: list[ast.stmt] = [
             *_STMTS("time = tl.load(spike_time_ptr + _s)"),
             *_STMTS("spike_src_j = tl.load(spike_src_ptr + _s)"),
@@ -106,7 +114,7 @@ mask = offs < n_neurons
 
         inner_for = ast.For(
             target=ast.Name(id="j", ctx=ast.Store()),
-            iter=_EXPR("tl.static_range(SPIKE_BLOCK)"),
+            iter=_EXPR("range(SPIKE_BLOCK)"),
             body=[
                 *_STMTS("_s = blk_start + j"),
                 ast.If(test=_EXPR("_s < n_spikes"), body=per_spike_body, orelse=[]),
@@ -209,13 +217,25 @@ mask = offs < n_neurons
                     f"tl.store(conn{i}_{attr}_ptr + _lk, lk_{attr}, mask=_lk_valid)"
                 )
 
+            # Densify: tl.histogram (is_target) + scratch-buffer atomic
+            # scatter-add (edge_{attr}) instead of a one-hot compare-and-
+            # reduce -- see no_delay_update_kernel.py's _csr_branch
+            # docstring and TODO.md for why (measured ~35x/~25x compile
+            # time/instruction win at this template's real tile sizes,
+            # with no change needed downstream since both still end up as
+            # plain register-resident tensors). scratch_ptr is reused
+            # across every bucket, tile, and attr in this kernel call —
+            # each use is self-contained (zero, scatter, barrier, load).
             densify: list[ast.stmt] = _STMTS(
-                "_hit = (tl.arange(0, GROUP_SIZE)[:, None] == _tgt[None, :]) & _lk_valid[None, :] & mask[:, None]\n"
-                "is_target = tl.sum(_hit.to(tl.int32), axis=1) > 0"
+                "is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0) & mask"
             )
             for attr in edge_tensor_attrs:
                 densify += _STMTS(
-                    f"edge_{attr} = tl.sum(tl.where(_hit, lk_{attr}[None, :], 0), axis=1)"
+                    f"tl.store(scratch_ptr + offs, 0.0, mask=mask)\n"
+                    f"tl.debug_barrier()\n"
+                    f"tl.atomic_add(scratch_ptr + pid * GROUP_SIZE + _tgt, lk_{attr}, mask=_lk_valid, scope='cta')\n"
+                    f"tl.debug_barrier()\n"
+                    f"edge_{attr} = tl.load(scratch_ptr + offs)"
                 )
 
             target_send = self._make_target_section(send_section)
@@ -275,6 +295,9 @@ mask = offs < n_neurons
             ast.arg(arg="local_spike_node_ptr"),
             ast.arg(arg="local_spike_time_ptr"),
             ast.arg(arg="local_spike_count_ptr"),
+            # per-program [GROUP_SIZE] scratch, reused by every densify step
+            # (every bucket/tile/attr) in this kernel call -- see _csr_branch.
+            ast.arg(arg="scratch_ptr"),
         ]
 
         args += [

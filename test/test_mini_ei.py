@@ -6,7 +6,8 @@ compiles the merged update-receive-send kernel for both populations.
 
 Expected kernel structure:
   - ONE outer for-loop over the unified sorted spike buffer
-  - Inner tl.static_range, guarded by blk_mask[j], containing:
+  - Inner real loop (range(SPIKE_BLOCK), not tl.static_range — see TODO.md),
+    guarded by blk_mask[j], containing:
       * time / spike_src_j / spike_conn_j loaded as scalars for this spike slot
       * An if/elif dispatch on spike_conn_j (warp-uniform — same value for
         every lane in this program, so this branches with no divergence),
@@ -115,17 +116,24 @@ def test_scalar_per_branch_csr_range_lookup(src_E):
 
 
 def test_links_densified_into_per_neuron_is_target(src_E):
+    # Densify used to be a one-hot [GROUP_SIZE, LINK_BLOCK] compare-and-reduce
+    # (_hit); replaced with tl.histogram (cheaper to compile, see TODO.md) —
+    # no _hit left anywhere.
     assert "is_target" in src_E
-    assert "_hit = (tl.arange(0, GROUP_SIZE)[:, None] == _tgt[None, :]) & _lk_valid[None, :] & mask[:, None]" in src_E
-    assert "is_target = tl.sum(_hit.to(tl.int32), axis=1) > 0" in src_E
+    assert "is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0) & mask" in src_E
+    assert "_hit" not in src_E, "one-hot compare-and-reduce densify should be gone"
     assert "_own" not in src_E, "ownership is structural in the blocked layout — no _own mask"
 
 
 def test_edge_weight_loaded_as_link_tile_then_reduced(src_E):
+    # edge_weight used to be a reduction over the one-hot _hit matrix;
+    # replaced with a scratch-buffer atomic scatter-add (see TODO.md) —
+    # scope="cta" since only this program's own lanes ever read it back.
     assert "edge.weight" not in src_E, "AttrPrefixTransformer missed edge.weight"
     assert "conn0_weight_ptr" in src_E
     assert "lk_weight = tl.load(conn0_weight_ptr + _lk, mask=_lk_valid, other=0)" in src_E
-    assert "edge_weight = tl.sum(tl.where(_hit, lk_weight[None, :], 0), axis=1)" in src_E
+    assert "tl.atomic_add(scratch_ptr + pid * GROUP_SIZE + _tgt, lk_weight, mask=_lk_valid, scope='cta')" in src_E
+    assert "edge_weight = tl.load(scratch_ptr + offs)" in src_E
 
 
 def test_receive_masked_by_is_target(src_E):
@@ -169,14 +177,17 @@ def test_spike_lowers_to_local_buffer_write_no_atomic(func_E, src_E):
         "bare n2.spike() should default to recording t, not the contextual time"
 
 
-def test_no_atomics_anywhere_in_the_kernel(src_E):
+def test_flush_step_has_no_atomic(src_E):
     # The flush step used to do one tl.atomic_add per program instance to
     # compact into a shared buffer; now it's a plain per-pid scalar store
     # (local_spike_node/time_ptr are already laid out exactly as a
-    # BlockedSpikes wants -- see naer2/spike_gather.py), so there should be
-    # no atomics left in the kernel at all.
-    assert "tl.atomic_add(" not in src_E
+    # BlockedSpikes wants -- see naer2/spike_gather.py). Densify's own
+    # scratch-buffer scatter-add (see TODO.md) is a real, separate,
+    # intentional atomic elsewhere in the kernel -- not what this test is
+    # about -- so check the flush statement itself, not "no atomics anywhere".
     assert "tl.store(local_spike_count_ptr + pid, local_spike_count)" in src_E
+    flush_line_idx = src_E.index("tl.store(local_spike_count_ptr + pid, local_spike_count)")
+    assert "tl.atomic_add(" not in src_E[flush_line_idx - 200:flush_line_idx]
 
 
 def test_per_link_fire_check_rooted_at_is_target(src_E):

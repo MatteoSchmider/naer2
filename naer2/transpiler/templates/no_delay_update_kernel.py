@@ -70,7 +70,7 @@ Kernel body — two parts:
     ┌─ Part 1: Event-driven spike loop ─────────────────────────────────────┐
     │  for blk_start in range(0, n_spikes, SPIKE_BLOCK):                    │
     │    load SPIKE_BLOCK entries from unified buffer                        │
-    │    for j in tl.static_range(SPIKE_BLOCK):         ← compile-unrolled  │
+    │    for j in range(SPIKE_BLOCK):            ← a real loop, NOT unrolled│
     │      if blk_mask[j]:                              ← skip padding       │
     │        time = spike_t[j]                                               │
     │        if spike_conn[j] == 0:       ← warp-uniform: same value for     │
@@ -121,12 +121,18 @@ connection's own directly-named pointers and its own transpiled receive/edge-
 forward AST with no indirection: different connections can have entirely
 different edge types with entirely different code, not just different
 topology, so a per-connection branch is not just a topology-routing
-convenience but the actual mechanism for running the right code at all. It
-does mean total code size scales with (number of connections) × SPIKE_BLOCK,
-since tl.static_range unrolls the whole dispatch per spike slot and every
-branch's code must be present regardless of which one runs for a given spike
-— if that ever matters, SPIKE_BLOCK is the knob to shrink, not the dispatch
-shape.
+convenience but the actual mechanism for running the right code at all. Total
+code size scales with (number of connections), since every branch's code
+must be compiled regardless of which one runs for a given spike — but NOT
+with SPIKE_BLOCK: the inner per-spike loop is a real Triton loop
+(`range(SPIKE_BLOCK)`, not `tl.static_range`), compiled once and executed up
+to SPIKE_BLOCK times at runtime rather than physically duplicated SPIKE_BLOCK
+times in the generated code. (`tl.static_range`'s own docs say it "guides the
+compiler to unroll the loop aggressively" — measured directly, forcing that
+unroll cost ~12x more instructions and ~14x longer compile at SPIKE_BLOCK=16,
+and ran slower even at full load, not just at compile time: that much
+duplicated code pressures instruction fetch/cache enough to lose even when
+none of the unrolled copies were wasted work. See TODO.md.)
 
 Per-link delays are intentionally ignored here — all deliveries from a source
 spike are processed at the same arrival time from the spike buffer.  This is a
@@ -238,7 +244,7 @@ mask = offs < n_neurons
     # ------------------------------------------------------------------ spike loop
 
     def _spike_loop(self, send_section: list) -> list[ast.stmt]:
-        """Outer loop over the unified spike buffer; inner static_range per spike.
+        """Outer loop over the unified spike buffer; inner real loop per spike.
 
         Each spike slot loads its own three scalars straight from the buffer —
         Triton can't index a tensor by an integer to pull one element out, so a
@@ -248,6 +254,14 @@ mask = offs < n_neurons
         for why that's safe (warp-uniform) and necessary (different
         connections can run genuinely different code, not just different CSR
         topology).
+
+        The inner loop is plain `range(SPIKE_BLOCK)`, not `tl.static_range`:
+        measured directly (see TODO.md), forcing the unroll duplicated the
+        whole per-spike body (every connection branch) SPIKE_BLOCK times in
+        the compiled kernel for no runtime benefit — a real loop with the
+        same compile-time-constant trip count compiles far faster and even
+        runs faster once there's real work to do, since it isn't fighting
+        its own bloated instruction footprint.
         """
         per_spike_body: list[ast.stmt] = [
             *_STMTS("time = tl.load(spike_time_ptr + _s)"),
@@ -258,7 +272,7 @@ mask = offs < n_neurons
 
         inner_for = ast.For(
             target=ast.Name(id="j", ctx=ast.Store()),
-            iter=_EXPR("tl.static_range(SPIKE_BLOCK)"),
+            iter=_EXPR("range(SPIKE_BLOCK)"),
             body=[
                 *_STMTS("_s = blk_start + j"),
                 ast.If(test=_EXPR("_s < n_spikes"), body=per_spike_body, orelse=[]),
@@ -347,16 +361,35 @@ mask = offs < n_neurons
             _tgt, lk_{attr}   = tile of target ids / per-link edge attrs
             <<< edge forward >>>       on link lanes
             <<< link stores >>>        per link, masked only for the ragged tile end
-            _hit[G, L]                 = neuron i is link l's target
-            is_target[G], edge_{attr}[G] = reduce over links
+            is_target[G]               = tl.histogram(_tgt, GROUP_SIZE) > 0
+            edge_{attr}[G]              = scatter-add lk_{attr} by _tgt into a
+                                          per-program scratch buffer, then load it back
             <<< receive >>>            on neuron lanes, masked by is_target
             <<< send >>>               fire check, after receive
+
+        Densify used to be a one-hot [GROUP_SIZE, LINK_BLOCK] compare-and-
+        reduce (`_hit`) -- replaced after measuring it directly against the
+        two operations above at this template's real tile sizes: compiled
+        ~35x slower and emitted ~25x more instructions for no runtime
+        benefit (the comparison matrix lowers to long RDNA cross-lane
+        shuffle chains -- `v_permlanex16_b32`/`v_readlane_b32`/
+        `v_mov_b32_dpp` -- while `tl.histogram` compiles to `ds_add_u32`,
+        real LDS/shared-memory atomics, under the hood). `tl.histogram` has
+        no weighted variant, so `edge_{attr}` instead does the scatter-add
+        explicitly against a dedicated `scratch_ptr` buffer (one program-
+        exclusive [GROUP_SIZE] slice per block, reused across every tile/
+        attr/bucket in this kernel call — zeroed, scattered into with
+        `tl.atomic_add(..., scope="cta")` since only this block's own lanes
+        ever read it back, then read back after a `tl.debug_barrier()` pair
+        bracketing the scatter so the write is visible across the tile's
+        own warps before the load). See TODO.md for the benchmark.
 
         Assumes a source's targets are unique within its row (no multapses):
         each neuron then receives at most one delivery per spike, which is what
         makes the reduce exact and per-target ordering unchanged. A duplicate
         target within one tile would deliver the sum of its links' values as
-        a single delivery.
+        a single delivery — true of the atomic scatter-add exactly as it was
+        of the one-hot reduce it replaced.
 
         update is deliberately NOT run here — only in the final propagation pass
         (Part 2). A node that needs its own state advanced to the spike's exact
@@ -408,13 +441,19 @@ mask = offs < n_neurons
 
         # Densify: which of this program's neurons is a target of which link in
         # the tile, then reduce per-link edge values down to per-neuron ones.
+        # See _csr_branch's own docstring for why this is tl.histogram (is_target)
+        # plus a scratch-buffer atomic scatter-add (edge_{attr}) rather than the
+        # one-hot compare-and-reduce this replaced.
         densify: list[ast.stmt] = _STMTS(
-            "_hit = (tl.arange(0, GROUP_SIZE)[:, None] == _tgt[None, :]) & _lk_valid[None, :] & mask[:, None]\n"
-            "is_target = tl.sum(_hit.to(tl.int32), axis=1) > 0"
+            "is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0) & mask"
         )
         for attr in edge_tensor_attrs:
             densify += _STMTS(
-                f"edge_{attr} = tl.sum(tl.where(_hit, lk_{attr}[None, :], 0), axis=1)"
+                f"tl.store(scratch_ptr + offs, 0.0, mask=mask)\n"
+                f"tl.debug_barrier()\n"
+                f"tl.atomic_add(scratch_ptr + pid * GROUP_SIZE + _tgt, lk_{attr}, mask=_lk_valid, scope='cta')\n"
+                f"tl.debug_barrier()\n"
+                f"edge_{attr} = tl.load(scratch_ptr + offs)"
             )
 
         # send (fire check) masked to the delivered neurons, run after receive
@@ -493,6 +532,10 @@ mask = offs < n_neurons
             ast.arg(arg="local_spike_node_ptr"),
             ast.arg(arg="local_spike_time_ptr"),
             ast.arg(arg="local_spike_count_ptr"),
+            # per-program [GROUP_SIZE] scratch, reused by every densify step in
+            # this kernel call (see _csr_branch) -- always declared, even for a
+            # population with no edge_tensor_attrs anywhere (then simply unused).
+            ast.arg(arg="scratch_ptr"),
         ]
 
         # constexpr tile sizes

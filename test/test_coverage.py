@@ -141,7 +141,9 @@ def test_tensor_backed_weight_loaded_per_link(B_module, src_B, src_C):
     assert "lk_weight = tl.load(conn0_weight_ptr + _lk, mask=_lk_valid, other=0)" in src_B, \
         "B's weight should load per-link, not inline a literal, since a tensor was assigned"
     assert "lk_weight = tl.load(conn0_weight_ptr + _lk, mask=_lk_valid, other=0)" in src_C
-    assert "edge_weight = tl.sum(tl.where(_hit, lk_weight[None, :], 0), axis=1)" in src_B, \
+    # Densify's weighted reduction (edge_weight) is a scratch-buffer atomic
+    # scatter-add, not a one-hot-matrix reduce -- see TODO.md.
+    assert "edge_weight = tl.load(scratch_ptr + offs)" in src_B, \
         "receive should see the per-neuron reduction of the per-link tile"
 
 

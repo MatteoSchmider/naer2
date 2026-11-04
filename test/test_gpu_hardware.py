@@ -61,6 +61,7 @@ def _launch(fn, conn, N, n_blocks, potential, t, spike_time=(), spike_src=(), sp
         local_spike_node_ptr=torch.zeros(n_blocks * LOCAL_SPIKE_CAP, device=DEVICE, dtype=torch.int32),
         local_spike_time_ptr=torch.zeros(n_blocks * LOCAL_SPIKE_CAP, device=DEVICE, dtype=torch.float32),
         local_spike_count_ptr=torch.zeros(n_blocks, device=DEVICE, dtype=torch.int32),
+        scratch_ptr=torch.zeros(n_blocks * GROUP_SIZE, device=DEVICE, dtype=torch.float32),
     )
     args = {k: v for k, v in args.items() if k in fn.arg_names}
     fn[(n_blocks,)](**args, GROUP_SIZE=GROUP_SIZE, SPIKE_BLOCK=SPIKE_BLOCK, LINK_BLOCK=LINK_BLOCK, LOCAL_SPIKE_CAP=LOCAL_SPIKE_CAP)
