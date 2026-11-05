@@ -16,11 +16,11 @@ TODO.md).
 
 Both retain more than one generator tick's worth of deliveries before
 they're due to consume them (2 and 3 respectively), exercising the
-retention mechanism at 2,000-wide populations.
+scheduling step (combine()) at 2,000-wide populations.
 
 Nodes read `time` rather than a `source.<attr>` on purpose: a receive
 hook's `source.attr` reflects the source's CURRENT state, not a snapshot
-pinned to that delivery -- under retention it would reflect the source's
+pinned to that delivery -- while a delivery waits to be scheduled it would reflect the source's
 latest value by the time it's finally read, not its value as of that
 delivery. `time` is fixed forever once recorded. See TODO.md.
 

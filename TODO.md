@@ -3,6 +3,18 @@
 Last updated after the test-suite restructure. See README.md for the directory
 layout. Run everything with `python -m pytest`.
 
+## Terminology — the four kinds of spike delay handling
+
+| Name | What it is | Where it's handled |
+|---|---|---|
+| **emission delay** | a spike's own recorded time lies in the future (`n2.spike(time + d)`) | source-side: `compact()`'s carry buffer, owned by the source population |
+| **scheduling** | a target not due on this sub-step keeps every input it's handed until it next runs (formerly "retention") | target-side: `combine()` in `Network.step()` |
+| **intra-timestep transmission delay** | per-link delay whose arrival still falls inside the target's current kernel call | inside the target's update kernel: delay buckets (`per_link_delay_update_kernel.py`) |
+| **inter-timestep transmission delay** | per-link delay pushing an arrival past the target's current kernel call | not implemented yet (formerly "cross-timestep" / "Part 2") |
+
+The update kernel itself has two phases, the **spike loop** and the **final
+propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
+
 ## Planned order of work
 
 1. **Spike management handling** (host side): turn each population's compacted
@@ -129,7 +141,7 @@ layout. Run everything with `python -m pytest`.
        "parallelize kernel execution across populations" below, not a
        correctness gap `gather()`'s phase ordering already covers that.
    - **Done — explicit per-population scheduling (`Population.timestep`),
-     network-wide effective-period propagation, and a real retention bug
+     network-wide effective-period propagation, and a real scheduling bug
      fix — together, a prerequisite the delay design below leans on.**
      Started from one gap (found reasoning through how PD14 actually
      schedules itself) and grew into two more once pushed on:
@@ -249,7 +261,7 @@ layout. Run everything with `python -m pytest`.
        Also surfaced a real, worth-documenting architectural property
        while building it: a receive hook's `source.<attr>` reads the
        source population's *current* live state, not a historical
-       snapshot pinned to the specific delivery — under retention (a
+       snapshot pinned to the specific delivery — under scheduling (a
        delivery sitting unconsumed across several of the source's own
        updates), this means `source.attr` reflects the source's *latest*
        value by the time it's finally read, not the value as of that
@@ -257,7 +269,7 @@ layout. Run everything with `python -m pytest`.
        is fixed forever once recorded. The showcase's nodes deliberately
        read `time`, not a mutable `source` attribute, for exactly this
        reason — worth keeping in mind for any future node design that
-       wants to carry a per-delivery value under retention/delay.
+       wants to carry a per-delivery value under scheduling/delay.
    - **In progress — real per-link delay, split into two update-kernel
      variants, design under discussion.** Today's kernel delivers every
      link out of a firing source at that spike's own recorded time — fine
@@ -388,7 +400,7 @@ layout. Run everything with `python -m pytest`.
        events), drop exact *delivery order* in favor of a bounded, cheap
        bucketing scheme. New shape, now two genuinely separate parts:
 
-       **Part 1 — intra-timestep bucketing (the common case).** Each
+       **Intra-timestep transmission delay (the common case).** Each
        population gets a default bucket count (**8**, a placeholder — see
        below), overridable per population (`Population.<something>`, not
        yet added — an event-driven population's own author knows their
@@ -462,8 +474,8 @@ layout. Run everything with `python -m pytest`.
          set, else looked up from `Network._compute_effective_periods()`)
          decides whether a connection's delay actually fits — `compile()`
          raises `NotImplementedError` naming the actual delay and period
-         if any link's delay reaches or exceeds it (the cross-timestep
-         case, Part 2, still not implemented), otherwise builds the real
+         if any link's delay reaches or exceeds it (inter-timestep
+         transmission delay, still not implemented), otherwise builds the real
          bucketed kernel. New `Population.n_delay_buckets` (default 8,
          like `timestep`/`carry_cap` etc.) and `_execute_update_kernel`
          building the delay-bucketed topology (falling a connection
@@ -483,7 +495,7 @@ layout. Run everything with `python -m pytest`.
          boundary `t`, never the contextual `time` — needed `n2.spike
          (time)` explicitly to capture a bucket's own arrival time; and
          forgetting to reset `potential` after firing let the kernel's
-         *second*, unconditional final-propagation pass (Part 2, which
+         *second*, unconditional final-propagation pass (which
          always re-runs `send()` once more for every neuron) fire a
          second time at `t` for anyone who'd already fired once — both
          are just restating existing, documented kernel semantics
@@ -720,13 +732,13 @@ layout. Run everything with `python -m pytest`.
            concretely on a real network rather than reasoned about: every
            cortical population's effective period is `0.0` (fully
            autonomous, no explicit `timestep`), while every real PD14
-           delay is 1.5-6ms — squarely Part 2's cross-timestep case
+           delay is 1.5-6ms — squarely inter-timestep transmission delay
            (`delay >= period`), still unimplemented. `compile()`'s existing
            `NotImplementedError` guard catches this correctly. Measuring
            PD14's *update-kernel* compile time at all therefore required
            temporarily forcing an explicit large `timestep` on every
            cortical population (measurement-only workaround, not a fix —
-           Part 2 is the real fix, still not started).
+           inter-timestep transmission delay is the real fix, still not started).
          - **With that workaround, PD14's update kernel compiles in a
            reasonable 11.5-24.9s per cortical population (~141s total
            across all 8)** — no longer catastrophic (pre-fix, this
@@ -836,16 +848,27 @@ layout. Run everything with `python -m pytest`.
            Still on `tl.sort`: `merge()`/`combine()` — the same blowup
            applies once their widths grow (`combine()` sizes off live
            counts, so it can grow at scale); same fix pattern.
-       **⚠ FLAG FOR WHEN WE GET HERE — open correctness concern, not yet
-       discussed.** The owner has flagged (2026-11-03) that something about
-       the *current* (Part 1, already-shipped) per-link-delay kernel looks
-       off to them once Part 2 is in view, but deliberately hasn't said
-       what yet — "there's something I don't understand about the kernel
-       there yet, but we'll only discuss it then." **Do not start
-       implementing Part 2 without raising this explicitly first** and
-       actually discussing it, rather than assuming Part 1 is settled.
+       **⚠ OPEN — correctness of the intra-timestep transmission delay
+       kernel, raised 2026-11-05, under discussion.** The owner flagged
+       (2026-11-03) that something about the already-shipped per-link-delay
+       kernel looked off once inter-timestep delay came into view. Two
+       candidate problems found reading the code (derived, not yet
+       reproduced; may or may not be the owner's concern):
+       1. Arrivals can land after the kernel call's `t` even with
+          delay < period: `compile()`'s guard compares delay to the
+          target's period, but sources emit on the network sub-step. With
+          sub_dt < period (e.g. period 1.0, sub_dt 0.1), a spike emitted at
+          1.9 with delay 0.75 is processed in the call at t=2.0 at arrival
+          2.65, and the final propagation then runs at 2.0 — backwards.
+          `test_per_link_delay_kernel.py` has sub_dt == period, so it
+          can't see this.
+       2. Within one call, events run in emission order, each spike
+          walking all its buckets before the next spike — not in arrival
+          order, so time can go backwards between deliveries.
+       **Do not start implementing inter-timestep transmission delay**
+       until this is settled.
 
-       **Part 2 — cross-timestep delay (the part that still needs
+       **Inter-timestep transmission delay (the part that still needs
        solving).** A delay that exceeds one population timestep pushes a
        delivery into a *later* timestep entirely, which is a different
        kind of problem from bucketing within one — it's exactly what

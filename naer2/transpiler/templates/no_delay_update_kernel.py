@@ -65,9 +65,9 @@ Kernel signature:
         LOCAL_SPIKE_CAP: tl.constexpr,  # per-program spike scratch capacity; power of 2
     ):
 
-Kernel body — two parts:
+Kernel body — two phases:
 
-    ┌─ Part 1: Event-driven spike loop ─────────────────────────────────────┐
+    ┌─ Spike loop (event-driven) ───────────────────────────────────────────┐
     │  for blk_start in range(0, n_spikes, SPIKE_BLOCK):                    │
     │    load SPIKE_BLOCK entries from unified buffer                        │
     │    for j in range(SPIKE_BLOCK):            ← a real loop, NOT unrolled│
@@ -90,7 +90,7 @@ Kernel body — two parts:
     │          ... conn 1's own pointers, own CSR range, own transpiled AST │
     └────────────────────────────────────────────────────────────────────────┘
 
-    ┌─ Part 2: Final propagation ────────────────────────────────────────────┐
+    ┌─ Final propagation ────────────────────────────────────────────────────┐
     │  time = t                                                               │
     │  <<< update_section — propagate from last spike time to t >>>          │
     │  <<< send_section   — final fire check >>>                             │
@@ -107,7 +107,7 @@ this spike) and send (fire check) run per link, in that order.  A node that
 needs its own state propagated to the incoming spike's exact time before
 applying the delivery must do that itself, explicitly, inside its receive
 hook — the framework does not inject update() there.  update() still runs
-once in Part 2, propagating from the last spike time to the timestep boundary t.
+once in the final propagation, from the last spike time to the timestep boundary t.
 
 Each spike's connection is dispatched via an explicit if/elif chain on
 spike_conn[j], not by pre-gathering every connection's CSR range and letting
@@ -215,13 +215,13 @@ mask = offs < n_neurons
         for attr in self.ctx.dynamic_attrs:
             body += _STMTS(f"{attr} = tl.load({attr}_ptr + offs, mask=mask)")
 
-        # Part 1: event-driven spike loop.
-        # update_section is NOT run per spike delivery, only in Part 2 below —
+        # Spike loop (event-driven).
+        # update_section is NOT run per spike delivery, only in the final propagation below —
         # only send_section runs per link (after receive), so only it needs a
-        # deepcopy here (it appears twice: inside the loop and in Part 2).
+        # deepcopy here (it appears twice: inside the loop and in the final propagation).
         body += self._spike_loop(copy.deepcopy(send_section))
 
-        # Part 2: final propagation from last spike time to current kernel time t.
+        # Final propagation from last spike time to current kernel time t.
         body += _STMTS("time = t")
         body += update_section
         body += send_section
@@ -391,8 +391,8 @@ mask = offs < n_neurons
         a single delivery — true of the atomic scatter-add exactly as it was
         of the one-hot reduce it replaced.
 
-        update is deliberately NOT run here — only in the final propagation pass
-        (Part 2). A node that needs its own state advanced to the spike's exact
+        update is deliberately NOT run here — only in the final propagation pass.
+        A node that needs its own state advanced to the spike's exact
         time before this delivery must do so explicitly inside its receive hook.
         """
         i = conn_idx

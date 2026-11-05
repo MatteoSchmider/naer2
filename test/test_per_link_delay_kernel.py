@@ -1,5 +1,5 @@
 """
-Real-hardware test of the per-link-delay (intra-timestep bucketing) update
+Real-hardware test of the per-link-delay (intra-timestep transmission delay) update
 kernel (naer2/transpiler/templates/per_link_delay_update_kernel.py) against
 a real network, built the normal way through the DSL -- no synthetic
 Triton-level fixtures, matching test_gpu_hardware.py's style.

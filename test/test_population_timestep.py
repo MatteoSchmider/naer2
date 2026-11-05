@@ -19,7 +19,7 @@ purposes") -- see _compute_effective_periods' recursive resolution.
 
 Pure scheduling-logic tests -- no GPU needed, no kernel launch (never calls
 _execute_update_kernel). See test_mixed_scheduling.py for the real,
-end-to-end, GPU-required version of all of this (including the retention
+end-to-end, GPU-required version of all of this (including the scheduling
 fix for a slow-ticking consumer).
 """
 

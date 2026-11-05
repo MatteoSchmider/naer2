@@ -41,13 +41,13 @@ def test_a_real_per_link_delay_tensor_switches_the_whole_population():
 
 def test_delay_exceeding_the_population_s_own_period_raises_not_implemented():
     """counter is autonomous with no explicit timestep -> period 0.0 ("every
-    sub-step") -- any nonzero delay is a cross-timestep case by definition,
-    which isn't implemented (only intra-timestep bucketing is)."""
+    sub-step") -- any nonzero delay is an inter-timestep transmission delay
+    by definition, which isn't implemented (only intra-timestep is)."""
     _, pops = build()
     B = pops["B"]
     B.incoming[0].fabric.delay = torch.rand(B.incoming[0].shape)
 
-    with pytest.raises(NotImplementedError, match="cross-timestep"):
+    with pytest.raises(NotImplementedError, match="inter-timestep"):
         B.compile()
 
 

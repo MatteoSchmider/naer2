@@ -66,7 +66,7 @@ def test_to_blocked_from_blocked_roundtrip(topo: Topology, n_tgt: int, group_siz
 # ------------------------------------------------------------------ delay bucketing
 #
 # Scope: a connection whose whole delay spread fits within one population
-# timestep (TODO.md's "intra-timestep bucketing" -- the cross-timestep case,
+# timestep (TODO.md's "intra-timestep transmission delay" -- the inter-timestep case,
 # delay >= timestep, is deliberately out of scope here and just clamps into
 # the last bucket rather than erroring).
 

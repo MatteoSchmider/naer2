@@ -1,9 +1,9 @@
 """
 Template for the merged update-receive-send Triton kernel -- the PER-LINK-
-DELAY variant, intra-timestep bucketing only (see TODO.md): a connection
-whose links carry a real per-link delay tensor, with every delay value
-less than the target population's own timestep. Cross-timestep delay
-(delay >= timestep) is not implemented -- Population.compile() raises
+DELAY variant, intra-timestep transmission delay only (see TODO.md): a
+connection whose links carry a real per-link delay tensor, with every delay
+value less than the target population's own timestep. Inter-timestep
+transmission delay (delay >= timestep) is not implemented -- Population.compile() raises
 before this template is ever reached in that case.
 
 Structurally this is `no_delay_update_kernel.py` with exactly one change:
@@ -43,7 +43,7 @@ _STMTS = lambda src: ast.parse(src).body
 class PerLinkDelayUpdateKernelTemplate:
     """
     Assembles the ast.Module for the merged update-receive-send kernel (the
-    per-link-delay, intra-timestep-bucketing variant -- see the module
+    per-link-delay, intra-timestep transmission delay variant -- see the module
     docstring).
 
     incoming_with_hooks — same shape as NoDelayUpdateKernelTemplate's:

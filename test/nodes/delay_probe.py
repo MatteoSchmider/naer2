@@ -20,7 +20,7 @@ class delay_probe:
     def send(self, time: n2.time):
         if self.potential > self.threshold:
             n2.spike(time)  # explicit: bare n2.spike() always records t, not this delivery's time
-            self.potential = 0.0  # reset, else Part 2's unconditional final pass fires again at t
+            self.potential = 0.0  # reset, else the unconditional final propagation fires again at t
 
     def receive(self, time: n2.receives.time, edge: n2.receives.edge, source: n2.receives.source):
         self.potential += edge.weight

@@ -9,8 +9,9 @@ import torch
 
 from .network import Network
 from .nodes import Node, node_types
-from .spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes, empty_blocked_spikes
+from .spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes
 from .spike_gather import compact as _compact
+from .spike_gather import empty_blocked_spikes
 from .spike_gather import merge as _merge
 from .types import Region
 
@@ -64,7 +65,8 @@ class Population:
         # Network._validate_schedulable and TODO.md.
         self.timestep = timestep
 
-        # Default bucket count for the intra-timestep per-link-delay kernel
+        # Default bucket count for the per-link-delay kernel's intra-timestep
+        # transmission delay
         # (naer2/transpiler/templates/per_link_delay_update_kernel.py) --
         # only consulted when some incoming connection actually carries a
         # real per-link delay tensor (uses_per_link_delay_kernel). A
@@ -99,61 +101,19 @@ class Population:
         self._carry: CarryBuffer | None = None
         self._fresh: BlockedSpikes | None = None
         self._due: CompactedSpikes | None = None
-        self._merged: tuple | None = None  # this round's merge_incoming() result, set by Network.step()
+        self._merged: tuple | None = (
+            None  # this round's merge_incoming() result, set by Network.step()
+        )
 
         # Real kernel execution (see _execute_update_kernel): compiled lazily
         # on first real launch, then cached -- a population's compiled source
         # never changes once its connections/hooks are fixed.
         self._kernel_fn = None
-        self._compiled_incoming_meta: list[tuple[set, set]] = []  # parallel to self.incoming, set by compile()
+        self._compiled_incoming_meta: list[tuple[set, set]] = (
+            []
+        )  # parallel to self.incoming, set by compile()
 
         self.network: Network = Network(self)
-
-        # Debug
-        # debug(self.dynamic_attrs)
-
-        # need to decide:
-        # attributes may be dynamic if they are changed in a connection as well!
-        # => only collect ALL attributes here
-        # => potentially let connection ADD attributes?
-        # => when is the decision made which ones are dynamic and which are static?
-
-        # why should a connection add attributes?
-        # => stdp may want to write to a buffer of pre-firing times in a target neuron
-        # => this is the basis of our whole speedup in simulation!
-        # => so to not make the target neuron code depend on this, we need to be able to add an array to it
-        # => the connection needs to add the array to the population from the edge code
-        # => edge code needs to be analyzed, together with the mappings to identify which unresolved attributes are left and need to be added
-
-        # STEP 1:
-        # this whole issue arose from trying to verify source and edge mappings in connection
-        # so for that problem, just provide all static and dynamic attributes
-        # in fact, as we see here now, we can only make a final decision on which is which, once we have all connections from and to a population
-        # ideally, the connection "adds" these to the appropriate population
-        # => we may add to source from edge and target code
-        # => we may add to target from edge code
-
-        # focus on verifying mappings for now.
-        # a mapping can only mean that the thing it is renaming already exists, otherwise it will simply be added
-        # when something is added we can worry about that later on.
-        # we need to provide a  way to access all known attributes from the population!
-        # we also need a way to check which attributes from source the edge code uses
-
-        # =====> we have the assignedmemberfinder!
-        # instead of looking for assignments on members of self, look for assignments on members of source, target, time, etc.!
-        # => we can even have a separate ast analyzer which looks for usages overall, not just assignments
-        # so we can find which source attributes the edge and target code actually USE and which ones they ASSIGN and also which ones in total are present in either population and the edge
-        # overall we do need something like the Population class for Edges too, wherein this analysis can be found, their multiplicity is generated from the Connection class, because it depends upon the pattern
-        # so the edge class may have its edge type known and the ast analysis accessed before knowing how many edges there actually are, since the connection may still be incomplete but already trying to verify things
-        # overall, since the edge class would be for verification and compilation, just like the Population class is for now,
-        # it would make sense to remove any start/stop control from the population class and delegate this exclusively to a network class!
-        # since the network class is singly responsible for that, it should consist only of that and not at all of compilation, that is handled by the individual populations
-        # the edge code also needs to be integrated in the population code of course, but this may happen at a later stage and it needs information from both the edge and population classes
-        # so merging only makes sense by letting the population own the edge at some point.....
-        # networks owns populations and connections, but populations own edges but edges are part of connections????
-
-        # STEP 2:
-        # JIT-compile only just before running
 
     @property
     def ports(self):
@@ -259,9 +219,9 @@ class Population:
             if attr not in self.__dict__:
                 default = getattr(self.instance, attr)
                 dtype = (
-                    torch.bool if py_type is bool
-                    else torch.int32 if py_type is int
-                    else torch.float32
+                    torch.bool
+                    if py_type is bool
+                    else torch.int32 if py_type is int else torch.float32
                 )
                 setattr(self, attr, torch.full((n,), default, dtype=dtype))
             tensor = getattr(self, attr)
@@ -285,7 +245,9 @@ class Population:
         """
         device = self.network.device
         if self._fresh is None:
-            self._fresh = empty_blocked_spikes(self.n_blocks, self.local_spike_cap, device)
+            self._fresh = empty_blocked_spikes(
+                self.n_blocks, self.local_spike_cap, device
+            )
         self.compact(t, self.carry_cap)
         # self._fresh is now folded into _carry/_due; reset it to "nothing
         # new" so a round where this population's update kernel doesn't run
@@ -349,13 +311,20 @@ class Population:
                         (len(conn.fabric.topology),), float(d) if d is not None else 0.0
                     )
                 bt = conn.fabric.topology.blocked(
-                    self.group_size, n_neurons,
-                    delay=delay_tensor, n_buckets=self.n_delay_buckets, timestep=period,
+                    self.group_size,
+                    n_neurons,
+                    delay=delay_tensor,
+                    n_buckets=self.n_delay_buckets,
+                    timestep=period,
                 )
             else:
                 bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
-            args[f"conn{i}_src_offsets_ptr"] = bt.offsets.flatten().to(device=device, dtype=torch.int64)
-            args[f"conn{i}_target_indices_ptr"] = bt.target_local.to(device=device, dtype=torch.int32)
+            args[f"conn{i}_src_offsets_ptr"] = bt.offsets.flatten().to(
+                device=device, dtype=torch.int64
+            )
+            args[f"conn{i}_target_indices_ptr"] = bt.target_local.to(
+                device=device, dtype=torch.int32
+            )
             for attr in edge_tensor_attrs:
                 canonical = getattr(conn.fabric, attr)
                 args[f"conn{i}_{attr}_ptr"] = bt.to_blocked(canonical).to(device=device)
@@ -365,7 +334,9 @@ class Population:
         args["t"] = t
         cap = self.local_spike_cap
         local_spike_node = torch.zeros(n_blocks * cap, device=device, dtype=torch.int32)
-        local_spike_time = torch.zeros(n_blocks * cap, device=device, dtype=torch.float32)
+        local_spike_time = torch.zeros(
+            n_blocks * cap, device=device, dtype=torch.float32
+        )
         local_spike_count = torch.zeros(n_blocks, device=device, dtype=torch.int32)
         args["local_spike_node_ptr"] = local_spike_node
         args["local_spike_time_ptr"] = local_spike_time
@@ -374,7 +345,9 @@ class Population:
         # (tl.histogram + atomic-scatter-add, see the update kernel templates)
         # in this launch -- always allocated, even if this particular
         # population's kernel never references it (then simply unused).
-        args["scratch_ptr"] = torch.zeros(n_blocks * self.group_size, device=device, dtype=torch.float32)
+        args["scratch_ptr"] = torch.zeros(
+            n_blocks * self.group_size, device=device, dtype=torch.float32
+        )
 
         args = {k: v for k, v in args.items() if k in fn.arg_names}
         fn[(n_blocks,)](
@@ -385,7 +358,9 @@ class Population:
             LOCAL_SPIKE_CAP=cap,
         )
 
-        self.set_fresh_output(BlockedSpikes(local_spike_node, local_spike_time, local_spike_count, cap))
+        self.set_fresh_output(
+            BlockedSpikes(local_spike_node, local_spike_time, local_spike_count, cap)
+        )
         self._merged = None
 
     def _kernel(self):
@@ -398,7 +373,11 @@ class Population:
         if self._kernel_fn is None:
             module = self.compile()
             func_name = module.body[0].name
-            source = "import triton\nimport triton.language as tl\n\n" + ast.unparse(module) + "\n"
+            source = (
+                "import triton\nimport triton.language as tl\n\n"
+                + ast.unparse(module)
+                + "\n"
+            )
             path = pathlib.Path(tempfile.mkdtemp()) / f"naer2_kernel_{id(self)}.py"
             path.write_text(source)
             spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -428,10 +407,14 @@ class Population:
         which this call just (re)produces; see Network.gather().
         """
         if self._fresh is None:
-            raise ValueError(f"{self!r} has no fresh spike output set for this round (see set_fresh_output)")
+            raise ValueError(
+                f"{self!r} has no fresh spike output set for this round (see set_fresh_output)"
+            )
         if self._carry is None:
             self._carry = CarryBuffer(carry_cap, self._fresh.time.device)
-        self._due = _compact(self._fresh, self._carry, t_hi, fresh_sorted=self.fresh_sorted)
+        self._due = _compact(
+            self._fresh, self._carry, t_hi, fresh_sorted=self.fresh_sorted
+        )
         return self._due
 
     @property
@@ -454,7 +437,9 @@ class Population:
                     return False
         return True
 
-    def merge_incoming(self, per_src_cap: int = 64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def merge_incoming(
+        self, per_src_cap: int = 64
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """This population's merge step (naer2/spike_gather.py): combine
         every incoming connection's source population's already-compact()ed
         `_due` (this round) into the sorted (time, src, conn) buffer this
@@ -466,7 +451,9 @@ class Population:
         for conn in self.incoming:
             src_due = conn._source._due
             if src_due is None:
-                raise ValueError(f"{conn._source!r} has not run compact() this round yet")
+                raise ValueError(
+                    f"{conn._source!r} has not run compact() this round yet"
+                )
             sources.append(src_due)
         conns = list(range(len(self.incoming)))
         return _merge(sources, conns, per_src_cap)
@@ -515,7 +502,9 @@ class Population:
         from .transpiler.analyzers.used_members import UsedMemberFinder
         from .transpiler.context import TranspilerContext
         from .transpiler.hook_transpiler import HookTranspiler
-        from .transpiler.templates.no_delay_update_kernel import NoDelayUpdateKernelTemplate
+        from .transpiler.templates.no_delay_update_kernel import (
+            NoDelayUpdateKernelTemplate,
+        )
 
         ctx = TranspilerContext(
             static_attrs={
@@ -548,8 +537,8 @@ class Population:
                     raise NotImplementedError(
                         f"connection with max delay {float(d.max().item())} >= "
                         f"{type(self.instance).__name__}'s own timestep/period ({period}) "
-                        f"-- cross-timestep per-link delay is not implemented yet, only "
-                        f"intra-timestep bucketing. See TODO.md."
+                        f"-- inter-timestep transmission delay is not implemented yet, only "
+                        f"intra-timestep transmission delay. See TODO.md."
                     )
 
         # one transpiled receive + edge-forward section per incoming connection
@@ -575,11 +564,16 @@ class Population:
 
             source_pop = conn._source
             for attr in real_source_attrs:
-                if attr not in source_pop.dynamic_attrs and attr not in source_pop.instance.__dict__:
+                if (
+                    attr not in source_pop.dynamic_attrs
+                    and attr not in source_pop.instance.__dict__
+                ):
                     raise ValueError(
                         f"source.{attr} referenced but '{attr}' does not exist on {source_pop!r}"
                     )
-            source_dynamic_attrs = {a for a in real_source_attrs if a in source_pop.dynamic_attrs}
+            source_dynamic_attrs = {
+                a for a in real_source_attrs if a in source_pop.dynamic_attrs
+            }
             source_static_attrs = {
                 a: source_pop.instance.__dict__[a]
                 for a in real_source_attrs
@@ -600,12 +594,18 @@ class Population:
             used_edge_names = set()
             if hook is not None:
                 used_edge_names |= UsedMemberFinder(hook.ast, "edge").run()
-            real_used_edge_from_receive = {edge_rename.get(n, n) for n in used_edge_names}
+            real_used_edge_from_receive = {
+                edge_rename.get(n, n) for n in used_edge_names
+            }
             used_self_forward = (
-                UsedMemberFinder(edge_fwd_hook.ast, "self").run() if edge_fwd_hook else set()
+                UsedMemberFinder(edge_fwd_hook.ast, "self").run()
+                if edge_fwd_hook
+                else set()
             )
             used_self_backward = (
-                UsedMemberFinder(edge_bwd_hook.ast, "self").run() if edge_bwd_hook else set()
+                UsedMemberFinder(edge_bwd_hook.ast, "self").run()
+                if edge_bwd_hook
+                else set()
             )
             referenced_edge_attrs = (
                 real_used_edge_from_receive | used_self_forward | used_self_backward
@@ -624,7 +624,8 @@ class Population:
             # per-link override from outside (conn.fabric.state) — same test as
             # Fabric.tensor_attrs, just restricted to names actually referenced here.
             edge_tensor_attrs = {
-                a for a in referenced_edge_attrs
+                a
+                for a in referenced_edge_attrs
                 if a in conn.fabric.dynamic_attrs or a in conn.fabric.state
             }
             edge_constant_attrs = {
@@ -664,7 +665,13 @@ class Population:
                 edge_fwd_stmts = []
 
             incoming_with_hooks.append(
-                (conn, recv_stmts, edge_fwd_stmts, source_dynamic_attrs, edge_tensor_attrs)
+                (
+                    conn,
+                    recv_stmts,
+                    edge_fwd_stmts,
+                    source_dynamic_attrs,
+                    edge_tensor_attrs,
+                )
             )
 
         update_section = HookTranspiler(self.node.update, ctx).emit()
@@ -675,7 +682,13 @@ class Population:
         # this back to build the real launch args with matching names.
         self._compiled_incoming_meta = [
             (source_dynamic_attrs, edge_tensor_attrs)
-            for (_, _, _, source_dynamic_attrs, edge_tensor_attrs) in incoming_with_hooks
+            for (
+                _,
+                _,
+                _,
+                source_dynamic_attrs,
+                edge_tensor_attrs,
+            ) in incoming_with_hooks
         ]
 
         if self.uses_per_link_delay_kernel:

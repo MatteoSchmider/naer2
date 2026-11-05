@@ -266,7 +266,7 @@ class TestMerge:
 
 
 class TestCombine:
-    """combine() -- retention's building block (see Network.step() and
+    """combine() -- the scheduling step's building block (see Network.step() and
     TODO.md): unlike merge(), neither input gets a connection id assigned
     here, since both inputs are themselves already merge()/combine()
     outputs (already (time, node, conn)-tagged)."""

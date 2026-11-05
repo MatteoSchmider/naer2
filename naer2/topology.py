@@ -145,7 +145,7 @@ class Topology:
         block-major-then-source-major idea with one more level: block,
         then bucket, then source. Scope for now: a connection whose whole
         delay spread fits within one population timestep (delay beyond a
-        timestep -- the cross-timestep case -- isn't handled here; an
+        timestep -- inter-timestep transmission delay -- isn't handled here; an
         out-of-scope delay >= timestep just clamps into the last bucket
         rather than erroring). n_buckets=1 (default) is the plain
         block-only layout above, byte-for-byte -- delay/timestep are

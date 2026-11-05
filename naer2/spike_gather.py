@@ -8,7 +8,15 @@ naer2/population.py's node/edge logic (which is checked against the Triton
 CPU interpreter). These kernels are checked by actually running them on a
 GPU; see test/test_spike_gather_gpu.py (skipped without one).
 
-Two separate concerns, two separate kernels:
+Where each kind of delay is handled (see TODO.md's terminology):
+  emission delay                     -- compact(), source-owned carry
+  scheduling                         -- combine(), a target waiting for its
+                                        next due tick keeps everything it was
+                                        handed meanwhile
+  intra-timestep transmission delay  -- inside the target's update kernel
+                                        (delay buckets, per_link_delay_
+                                        update_kernel.py)
+  inter-timestep transmission delay  -- not implemented yet
 
   compact() -- owned by a single source population. Combines whatever it's
     still holding from previous calls (`carry`, already sorted) with this
@@ -492,7 +500,7 @@ def combine(
 
     Unlike merge(), neither input gets a connection id assigned here --
     both already carry their own per-entry conn, since both are themselves
-    merge() (or combine()) outputs. This is what retention needs: a
+    merge() (or combine()) outputs. This is the scheduling step: a
     population not yet due for its own update must not lose a round's
     merge_incoming() result just because a later round's overwrites it --
     see Network.step() and TODO.md.
@@ -503,11 +511,11 @@ def combine(
     but is wrong here specifically: merge()/combine() always allocate a
     full padded buffer regardless of how much is actually due, so sizing
     off that padding instead of the live count made capacity compound
-    roughly geometrically across repeated retention rounds (combine(2048,
+    roughly geometrically across repeated scheduling rounds (combine(2048,
     2048) -> 4096 -> 8192 -> ... even when almost nothing was actually
     pending) -- found by it making compact()/merge()'s single-block
     tl.sort compile time blow up (minutes, not seconds) at a population
-    size of just 1,000-2,000 once a population needed to retain across a
+    size of just 1,000-2,000 once a population had to wait across a
     couple of sub-steps. Reading the live count costs one extra .item()
     sync per side (same latency-floor caveat merge()'s own host wrapper
     already carries, see its docstring) but keeps the buffer honest.

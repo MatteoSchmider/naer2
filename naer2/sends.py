@@ -13,7 +13,8 @@ def spike(time: float = None):
     spike's timestamp — e.g. n2.spike(time) records this hook invocation's own
     notion of time (the incoming spike's exact arrival time inside a per-link
     receive, or `t` again during the final pass), and a receive hook can add
-    its own delay on top: n2.spike(time + self.output_delay). No validation is
+    its own emission delay on top: n2.spike(time + self.emission_delay) --
+    held back by the source's compact() until due. No validation is
     performed — a negative or otherwise nonsensical time is the caller's own
     responsibility.
     """

@@ -15,7 +15,7 @@ behaviors together, in one hand-verified scenario:
      autonomous dynamics and no explicit timestep meant "never due," the
      same silent-failure shape as the PD14 T/poisson gap. Now it correctly
      syncs to whatever the source's own effective period is.
-  3. Retention: a population that ticks slower than the network's sub_dt
+  3. Scheduling: a population that ticks slower than the network's sub_dt
      must not lose anything that became due while it was waiting --
      `Network.step()` used to unconditionally overwrite `_merged` every
      sub-step, discarding whatever a not-yet-due population hadn't
@@ -49,9 +49,9 @@ its autonomous-default period is 0.0 -- always due):
   population), accumulating via combine() rather than losing anything:
     by t=4: 3 rounds' worth due (steps 1,2,3) -> +9 -> count 9
     by t=7: 3 more rounds' worth (steps 4,5,6) -> +9 -> count 18
-  Without the retention fix, Y_delay would have seen only the LAST
+  Without the scheduling fix, Y_delay would have seen only the LAST
   sub-step's contribution each time it finally ticked (3, not 9) -- see
-  test_retention_across_sub_steps_loses_nothing below, which pins the
+  test_scheduling_across_sub_steps_loses_nothing below, which pins the
   exact numbers the bug used to produce.
 
 Skipped entirely when no CUDA/ROCm device is visible to torch (no CPU
@@ -108,12 +108,12 @@ def test_event_driven_with_no_delay_syncs_to_its_source_s_own_cadence(net):
         assert Y_nodelay.count.tolist() == [expected[i]] * 3
 
 
-def test_retention_across_sub_steps_loses_nothing(net):
+def test_scheduling_across_sub_steps_loses_nothing(net):
     """The actual regression test for the bug: without combine()-based
-    retention, Y_delay only ever sees whatever was due on the single
+    scheduling, Y_delay only ever sees whatever was due on the single
     sub-step it happens to tick on (3 per tick), silently dropping the
     other 2 rounds' worth every time -- confirmed by direct reproduction
-    before this fix landed. With retention, every round it was waiting
+    before this fix landed. With scheduling, every round it was waiting
     through is preserved."""
     network, A, Y_delay, Y_nodelay = net
 
