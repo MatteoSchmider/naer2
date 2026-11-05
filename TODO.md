@@ -689,6 +689,153 @@ layout. Run everything with `python -m pytest`.
            At idle (nothing firing), both were equal (~13.3µs each),
            confirming the cost is specifically about code size/compile
            time, not about skipping runtime work differently.
+       - **New (2026-11-04) — real-network-scale follow-up, PD14 and a
+         controlled isolation experiment.** With the two fixes above in
+         place, checked whether real, larger networks (`test/networks/
+         PD14`, `mini_ei`) still have compile-time problems.
+         - **`PD14_neuron`/`PD14_poisson` could never actually be run, only
+           built** — a genuine, pre-existing bug, unrelated to performance.
+           `test/networks/PD14/net.py` only ever broadcasts `potential`
+           into a per-neuron tensor; `current`/`t_ref_end`/`last_time`
+           (`PD14_neuron`) and `next_spike` (`PD14_poisson`) were never
+           turned into tensors anywhere, and `Population.__init__` never
+           did this automatically — so any real kernel launch crashed
+           immediately (`AttributeError: 'Population' object has no
+           attribute 'next_spike'`). Confirms TODO's own "not started/
+           untested" note was literal: PD14 had never been executed, only
+           `build()`-ed. **Fixed, generally** (not PD14-specific):
+           `Population._ensure_on_device` — already the lazy, idempotent
+           chokepoint called before every real kernel launch on `self`,
+           and on a connection's `_source` before reading it — now also
+           broadcasts any dynamic attr nobody explicitly set into a
+           per-neuron tensor from the node instance's own scalar default
+           (`self.instance`'s `__init__`-set value), choosing `torch.bool`/
+           `torch.int32`/`torch.float32` from the type recorded in
+           `self.dynamic_attrs` at construction. Verified: full suite
+           (138 tests) still green; PD14's populations now initialize
+           without the patch my own measurement script needed before this
+           fix existed.
+         - **PD14 still can't reach `.compile()` at all today** — not a
+           regression, a real, already-known limitation, now confirmed
+           concretely on a real network rather than reasoned about: every
+           cortical population's effective period is `0.0` (fully
+           autonomous, no explicit `timestep`), while every real PD14
+           delay is 1.5-6ms — squarely Part 2's cross-timestep case
+           (`delay >= period`), still unimplemented. `compile()`'s existing
+           `NotImplementedError` guard catches this correctly. Measuring
+           PD14's *update-kernel* compile time at all therefore required
+           temporarily forcing an explicit large `timestep` on every
+           cortical population (measurement-only workaround, not a fix —
+           Part 2 is the real fix, still not started).
+         - **With that workaround, PD14's update kernel compiles in a
+           reasonable 11.5-24.9s per cortical population (~141s total
+           across all 8)** — no longer catastrophic (pre-fix, this
+           class of kernel didn't finish compiling in 9.5+ minutes), but
+           not trivial either, and clearly population-`n_incoming`-driven
+           rather than neuron-count-driven (PD14's 8 cortical populations
+           range from 1065 to 21915 neurons but their compile times don't
+           track that at all — they track their own connection count,
+           6-9 each).
+         - **Isolated `n_incoming` directly**, holding target population
+           size exactly fixed (`N_TARGET=5000`, `n_blocks=157` identical
+           across every trial, only varying how many separate source
+           populations feed it): `n_incoming` 1/2/4/9 ->
+           1.15s/1.39s/4.24s/19.9s. Confirms `n_incoming` (not population
+           size, not topology specifics) is PD14's own dominant remaining
+           driver — it reproduces PD14's own worst real case (24.9s at
+           `n_incoming=9`) almost exactly (19.9s) in complete isolation.
+           Mechanistically different from the `SPIKE_BLOCK`/densify fixes
+           above: the connection dispatch is a genuine if/elif chain where
+           every branch can run completely different code (different edge
+           class, different source, different topology) — there's no
+           "swap a forced unroll for a real loop" trick available, since
+           unlike `SPIKE_BLOCK`'s iterations (same code, different data),
+           different connections are NOT the same code. All `n_incoming`
+           branches' code necessarily exists in the compiled kernel
+           regardless of which one runs for any given spike.
+         - **Checked where, precisely, that superlinearity lives — directly
+           asked whether it's an LLVM optimization-pass problem (the
+           owner's own research suggested there's "no good way to avoid
+           this" short of contributing to Triton itself, but wanted this
+           confirmed before accepting that).** Two checks, both decisive:
+           - `DISABLE_LLVM_OPT=1` (routes to `disable_optimization=True` in
+             the AMD backend's `compile_amdgpu`, confirmed by reading
+             `triton/backends/amd/compiler.py` directly) barely changed
+             anything: `n_incoming` 1/2/4/9 -> 0.94/1.26/4.06/18.1s vs.
+             1.15/1.39/4.24/19.9s optimized — same superlinear shape,
+             just uniformly a bit faster. If LLVM's optimizer were the
+             cause, disabling it should have flattened the curve, not
+             just shifted it down a constant fraction.
+           - **Per-stage timing via `triton.knobs.compilation.listener`**
+             (a real, documented Triton hook — `CompileTimes` with
+             `ir_initialization` [AST -> Triton IR] plus one duration per
+             `lowering_stages` entry, keyed by stage extension: `ttir`,
+             `ttgir`, `llir`, `amdgcn`, `hsaco`) settled it directly: at
+             `n_incoming=9`, `ttgir` lowering alone is 15.6s of the 18.6s
+             total (~84%); `llir`+`amdgcn` (where LLVM actually runs)
+             together are under 1.5s. Swept all four `n_incoming` values
+             with and without `DISABLE_LLVM_OPT=1`: `ttgir` duration is
+             essentially identical either way at every point (e.g.
+             `n_incoming=9`: 15.617s optimized vs. 15.900s unoptimized),
+             while `llir`/`amdgcn` do shrink by roughly half when LLVM
+             optimization is disabled (small, as expected, since that's
+             exactly the stage it touches) — but that's a minor fraction
+             of the total regardless. **Conclusion: the superlinearity is
+             not an LLVM optimization-pass cost at all — it's Triton's own
+             `ttgir` lowering (TTIR -> TTGIR, i.e. Triton's own MLIR-based
+             layout-assignment/legalization pass, which runs entirely
+             before LLVM is ever invoked).** Matches the owner's own
+             research that there's no good within-Triton-API way to avoid
+             this for a genuinely-branchy kernel; a real fix would mean
+             contributing to Triton's own `ttgir` lowering pass, not
+             anything reachable from kernel-authoring code. Worth
+             remembering as a general Triton-authoring lesson, not just a
+             naer2-specific one: minimize the number of *structurally
+             distinct* branches/tensor-shapes compiled into one kernel
+             function if `ttgir` lowering time becomes a problem elsewhere
+             — this is exactly why the `SPIKE_BLOCK`/densify fixes above
+             (removing *repeated, same-shaped* code) worked so well and
+             why `n_incoming` (genuinely *different*-shaped code per
+             branch) doesn't have an equivalent fix available.
+         - **`mini_ei` confirmed trivial, no issues**: `build()` 0.006s;
+           E (100 neurons, n_incoming=2) compile+run 0.537s; I (25 neurons,
+           n_incoming=2) 0.016s; first real `network.step()` (gather+merge+
+           update, all kernels) 1.085s; steady-state 0.0023s. Small
+           population, few connections, no delay kernel at all -- nothing
+           here was ever going to be a problem.
+         - **Done (2026-11-05) — `compact()` no longer uses `tl.sort`.** At
+           PD14 scale (sort width 65536) the old single-`tl.sort` kernel was
+           still compiling after 29+ minutes: `tl.sort` emits its bitonic
+           network fully unrolled over one register tile, the same
+           unroll-everything failure as `tl.static_range(SPIKE_BLOCK)`. It is
+           now a merge, done with real loops in BLOCK-sized chunks through
+           global memory: densify fresh (prefix sum of group counts), sort
+           fresh with a looped bitonic network (global-memory compare-exchange
+           plus a barrier per stage), then merge it with carry (always
+           already sorted, being the tail of the previous call's output) by
+           binary-search rank. Each element's position is its own index plus
+           how many entries of the other sequence come before it, with carry
+           first on ties. Sizes are runtime args, so one compiled kernel
+           serves every population size. Compile ~0.3-0.4s at any size;
+           steady state at 685 groups ~1ms (sort skipped) / ~10ms (bitonic
+           sort).
+           Fast path: the `FRESH_SORTED` constexpr skips the fresh sort.
+           `Population.fresh_sorted` sets it from the hook ASTs: it is True
+           iff every `n2.spike()` in the node's hooks (and incoming edge
+           hooks) is bare. A bare call always records the kernel's `t`, so
+           one launch's fresh output shares a single timestamp. Any explicit
+           emission time (an emission delay, not a transmission delay) turns
+           it off. Output is ordered by time only, and ties have no defined
+           order (confirmed: no consumer relies on it).
+           Carry overflow: the old kernel wrote past `carry.cap`; writes are
+           now masked to the buffer, but `carry.count` keeps the true
+           (possibly > cap) count, so the excess is dropped yet an overflow
+           stays detectable. Nothing checks it yet.
+           Tests: `TestCompactAtScale` (685 groups, multi-round, both paths,
+           vs. a reference), `test_fresh_sorted_flag.py`.
+           Still on `tl.sort`: `merge()`/`combine()` — the same blowup
+           applies once their widths grow (`combine()` sizes off live
+           counts, so it can grow at scale); same fix pattern.
        **⚠ FLAG FOR WHEN WE GET HERE — open correctness concern, not yet
        discussed.** The owner has flagged (2026-11-03) that something about
        the *current* (Part 1, already-shipped) per-link-delay kernel looks

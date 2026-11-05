@@ -34,14 +34,23 @@ Two separate concerns, two separate kernels:
     merge-path; see the module docstring note below each kernel for what's
     deferred.)
 
-Both kernels run as a single Triton program (grid=(1,)): realistic spike
-counts here are small -- tens to a few hundred per population per timestep,
-see TODO.md's scale reasoning -- so one block sorting everything at once is
-simpler than tiling, and was fast enough (tens to low hundreds of us,
-measured) that tiling isn't worth it unless a future scale actually needs
-it. Both use the same trick to turn a sort into a single `tl.sort` call
-(which only orders one tensor of keys, no attached payload): pack every
-field being carried into one sortable integer key, sort that, unpack after.
+All kernels run as a single Triton program (grid=(1,)).
+
+compact() does NOT use tl.sort: tl.sort builds its whole bitonic network
+unrolled at trace time over one TOTAL_CAP-wide register tile, and at real
+population sizes (TOTAL_CAP 65536 for PD14) that took tens of minutes to
+compile. Instead it works through global memory in BLOCK-sized chunks with
+real loops: densify fresh, sort it (a looped bitonic network -- skipped
+entirely when the population only emits bare n2.spike(), see
+Population.fresh_sorted), then merge it with the already-sorted carry by
+binary-search rank. Sizes are runtime arguments, so one compiled kernel
+serves every population size. Output is sorted by time only; ties have no
+defined order.
+
+merge()/combine() still use the original trick to turn a sort into a single
+`tl.sort` call (which only orders one tensor of keys, no attached payload):
+pack every field being carried into one sortable integer key, sort that,
+unpack after.
 float times are made integer-sortable via the standard order-preserving bit
 flip (flip the sign bit for positives, invert all bits for negatives);
 everything else (a population-local node index, a connection id) is small
@@ -141,76 +150,211 @@ class CompactedSpikes:
 
 
 @triton.jit
+def _bit_length(n):
+    """Number of binary-search halvings that always converge over [0, n]."""
+    b = tl.cast(0, tl.int32)
+    while n > 0:
+        n = n >> 1
+        b += 1
+    return b
+
+
+@triton.jit
+def _rank(arr_ptr, n, x, iters, INCLUSIVE: tl.constexpr):
+    """Per element of x: how many of the sorted arr[0:n] are < x (or <= x if
+    INCLUSIVE). Vectorized binary search as a real loop over global memory --
+    a register tensor can't be gathered from at arbitrary indices."""
+    lo = tl.zeros_like(x).to(tl.int32)
+    hi = lo + n
+    for _ in range(iters):
+        active = lo < hi
+        mid = (lo + hi) // 2
+        v = tl.load(arr_ptr + mid, mask=active, other=0.0)
+        if INCLUSIVE:
+            right = v <= x
+        else:
+            right = v < x
+        lo = tl.where(active & right, mid + 1, lo)
+        hi = tl.where(active & ~right, mid, hi)
+    return lo
+
+
+@triton.jit
+def _bitonic_sort_inplace(time_ptr, node_ptr, n, BLOCK: tl.constexpr):
+    """Sort time_ptr[0:n] ascending (node_ptr riding along), in place, as a
+    bitonic network over a power-of-two padded scratch buffer (caller
+    guarantees capacity). Every stage is the same compare-exchange at a
+    different stride, so this is a real loop through global memory -- not
+    tl.sort's trace-time-unrolled register network, whose compile time
+    explodes with width."""
+    p = tl.cast(1, tl.int32)
+    while p < n:
+        p *= 2
+    for start in range(n, p, BLOCK):
+        i = start + tl.arange(0, BLOCK)
+        tl.store(time_ptr + i, _INF, mask=i < p)
+    tl.debug_barrier()
+
+    k = tl.cast(2, tl.int32)
+    while k <= p:
+        j = k // 2
+        while j > 0:
+            for start in range(0, p, BLOCK):
+                i = start + tl.arange(0, BLOCK)
+                partner = i ^ j
+                # each pair is owned by its lower index, so no lane in this
+                # stage ever touches an element another lane writes
+                lead = (i < p) & (partner > i)
+                ti = tl.load(time_ptr + i, mask=lead, other=0.0)
+                tp = tl.load(time_ptr + partner, mask=lead, other=0.0)
+                ni = tl.load(node_ptr + i, mask=lead, other=0)
+                np_ = tl.load(node_ptr + partner, mask=lead, other=0)
+                ascending = (i & k) == 0
+                swap = lead & tl.where(ascending, ti > tp, ti < tp)
+                tl.store(time_ptr + i, tp, mask=swap)
+                tl.store(time_ptr + partner, ti, mask=swap)
+                tl.store(node_ptr + i, np_, mask=swap)
+                tl.store(node_ptr + partner, ni, mask=swap)
+            tl.debug_barrier()
+            j = j // 2
+        k *= 2
+
+
+@triton.jit
+def _emit_merged(
+    pos, time, node, m, due_count,
+    due_time_ptr, due_node_ptr, new_carry_time_ptr, new_carry_node_ptr, CARRY_CAP,
+):
+    is_due = pos < due_count
+    tl.store(due_time_ptr + pos, time, mask=m & is_due)
+    tl.store(due_node_ptr + pos, node, mask=m & is_due)
+    cpos = pos - due_count
+    keep = m & ~is_due & (cpos < CARRY_CAP)
+    tl.store(new_carry_time_ptr + cpos, time, mask=keep)
+    tl.store(new_carry_node_ptr + cpos, node, mask=keep)
+
+
+@triton.jit
 def _compaction_kernel(
     carry_time_ptr, carry_node_ptr, carry_count_ptr,
     fresh_time_ptr, fresh_node_ptr, fresh_count_ptr,
+    dense_time_ptr, dense_node_ptr, group_off_ptr,
     due_time_ptr, due_node_ptr, due_count_ptr,
-    t_hi,
-    N_GROUPS: tl.constexpr, GROUP_CAP: tl.constexpr, CARRY_CAP: tl.constexpr, TOTAL_CAP: tl.constexpr,
+    new_carry_time_ptr, new_carry_node_ptr,
+    t_hi, N_GROUPS, CARRY_CAP,
+    GROUP_CAP: tl.constexpr, FRESH_SORTED: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    idx = tl.arange(0, TOTAL_CAP)
-    carry_count = tl.load(carry_count_ptr)
+    lanes = tl.arange(0, BLOCK)
 
-    is_carry = idx < CARRY_CAP
-    is_fresh = (idx >= CARRY_CAP) & (idx < CARRY_CAP + N_GROUPS * GROUP_CAP)
+    # 1. densify fresh: exclusive prefix sum of per-group counts gives each
+    #    group's offset in one contiguous array
+    running = tl.cast(0, tl.int32)
+    for gs in range(0, N_GROUPS, BLOCK):
+        gi = gs + lanes
+        gm = gi < N_GROUPS
+        c = tl.minimum(tl.load(fresh_count_ptr + gi, mask=gm, other=0), GROUP_CAP)
+        tl.store(group_off_ptr + gi, running + tl.cumsum(c, axis=0) - c, mask=gm)
+        running += tl.sum(c, axis=0)
+    n_fresh = running
+    tl.debug_barrier()
 
-    time_c = tl.load(carry_time_ptr + idx, mask=is_carry, other=0.0)
-    node_c = tl.load(carry_node_ptr + idx, mask=is_carry, other=0)
-    carry_valid = is_carry & (idx < carry_count)
+    for s0 in range(0, N_GROUPS * GROUP_CAP, BLOCK):
+        s = s0 + lanes
+        g = s // GROUP_CAP
+        local = s % GROUP_CAP
+        in_range = s < N_GROUPS * GROUP_CAP
+        c = tl.minimum(tl.load(fresh_count_ptr + g, mask=in_range, other=0), GROUP_CAP)
+        v = in_range & (local < c)
+        dst = tl.load(group_off_ptr + g, mask=v, other=0) + local
+        tl.store(dense_time_ptr + dst, tl.load(fresh_time_ptr + s, mask=v), mask=v)
+        tl.store(dense_node_ptr + dst, tl.load(fresh_node_ptr + s, mask=v), mask=v)
+    tl.debug_barrier()
 
-    fresh_idx = idx - CARRY_CAP
-    g = fresh_idx // GROUP_CAP
-    local = fresh_idx % GROUP_CAP
-    fresh_count_g = tl.load(fresh_count_ptr + g, mask=is_fresh, other=0)
-    fresh_valid = is_fresh & (local < fresh_count_g)
-    time_f = tl.load(fresh_time_ptr + fresh_idx, mask=fresh_valid, other=0.0)
-    node_f = tl.load(fresh_node_ptr + fresh_idx, mask=fresh_valid, other=0)
+    # 2. fresh must be sorted before merging; with only bare n2.spike() in a
+    #    population's hooks every fresh time is the same `t`, already sorted
+    if not FRESH_SORTED:
+        _bitonic_sort_inplace(dense_time_ptr, dense_node_ptr, n_fresh, BLOCK)
+        tl.debug_barrier()
 
-    valid = tl.where(is_carry, carry_valid, fresh_valid)
-    time = tl.where(is_carry, time_c, time_f)
-    node = tl.where(is_carry, node_c, node_f)
-    time = tl.where(valid, time, _INF)
+    # 3. merge sorted carry with sorted fresh; since both are sorted, the
+    #    due/carry split point is just how many of each are <= t_hi
+    n_carry = tl.minimum(tl.load(carry_count_ptr), CARRY_CAP)
+    due_count = tl.cast(0, tl.int32)
+    for start in range(0, n_carry, BLOCK):
+        i = start + lanes
+        due_count += tl.sum((tl.load(carry_time_ptr + i, mask=i < n_carry, other=_INF) <= t_hi).to(tl.int32), axis=0)
+    for start in range(0, n_fresh, BLOCK):
+        i = start + lanes
+        due_count += tl.sum((tl.load(dense_time_ptr + i, mask=i < n_fresh, other=_INF) <= t_hi).to(tl.int32), axis=0)
 
-    key = (_to_ordered_u32(time).to(tl.uint64) << 32) | node.to(tl.uint64)
-    key = tl.sort(key)
-    sorted_node = (key & 0xFFFFFFFF).to(tl.int32)
-    sorted_time = _from_ordered_u32((key >> 32).to(tl.uint32))
-
-    fresh_total = tl.sum(fresh_valid.to(tl.int32), axis=0)
-    total_real = carry_count + fresh_total
-    due_count = tl.sum((sorted_time <= t_hi).to(tl.int32), axis=0)
-    new_carry_count = total_real - due_count
-
-    due_mask = idx < due_count
-    tl.store(due_time_ptr + idx, sorted_time, mask=due_mask)
-    tl.store(due_node_ptr + idx, sorted_node, mask=due_mask)
-
-    carry_store_idx = idx - due_count
-    carry_mask = (idx >= due_count) & (idx < due_count + new_carry_count)
-    tl.store(carry_time_ptr + carry_store_idx, sorted_time, mask=carry_mask)
-    tl.store(carry_node_ptr + carry_store_idx, sorted_node, mask=carry_mask)
+    # an element's merged position = its own index + how many of the other
+    # sequence precede it (ties: carry first, so carry counts fresh strictly
+    # less, fresh counts carry less-or-equal -- every position is unique)
+    iters_fresh = _bit_length(n_fresh)
+    iters_carry = _bit_length(n_carry)
+    for start in range(0, n_carry, BLOCK):
+        i = start + lanes
+        m = i < n_carry
+        time = tl.load(carry_time_ptr + i, mask=m, other=_INF)
+        node = tl.load(carry_node_ptr + i, mask=m, other=0)
+        pos = i + _rank(dense_time_ptr, n_fresh, time, iters_fresh, INCLUSIVE=False)
+        _emit_merged(pos, time, node, m, due_count,
+                     due_time_ptr, due_node_ptr, new_carry_time_ptr, new_carry_node_ptr, CARRY_CAP)
+    for start in range(0, n_fresh, BLOCK):
+        i = start + lanes
+        m = i < n_fresh
+        time = tl.load(dense_time_ptr + i, mask=m, other=_INF)
+        node = tl.load(dense_node_ptr + i, mask=m, other=0)
+        pos = i + _rank(carry_time_ptr, n_carry, time, iters_carry, INCLUSIVE=True)
+        _emit_merged(pos, time, node, m, due_count,
+                     due_time_ptr, due_node_ptr, new_carry_time_ptr, new_carry_node_ptr, CARRY_CAP)
 
     tl.store(due_count_ptr, due_count)
-    tl.store(carry_count_ptr, new_carry_count)
+    # unclamped on purpose: a count above CARRY_CAP marks an overflow (the
+    # excess was dropped above) instead of hiding it
+    tl.store(carry_count_ptr, n_carry + n_fresh - due_count)
 
 
-def compact(fresh: BlockedSpikes, carry: CarryBuffer, t_hi: float) -> CompactedSpikes:
-    """Fold `fresh` into `carry` (mutated in place: becomes the new
-    carry-forward remainder), return the entries due by `t_hi`."""
+_COMPACT_BLOCK = 1024
+
+
+def compact(fresh: BlockedSpikes, carry: CarryBuffer, t_hi: float, fresh_sorted: bool = False) -> CompactedSpikes:
+    """Fold `fresh` into `carry` (mutated: its buffers are replaced by the
+    new carry-forward remainder), return the entries due by `t_hi`, sorted
+    by time (ties in no particular order).
+
+    fresh_sorted=True promises every valid fresh entry is already in time
+    order once the groups are concatenated -- true whenever all of them
+    share one timestamp, which is what a population emitting only bare
+    n2.spike() produces (see Population.fresh_sorted). It skips the sort;
+    the default False is always correct."""
+    device = fresh.time.device
     n_groups = fresh.count.shape[0]
-    total_cap = _next_pow2(carry.cap + n_groups * fresh.cap)
+    fresh_cap = n_groups * fresh.cap
 
-    due_time = torch.zeros(total_cap, device=fresh.time.device, dtype=torch.float32)
-    due_node = torch.zeros(total_cap, device=fresh.time.device, dtype=torch.int32)
-    due_count = torch.zeros(1, device=fresh.time.device, dtype=torch.int32)
+    dense_time = torch.empty(max(_next_pow2(fresh_cap), 1), device=device, dtype=torch.float32)
+    dense_node = torch.empty_like(dense_time, dtype=torch.int32)
+    group_off = torch.empty(max(n_groups, 1), device=device, dtype=torch.int32)
+
+    due_time = torch.zeros(carry.cap + fresh_cap, device=device, dtype=torch.float32)
+    due_node = torch.zeros(carry.cap + fresh_cap, device=device, dtype=torch.int32)
+    due_count = torch.zeros(1, device=device, dtype=torch.int32)
+    # carry is read by binary search while the merge writes the new
+    # remainder, so the remainder goes into fresh buffers that replace it
+    new_carry_time = torch.full((carry.cap,), float("inf"), device=device, dtype=torch.float32)
+    new_carry_node = torch.zeros(carry.cap, device=device, dtype=torch.int32)
 
     _compaction_kernel[(1,)](
         carry.time, carry.node, carry.count,
         fresh.time, fresh.node, fresh.count,
+        dense_time, dense_node, group_off,
         due_time, due_node, due_count,
-        t_hi,
-        N_GROUPS=n_groups, GROUP_CAP=fresh.cap, CARRY_CAP=carry.cap, TOTAL_CAP=total_cap,
+        new_carry_time, new_carry_node,
+        t_hi, n_groups, carry.cap,
+        GROUP_CAP=fresh.cap, FRESH_SORTED=fresh_sorted, BLOCK=_COMPACT_BLOCK,
     )
+    carry.time = new_carry_time
+    carry.node = new_carry_node
     return CompactedSpikes(due_time, due_node, due_count)
 
 

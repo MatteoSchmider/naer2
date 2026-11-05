@@ -141,6 +141,85 @@ class TestCompact:
         assert _pairs(carry.time, carry.node, carry.count) == [(100.0, 0)]
 
 
+def _random_round(n_groups: int, cap: int, uniform_time: float | None, gen: torch.Generator) -> BlockedSpikes:
+    """Real-kernel-shaped fresh output: random per-group counts, scratch
+    past each count, and either one shared timestamp (what bare n2.spike()
+    emits) or random, unsorted times."""
+    count = torch.randint(0, cap + 1, (n_groups,), generator=gen, dtype=torch.int32)
+    if uniform_time is None:
+        time = torch.rand(n_groups * cap, generator=gen) * 20.0
+    else:
+        time = torch.full((n_groups * cap,), uniform_time)
+    local = torch.arange(n_groups * cap) % cap
+    valid = local < count.repeat_interleave(cap)
+    time[~valid] = float("nan")
+    node = torch.where(valid, torch.arange(n_groups * cap, dtype=torch.int32), -1)
+    return BlockedSpikes(node.to(DEVICE), time.to(DEVICE), count.to(DEVICE), cap)
+
+
+def _valid_entries(fresh: BlockedSpikes) -> list[tuple[float, int]]:
+    local = torch.arange(fresh.time.shape[0], device=DEVICE) % fresh.cap
+    valid = local < fresh.count.repeat_interleave(fresh.cap)
+    return list(zip(fresh.time[valid].tolist(), fresh.node[valid].tolist()))
+
+
+def _check_sorted_split(due, carry, expected: list[tuple[float, int]], t_hi: float):
+    """Ties have no defined order, so compare as sets of (time, node) plus
+    an explicit time-ascending check on each output."""
+    got_due = _pairs(due.time, due.node, due.count)
+    got_carry = _pairs(carry.time, carry.node, carry.count)
+    for got in (got_due, got_carry):
+        times = [t for t, _ in got]
+        assert times == sorted(times)
+    assert sorted(got_due) == sorted(e for e in expected if e[0] <= t_hi)
+    assert sorted(got_carry) == sorted(e for e in expected if e[0] > t_hi)
+
+
+class TestCompactAtScale:
+    """compact() at real-network width (PD14's largest population has 685
+    groups) -- the size that used to take tens of minutes to compile under
+    a single tl.sort -- across several rounds, for both the generic sorted
+    path and the fresh_sorted fast path."""
+
+    N_GROUPS = 685
+    CAP = 64
+
+    @pytest.mark.parametrize("fresh_sorted", [False, True])
+    def test_multi_round_lifecycle_matches_reference(self, fresh_sorted):
+        gen = torch.Generator().manual_seed(1)
+        carry = CarryBuffer(cap=self.N_GROUPS * self.CAP, device=DEVICE)
+        pending: list[tuple[float, int]] = []
+        for rnd, t_hi in enumerate([5.0, 10.0, 15.0, 25.0]):
+            uniform = float(3 + 5 * rnd) if fresh_sorted else None
+            fresh = _random_round(self.N_GROUPS, self.CAP, uniform, gen)
+            expected = pending + _valid_entries(fresh)
+
+            due = compact(fresh, carry, t_hi=t_hi, fresh_sorted=fresh_sorted)
+
+            _check_sorted_split(due, carry, expected, t_hi)
+            pending = [e for e in expected if e[0] > t_hi]
+
+    def test_fast_path_agrees_with_generic_path_on_uniform_fresh(self):
+        # carry straddling the shared fresh time on both sides, including
+        # an exact tie, so the merge's tie rule is actually exercised
+        results = []
+        for fresh_sorted in (False, True):
+            gen = torch.Generator().manual_seed(2)
+            fresh = _random_round(self.N_GROUPS, self.CAP, 7.0, gen)
+            carry = CarryBuffer(cap=16, device=DEVICE)
+            carry.time[:5] = torch.tensor([1.0, 7.0, 7.0, 9.0, 12.0])
+            carry.node[:5] = torch.tensor([-1, -2, -3, -4, -5], dtype=torch.int32)
+            carry.count[0] = 5
+            expected = _pairs(carry.time, carry.node, carry.count) + _valid_entries(fresh)
+
+            due = compact(fresh, carry, t_hi=8.0, fresh_sorted=fresh_sorted)
+
+            _check_sorted_split(due, carry, expected, 8.0)
+            results.append((sorted(_pairs(due.time, due.node, due.count)),
+                            _pairs(carry.time, carry.node, carry.count)))
+        assert results[0] == results[1]
+
+
 class TestMerge:
     def test_combines_and_tags_sources_by_connection(self):
         s0 = _compacted([(5.0, 1)])

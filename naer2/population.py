@@ -245,8 +245,25 @@ class Population:
         `_source` before reading its state as a source_{attr} pointer --
         since the "lazy move on first kernel launch" policy must hold
         regardless of which population's kernel happens to run first on a
-        given round."""
-        for attr in self.dynamic_attrs:
+        given round.
+
+        A dynamic attr build()-time code never explicitly broadcast into a
+        per-neuron tensor (e.g. `pop.potential = tensor` is common, but a
+        node can have several dynamic attrs and nothing requires every one
+        of them to be set that way) is broadcast here instead, lazily, from
+        the node instance's own scalar default (the value its __init__ set)
+        -- same timing as the device move, since both are "whatever this
+        attr needs before the first real kernel read/write touches it"."""
+        n = len(self.shape)
+        for attr, py_type in self.dynamic_attrs.items():
+            if attr not in self.__dict__:
+                default = getattr(self.instance, attr)
+                dtype = (
+                    torch.bool if py_type is bool
+                    else torch.int32 if py_type is int
+                    else torch.float32
+                )
+                setattr(self, attr, torch.full((n,), default, dtype=dtype))
             tensor = getattr(self, attr)
             if tensor.device != device:
                 setattr(self, attr, tensor.to(device))
@@ -394,7 +411,9 @@ class Population:
         """Hand off this round's freshly emitted, GROUP-blocked spikes for
         compact() to fold in. Called automatically by _execute_update_kernel
         after every real kernel launch; tests may also call it directly to
-        control spikes without running the update kernel."""
+        control spikes without running the update kernel -- if
+        self.fresh_sorted is True, the entries must then already be in time
+        order, since compact() won't sort them."""
         self._fresh = blocked
 
     def compact(self, t_hi: float, carry_cap: int = 64) -> CompactedSpikes:
@@ -412,8 +431,28 @@ class Population:
             raise ValueError(f"{self!r} has no fresh spike output set for this round (see set_fresh_output)")
         if self._carry is None:
             self._carry = CarryBuffer(carry_cap, self._fresh.time.device)
-        self._due = _compact(self._fresh, self._carry, t_hi)
+        self._due = _compact(self._fresh, self._carry, t_hi, fresh_sorted=self.fresh_sorted)
         return self._due
+
+    @property
+    def fresh_sorted(self) -> bool:
+        """True if every n2.spike() in this population's own hooks is bare
+        (no time argument): then each one records the kernel's `t`, so all of
+        one launch's fresh output shares a single timestamp and compact() can
+        skip sorting it. Any explicit spike time (e.g. an emission delay)
+        makes it False."""
+        from .transpiler.transformers.if_transformer import IfTransformer
+
+        hooks = [self.node.send, self.node.update, *self.node.receive.values()]
+        for conn in self.incoming:
+            hooks += conn.fabric.edge.values()
+        for hook in hooks:
+            if hook is None:
+                continue
+            for n in ast.walk(hook.ast):
+                if IfTransformer._is_spike(n) and (n.value.args or n.value.keywords):
+                    return False
+        return True
 
     def merge_incoming(self, per_src_cap: int = 64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """This population's merge step (naer2/spike_gather.py): combine
