@@ -11,18 +11,19 @@ neurons (B, `delay_probe`): weight alternates [1, 0, 1, 0], delay places
 each target in a different one of B's 4 buckets (bucket_width = B.timestep
 / B.n_delay_buckets = 1.0 / 4 = 0.25):
 
-    target  weight  delay  bucket  expected arrival = emission(1.0) + bucket*0.25
-      0        1     0.00     0      1.00  -> fires (weight 1 crosses threshold 0.5)
-      1        0     0.25     1      1.25  -> never fires (weight 0)
-      2        1     0.50     2      1.50  -> fires
-      3        0     0.75     3      1.75  -> never fires
+    target  weight  delay  bucket  delivery time = diagonal centre (4 + bucket + 1) * 0.25
+      0        1     0.00     0      1.25  -> fires (weight 1 crosses threshold 0.5)
+      1        0     0.25     1      1.50  -> never fires (weight 0)
+      2        1     0.50     2      1.75  -> fires
+      3        0     0.75     3      2.00  -> never fires
 
-Buckets are walked in ascending order inside one kernel call (bucket 0's
-whole link range fully processed -- receive, then send -- before bucket 1's
-starts, see the template's module docstring), so target 0's spike is
-written into B's local spike buffer strictly before target 2's: checking
-that order directly is this test's way of confirming "buckets go through
-one after another," not just that the final set of who-fired is right.
+(emission 1.0 is emission bin 4; delivery time is the (emission bin, delay
+bucket) diagonal's centre, see the template's module docstring.) Diagonals
+are walked in ascending order inside one kernel call, so target 0's spike
+is written into B's local spike buffer strictly before target 2's.
+test_deliveries_follow_arrival_order_not_emission_order below covers the
+case that actually needs the convolution: two spikes with different
+emission times whose arrivals interleave.
 
 Skipped entirely when no CUDA/ROCm device is visible to torch (no CPU
 reference for the compiled kernel, same as test_gpu_hardware.py).
@@ -76,10 +77,44 @@ def test_targets_fire_at_their_own_bucket_s_arrival_time_in_ascending_order(net)
     nodes = B._fresh.node[:count].tolist()
     times = B._fresh.time[:count].tolist()
 
-    assert list(zip(nodes, times)) == [(0, 1.0), (2, 1.5)], (
+    assert list(zip(nodes, times)) == [(0, 1.25), (2, 1.75)], (
         "only the weight-1 targets (buckets 0 and 2) should fire, each at its own "
         "bucket's arrival time, in ascending bucket order"
     )
+
+
+def test_deliveries_follow_arrival_order_not_emission_order():
+    """A0 fires first (1.0) on a long delay (0.75 -> bucket 3), A1 fires
+    later (1.5) on no delay (bucket 0). Arrival order is the reverse of
+    emission order: A1's delivery (diagonal 6 -> 1.75) must be processed
+    before A0's (diagonal 7 -> 2.0). Processing in emission order -- each
+    spike walking all its buckets before the next -- would fire B0 first.
+    B's input is set directly so both spikes land in one kernel call."""
+    torch.cuda.set_device(0)
+    A = counter() * 2
+    A.potential = torch.zeros(2)
+    B = delay_probe() * 2
+    B.potential = torch.zeros(2)
+    B.timestep = 1.0
+    B.n_delay_buckets = 4
+
+    conn = A >> all_to_all >> B
+    # links in source-major order: A0->B0, A0->B1, A1->B0, A1->B1
+    conn.weight = torch.tensor([1.0, 0.0, 0.0, 1.0])
+    conn.delay = torch.tensor([0.75, 0.0, 0.0, 0.0])
+
+    dev = "cuda:0"
+    B._merged = (
+        torch.tensor([1.0, 1.5], device=dev),
+        torch.tensor([0, 1], device=dev, dtype=torch.int32),
+        torch.tensor([0, 0], device=dev, dtype=torch.int32),
+        torch.tensor([2], device=dev, dtype=torch.int32),
+    )
+    B._execute_update_kernel(2.0)
+
+    count = int(B._fresh.count[0].item())
+    fired = list(zip(B._fresh.node[:count].tolist(), B._fresh.time[:count].tolist()))
+    assert fired == [(1, 1.75), (0, 2.0)]
 
 
 def test_weight_zero_targets_never_cross_threshold(net):

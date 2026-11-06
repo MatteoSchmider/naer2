@@ -865,8 +865,40 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
        2. Within one call, events run in emission order, each spike
           walking all its buckets before the next spike — not in arrival
           order, so time can go backwards between deliveries.
-       **Do not start implementing inter-timestep transmission delay**
-       until this is settled.
+       **Decided 2026-11-05 — point 2 is fixed by a convolution over
+       (emission bin, delay bucket), not by any extra sort.** Bin incoming
+       spikes' emission times on an absolute grid of the same width w as the
+       delay buckets (the input is already emission-sorted, so each bin is a
+       contiguous range). Pair (emission bin i, delay bucket j) has arrivals
+       in [(i+j)·w, (i+j+2)·w), so processing anti-diagonals k = i+j in
+       increasing order gives arrival order up to one bucket width — out of
+       order only between adjacent diagonals, by < w, which is below the
+       resolution we care about. Topology stays fully static (the existing
+       per-delay-bucket sub-topologies); every (spike, bucket) pair is still
+       walked exactly once. Delivery time is coarse and monotone on purpose:
+       every delivery on diagonal k gets `time = (k+1)·w` (emission-bin
+       centre + bucket centre), so models never see negative dt. Bucket is a
+       runtime index now, so the link body is no longer duplicated per
+       bucket.
+       Point 1 (arrivals past the call's `t`) is NOT fixed by this; it falls
+       out of inter-timestep delay below: a call only processes diagonals
+       up to its `t`, and the remaining (spike, bucket ≥ m) work carries to
+       the target's next call — the inter-timestep buffer is just the
+       emission-sorted spikes the target keeps until all their buckets are
+       delivered, with n_buckets·w covering the max delay.
+       Order: (a) convolution, intra-timestep only, tested; (b)
+       inter-timestep transmission delay on top of it; (c) the full
+       spike-lifecycle review (item 1b below).
+
+       PD14 numbers for reference (w = 0.1ms): total fan-out per source
+       spike is 2,700-6,500 links, peaking at ~140-690 links in the busiest
+       0.1ms bucket. E delays N(1.5, 0.75) need ~40 buckets to cover their
+       range and I delays N(0.75, 0.375) ~21, so 16 buckets of 0.1ms would
+       leave ~45% of E links beyond the last bucket. Per (spike, bucket,
+       32-neuron target block) — what one walk in the kernel actually finds
+       — it's at most ~1.6 links (I_5→E_5) and typically 0.001-0.6, so most
+       walks are empty and cost two offset loads each; worth measuring once
+       (a) runs at PD14 scale.
 
        **Inter-timestep transmission delay (the part that still needs
        solving).** A delay that exceeds one population timestep pushes a
@@ -960,6 +992,16 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      latency lever than how spike management sorts, since every population
      pays its own full kernel-launch overhead in sequence regardless. Not
      started; flagged here per request.
+1b. **Review the whole spike lifecycle, emission to consumption, end to
+   end** (requested 2026-11-05, after inter-timestep delay lands). Most of
+   it now exists but was built piece by piece: emission (`n2.spike`, local
+   spike buffers), emission delay (`compact()` carry), scheduling
+   (`combine()`), merge, intra-/inter-timestep transmission delay (the
+   convolution and the target-owned carry), consumption in the kernel.
+   Check the whole chain for consistency of time semantics, ownership,
+   capacities/overflow (`carry.count > cap` is reported but not checked),
+   the remaining `tl.sort` users (`merge()`/`combine()`), and host syncs.
+
 2. **Get the full PD14 network (`test/networks/PD14/net.py`) actually running in
    main.py**, as the first real-scale proof the whole stack holds together
    rather than developing further pieces in a vacuum against small hand-built

@@ -85,15 +85,17 @@ def test_targets_fire_at_their_own_bucket_s_arrival_time_in_ascending_order(net)
     n_buckets = B.n_delay_buckets
     expected_nodes = [i for i in range(N) if i % 2 == 0]
     expected_bucket = [(i % n_buckets) for i in expected_nodes]
-    expected_times = [1.0 + bk * (1.0 / n_buckets) for bk in expected_bucket]
+    w = 1.0 / n_buckets
+    # emission 1.0 sits in bin 1.0/w; delivery time is the diagonal centre
+    expected_times = [(1.0 / w + bk + 1) * w for bk in expected_bucket]
 
     assert sorted(nodes) == expected_nodes, (
         "exactly the even (weight-1) targets should fire, regardless of "
         "block/bucket ordering"
     )
 
-    # Within each block, bucket order must be ascending: buckets are walked
-    # 0, 1, 2, ... in sequence inside one kernel call (see
+    # Within each block, delivery must be in ascending diagonal order (one
+    # emission bin here, so diagonal == bucket; see
     # per_link_delay_update_kernel.py's module docstring), so each block's
     # own firings must already come out in non-decreasing time order.
     for block, firings in by_block.items():

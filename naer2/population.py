@@ -349,19 +349,46 @@ class Population:
             n_blocks * self.group_size, device=device, dtype=torch.float32
         )
 
-        args = {k: v for k, v in args.items() if k in fn.arg_names}
-        fn[(n_blocks,)](
-            **args,
+        if delay_kernel:
+            args.update(
+                self._emission_bins(spike_time, n_spikes, period / self.n_delay_buckets)
+            )
+
+        args.update(
             GROUP_SIZE=self.group_size,
             SPIKE_BLOCK=self.spike_block,
             LINK_BLOCK=self.link_block,
             LOCAL_SPIKE_CAP=cap,
         )
+        args = {k: v for k, v in args.items() if k in fn.arg_names}
+        fn[(n_blocks,)](**args)
 
         self.set_fresh_output(
             BlockedSpikes(local_spike_node, local_spike_time, local_spike_count, cap)
         )
         self._merged = None
+
+    @staticmethod
+    def _emission_bins(spike_time: torch.Tensor, n_spikes: int, width: float) -> dict:
+        """Emission-bin boundaries for the per-link-delay kernel's
+        (emission bin, delay bucket) convolution: bins of `width` on an
+        absolute grid, so bin_start[m] : bin_start[m + 1] is bin
+        first_bin + m's range in the (emission-sorted) spike buffer."""
+        device = spike_time.device
+        if n_spikes == 0:
+            return dict(
+                bin_start_ptr=torch.zeros(1, device=device, dtype=torch.int32),
+                first_bin=0,
+                n_bins=0,
+            )
+        bins = torch.floor(spike_time[:n_spikes] / width).to(torch.int64)
+        first, last = torch.stack([bins[0], bins[-1]]).tolist()
+        edges = torch.arange(first, last + 2, device=device, dtype=torch.int64)
+        return dict(
+            bin_start_ptr=torch.searchsorted(bins, edges).to(torch.int32),
+            first_bin=first,
+            n_bins=last - first + 1,
+        )
 
     def _kernel(self):
         """Compile (once) and return the loaded @triton.jit update-kernel

@@ -6,20 +6,30 @@ value less than the target population's own timestep. Inter-timestep
 transmission delay (delay >= timestep) is not implemented -- Population.compile() raises
 before this template is ever reached in that case.
 
-Structurally this is `no_delay_update_kernel.py` with exactly one change:
-each connection's CSR walk is no longer one range per firing source, but
-`n_buckets` of them, each against its own statically-bucketed sub-range
-(Topology.blocked(..., delay=..., n_buckets=..., timestep=...) — see
-naer2/topology.py), each using that bucket's own representative arrival
-time (`emission_time + bucket_index * bucket_width`) for receive/send
-instead of the raw spike time. Buckets are unrolled as plain, sequential
-Python-generated AST blocks (bucket 0's whole range-load-and-link-loop,
-then bucket 1's, ...) at build time -- the same trick `_conn_dispatch`
-already uses to unroll one branch per connection -- not a Triton loop
-construct, since n_buckets is small and fixed per population. This is
-also why no new kernel arguments are needed: n_buckets and bucket_width
-are baked in as literals directly into the generated source, not passed
-at launch.
+Each connection's links are statically split by delay bucket (bucket j
+holds delays in [j*w, (j+1)*w), w = timestep / n_buckets; Topology.
+blocked(..., delay=..., n_buckets=..., timestep=...), see naer2/topology.py).
+The spike loop is a convolution over (emission bin, delay bucket): incoming
+spikes are already emission-sorted, so binning their emission times on an
+absolute grid of width w makes each bin a contiguous range of the buffer
+(bin_start_ptr, computed by the host). Pair (bin i, bucket j) arrives in
+[(i+j)*w, (i+j+2)*w), so walking anti-diagonals k = i+j in increasing order
+delivers in arrival order up to one bucket width -- two deliveries can only
+be out of order across adjacent diagonals, by less than w:
+
+    for k in diagonals:                       time = (k+1)*w  (monotone)
+      for j in range(n_buckets):              bucket j, emission bin k-j
+        for each spike s in bin k-j:
+          <conn dispatch>: walk s's links in bucket j's sub-range
+
+Every delivery on diagonal k uses the same time, (k+1)*w -- the emission-
+bin centre plus the bucket centre -- so time never decreases between
+deliveries (no negative dt for the model). Every (spike, bucket) pair is
+still walked exactly once, and the bucket is a runtime index, so the link
+body exists once per connection rather than once per bucket. See TODO.md.
+
+Everything per link -- tiling, densify, receive, send -- is exactly the
+no-delay template's.
 
 Edge forward/backward callbacks are disallowed on every incoming
 connection of a population using this kernel (checked in Population.
@@ -97,36 +107,52 @@ mask = offs < n_neurons
     # ------------------------------------------------------------------ spike loop (unchanged from the no-delay template)
 
     def _spike_loop(self, send_section: list) -> list[ast.stmt]:
-        # NOTE: the inner loop below is plain range(SPIKE_BLOCK), not
-        # tl.static_range -- see no_delay_update_kernel.py's identical
-        # _spike_loop and TODO.md for why: tl.static_range forces a full
-        # compile-time unroll, physically duplicating the whole per-spike
-        # body (every connection, every bucket, every dense-matrix-shaped
-        # op) SPIKE_BLOCK times -- measured directly as a large, avoidable
-        # compile-time and even runtime cost, worse here than in the
-        # no-delay kernel since it multiplies with n_buckets too.
+        """The (emission bin, delay bucket) convolution -- see the module
+        docstring. bin_start_ptr[m] : bin_start_ptr[m + 1] is emission bin
+        first_bin + m's range in the emission-sorted spike buffer. All
+        loops are real loops (runtime bounds), nothing is unrolled."""
         per_spike_body: list[ast.stmt] = [
-            *_STMTS("time = tl.load(spike_time_ptr + _s)"),
             *_STMTS("spike_src_j = tl.load(spike_src_ptr + _s)"),
             *_STMTS("spike_conn_j = tl.load(spike_conn_ptr + _s)"),
             *self._conn_dispatch(send_section),
         ]
 
-        inner_for = ast.For(
-            target=ast.Name(id="j", ctx=ast.Store()),
-            iter=_EXPR("range(SPIKE_BLOCK)"),
+        spike_for = ast.For(
+            target=ast.Name(id="_s", ctx=ast.Store()),
+            iter=_EXPR("range(_s_start, _s_end)"),
+            body=per_spike_body,
+            orelse=[],
+        )
+
+        bucket_for = ast.For(
+            target=ast.Name(id="_bk", ctx=ast.Store()),
+            iter=_EXPR(f"range({self.n_buckets})"),
             body=[
-                *_STMTS("_s = blk_start + j"),
-                ast.If(test=_EXPR("_s < n_spikes"), body=per_spike_body, orelse=[]),
+                *_STMTS("_m = _k - _bk"),
+                ast.If(
+                    test=_EXPR("(_m >= 0) & (_m < n_bins)"),
+                    body=[
+                        *_STMTS(
+                            "_s_start = tl.load(bin_start_ptr + _m)\n"
+                            "_s_end = tl.load(bin_start_ptr + _m + 1)"
+                        ),
+                        spike_for,
+                    ],
+                    orelse=[],
+                ),
             ],
             orelse=[],
         )
 
         return [
             ast.For(
-                target=ast.Name(id="blk_start", ctx=ast.Store()),
-                iter=_EXPR("range(0, n_spikes, SPIKE_BLOCK)"),
-                body=[inner_for],
+                target=ast.Name(id="_k", ctx=ast.Store()),
+                iter=_EXPR(f"range(n_bins + {self.n_buckets - 1})"),
+                body=[
+                    # diagonal k's centre: emission-bin centre + bucket centre
+                    *_STMTS(f"time = (first_bin + _k + 1) * {self.bucket_width!r}"),
+                    bucket_for,
+                ],
                 orelse=[],
             )
         ]
@@ -164,19 +190,14 @@ mask = offs < n_neurons
         edge_tensor_attrs: set,
         send_section: list,
     ) -> list[ast.stmt]:
-        """One spike_conn_j == conn_idx branch, now walking `self.n_buckets`
-        separate sub-ranges in sequence (bucket 0 first, then bucket 1, ...)
-        instead of one. Each bucket's sub-range comes from `conn{i}_src_
-        offsets_ptr`'s bucket axis (Topology.blocked(..., n_buckets=...)
-        flattens [n_blocks, n_buckets, N_src + 1] row-major, so bucket b's
-        row for program `pid` sits at flat offset `(pid * n_buckets + b) *
-        (N_src + 1)`). `_emit_time` preserves the spike's own recorded time
-        before `time` gets reassigned, per bucket, to that bucket's
-        representative arrival time -- `_emit_time + bucket_index *
-        bucket_width`, baked in as one literal float per bucket (no new
-        kernel argument needed). Everything else -- link tiling, densify,
-        receive, send -- is exactly the no-delay template's, just run once
-        per bucket instead of once per connection-branch.
+        """One spike_conn_j == conn_idx branch, walking only delay bucket
+        `_bk`'s sub-range (a runtime index set by the convolution loop, see
+        _spike_loop). The sub-range comes from `conn{i}_src_offsets_ptr`'s
+        bucket axis (Topology.blocked(..., n_buckets=...) flattens
+        [n_blocks, n_buckets, N_src + 1] row-major, so bucket b's row for
+        program `pid` sits at flat offset `(pid * n_buckets + b) * (N_src +
+        1)`). Everything else -- link tiling, densify, receive, send -- is
+        exactly the no-delay template's.
         """
         i = conn_idx
         topology = conn.fabric.topology
@@ -191,69 +212,64 @@ mask = offs < n_neurons
                 f"source_{attr} = tl.load(conn{i}_source_{attr}_ptr + spike_src_j)"
             )
 
-        stmts: list[ast.stmt] = [*source_loads, *_STMTS("_emit_time = time")]
-
-        for bk in range(self.n_buckets):
-            stmts += _STMTS(
-                f"_row = (pid.to(tl.int64) * {self.n_buckets} + {bk}) * {row_stride}\n"
+        stmts: list[ast.stmt] = [
+            *source_loads,
+            *_STMTS(
+                f"_row = (pid.to(tl.int64) * {self.n_buckets} + _bk) * {row_stride}\n"
                 f"link_start = tl.load(conn{i}_src_offsets_ptr + _row + spike_src_j)\n"
-                f"link_end = tl.load(conn{i}_src_offsets_ptr + _row + spike_src_j + 1)\n"
-                f"time = _emit_time + {bk * self.bucket_width}"
+                f"link_end = tl.load(conn{i}_src_offsets_ptr + _row + spike_src_j + 1)"
+            ),
+        ]
+
+        link_loads: list[ast.stmt] = _STMTS(
+            "_lk = link_tile + tl.arange(0, LINK_BLOCK)\n"
+            "_lk_valid = _lk < link_end\n"
+            f"_tgt = tl.load(conn{i}_target_indices_ptr + _lk, mask=_lk_valid, other=-1)"
+        )
+        for attr in edge_tensor_attrs:
+            link_loads += _STMTS(
+                f"lk_{attr} = tl.load(conn{i}_{attr}_ptr + _lk, mask=_lk_valid, other=0)"
             )
 
-            link_loads: list[ast.stmt] = _STMTS(
-                "_lk = link_tile + tl.arange(0, LINK_BLOCK)\n"
-                "_lk_valid = _lk < link_end\n"
-                f"_tgt = tl.load(conn{i}_target_indices_ptr + _lk, mask=_lk_valid, other=-1)"
+        link_stores: list[ast.stmt] = []
+        for attr in conn.fabric.dynamic_attrs:
+            link_stores += _STMTS(
+                f"tl.store(conn{i}_{attr}_ptr + _lk, lk_{attr}, mask=_lk_valid)"
             )
-            for attr in edge_tensor_attrs:
-                link_loads += _STMTS(
-                    f"lk_{attr} = tl.load(conn{i}_{attr}_ptr + _lk, mask=_lk_valid, other=0)"
-                )
 
-            link_stores: list[ast.stmt] = []
-            for attr in conn.fabric.dynamic_attrs:
-                link_stores += _STMTS(
-                    f"tl.store(conn{i}_{attr}_ptr + _lk, lk_{attr}, mask=_lk_valid)"
-                )
-
-            # Densify: tl.histogram (is_target) + scratch-buffer atomic
-            # scatter-add (edge_{attr}) instead of a one-hot compare-and-
-            # reduce -- see no_delay_update_kernel.py's _csr_branch
-            # docstring and TODO.md for why (measured ~35x/~25x compile
-            # time/instruction win at this template's real tile sizes,
-            # with no change needed downstream since both still end up as
-            # plain register-resident tensors). scratch_ptr is reused
-            # across every bucket, tile, and attr in this kernel call —
-            # each use is self-contained (zero, scatter, barrier, load).
-            densify: list[ast.stmt] = _STMTS(
-                "is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0) & mask"
+        # Densify: tl.histogram (is_target) + scratch-buffer atomic
+        # scatter-add (edge_{attr}) instead of a one-hot compare-and-reduce
+        # -- see no_delay_update_kernel.py's _csr_branch docstring and
+        # TODO.md for why. scratch_ptr is reused across every tile and attr
+        # in this kernel call -- each use is self-contained (zero, scatter,
+        # barrier, load).
+        densify: list[ast.stmt] = _STMTS(
+            "is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0) & mask"
+        )
+        for attr in edge_tensor_attrs:
+            densify += _STMTS(
+                f"tl.store(scratch_ptr + offs, 0.0, mask=mask)\n"
+                f"tl.debug_barrier()\n"
+                f"tl.atomic_add(scratch_ptr + pid * GROUP_SIZE + _tgt, lk_{attr}, mask=_lk_valid, scope='cta')\n"
+                f"tl.debug_barrier()\n"
+                f"edge_{attr} = tl.load(scratch_ptr + offs)"
             )
-            for attr in edge_tensor_attrs:
-                densify += _STMTS(
-                    f"tl.store(scratch_ptr + offs, 0.0, mask=mask)\n"
-                    f"tl.debug_barrier()\n"
-                    f"tl.atomic_add(scratch_ptr + pid * GROUP_SIZE + _tgt, lk_{attr}, mask=_lk_valid, scope='cta')\n"
-                    f"tl.debug_barrier()\n"
-                    f"edge_{attr} = tl.load(scratch_ptr + offs)"
-                )
 
-            target_send = self._make_target_section(send_section)
-            link_body = (
-                link_loads
-                + list(copy.deepcopy(edge_fwd_stmts))
-                + link_stores
-                + densify
-                + list(copy.deepcopy(recv_stmts))
-                + target_send
-            )
-            stmts.append(ast.For(
-                target=ast.Name(id="link_tile", ctx=ast.Store()),
-                iter=_EXPR("range(link_start, link_end, LINK_BLOCK)"),
-                body=link_body or [ast.Pass()],
-                orelse=[],
-            ))
-
+        target_send = self._make_target_section(send_section)
+        link_body = (
+            link_loads
+            + list(copy.deepcopy(edge_fwd_stmts))
+            + link_stores
+            + densify
+            + list(copy.deepcopy(recv_stmts))
+            + target_send
+        )
+        stmts.append(ast.For(
+            target=ast.Name(id="link_tile", ctx=ast.Store()),
+            iter=_EXPR("range(link_start, link_end, LINK_BLOCK)"),
+            body=link_body or [ast.Pass()],
+            orelse=[],
+        ))
         return stmts
 
     # ------------------------------------------------------------------ helpers (unchanged from the no-delay template)
@@ -271,11 +287,16 @@ mask = offs < n_neurons
             args.append(ast.arg(arg=f"{attr}_ptr"))
         args.append(ast.arg(arg="n_neurons"))
 
+        # spike_time_ptr isn't read: the convolution only needs the
+        # emission-bin boundaries (bin_start_ptr/first_bin/n_bins, computed
+        # by the host from the sorted times), and delivery time comes from
+        # the diagonal, not the spike.
         args += [
-            ast.arg(arg="spike_time_ptr"),
             ast.arg(arg="spike_src_ptr"),
             ast.arg(arg="spike_conn_ptr"),
-            ast.arg(arg="n_spikes"),
+            ast.arg(arg="bin_start_ptr"),
+            ast.arg(arg="first_bin"),
+            ast.arg(arg="n_bins"),
         ]
 
         for i, (conn, _, _, source_dynamic_attrs, edge_tensor_attrs) in enumerate(
@@ -296,13 +317,12 @@ mask = offs < n_neurons
             ast.arg(arg="local_spike_time_ptr"),
             ast.arg(arg="local_spike_count_ptr"),
             # per-program [GROUP_SIZE] scratch, reused by every densify step
-            # (every bucket/tile/attr) in this kernel call -- see _csr_branch.
+            # (every tile/attr) in this kernel call -- see _csr_branch.
             ast.arg(arg="scratch_ptr"),
         ]
 
         args += [
             ast.arg(arg="GROUP_SIZE", annotation=_EXPR("tl.constexpr")),
-            ast.arg(arg="SPIKE_BLOCK", annotation=_EXPR("tl.constexpr")),
             ast.arg(arg="LINK_BLOCK", annotation=_EXPR("tl.constexpr")),
             ast.arg(arg="LOCAL_SPIKE_CAP", annotation=_EXPR("tl.constexpr")),
         ]
