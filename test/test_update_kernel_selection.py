@@ -39,15 +39,38 @@ def test_a_real_per_link_delay_tensor_switches_the_whole_population():
     assert B.uses_per_link_delay_kernel
 
 
-def test_delay_exceeding_the_population_s_own_period_raises_not_implemented():
+def test_delay_beyond_the_population_s_own_period_compiles():
     """counter is autonomous with no explicit timestep -> period 0.0 ("every
-    sub-step") -- any nonzero delay is an inter-timestep transmission delay
-    by definition, which isn't implemented (only intra-timestep is)."""
+    sub-step") -- any nonzero delay is an inter-timestep transmission
+    delay, which the per-link-delay kernel handles: n_buckets just grows to
+    cover the largest delay."""
+    _, pops = build()
+    B = pops["B"]
+    B.delay_resolution = 0.1
+    B.incoming[0].fabric.delay = torch.full(B.incoming[0].shape, 2.55)
+
+    module = B.compile()
+    assert module.body[0].name == "per_link_delay_update_kernel"
+    assert B._delay_layout() == (0.1, 26)
+
+
+def test_delay_resolution_defaults_to_the_finest_network_period_before_any_step():
+    _, pops = build()
+    B = pops["B"]
+    B.timestep = 0.5
+    B.incoming[0].fabric.delay = torch.rand(B.incoming[0].shape)
+
+    assert B._delay_layout()[0] == 0.5
+
+
+def test_no_resolution_available_raises_clearly():
+    """Every population autonomous, nothing with a positive period, no
+    step() yet: there's no sub-step to adopt."""
     _, pops = build()
     B = pops["B"]
     B.incoming[0].fabric.delay = torch.rand(B.incoming[0].shape)
 
-    with pytest.raises(NotImplementedError, match="inter-timestep"):
+    with pytest.raises(ValueError, match="delay_resolution"):
         B.compile()
 
 
@@ -91,8 +114,7 @@ def test_static_edge_with_a_tensor_override_is_fine_in_delay_mode():
     tensor OVERRIDE set from outside (conn.fabric.weight = tensor(...),
     never written back by any hook) has no dynamic_attrs at all -- the
     check above must not flag it, since nothing here was ever claimed to
-    change. Still hits the stub's NotImplementedError (the kernel itself
-    isn't implemented yet), not the ValueError."""
+    change -- it compiles to the per-link-delay kernel."""
     from test.edges import static_synapse
     from test.nodes import counter
     from test.patterns import all_to_all
@@ -104,9 +126,9 @@ def test_static_edge_with_a_tensor_override_is_fine_in_delay_mode():
     conn = A >> static_synapse(0.0) @ all_to_all >> B
     conn.fabric.weight = torch.rand(conn.shape)
     conn.fabric.delay = torch.rand(conn.shape)
+    B.delay_resolution = 0.25
 
-    with pytest.raises(NotImplementedError):
-        B.compile()
+    assert B.compile().body[0].name == "per_link_delay_update_kernel"
 
 
 def test_one_delayed_incoming_connection_switches_the_whole_population():
@@ -129,5 +151,5 @@ def test_one_delayed_incoming_connection_switches_the_whole_population():
     B.incoming[1].fabric.delay = torch.rand(B.incoming[1].shape)
 
     assert B.uses_per_link_delay_kernel
-    with pytest.raises(NotImplementedError):
-        B.compile()
+    B.delay_resolution = 0.25
+    assert B.compile().body[0].name == "per_link_delay_update_kernel"

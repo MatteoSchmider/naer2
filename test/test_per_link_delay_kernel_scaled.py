@@ -5,9 +5,10 @@ checked explicitly), but scaled to N=4000 targets so the update kernel
 genuinely launches multiple workgroups (n_blocks = N / group_size = 125,
 with the default group_size=32) instead of the single-block N=4 case.
 
-Every tile-size knob (group_size, n_delay_buckets, spike_block) is left at
-its real default -- this used to need group_size=32/n_delay_buckets=4
-specifically to dodge a since-fixed compile-time blowup (see TODO.md: the
+Every tile-size knob (group_size, spike_block) is left at its real default
+(delay_resolution is set to give 8 buckets) -- this used to need
+group_size=32 and few buckets specifically to dodge a since-fixed
+compile-time blowup (see TODO.md: the
 densify step's one-hot compare-and-reduce, and tl.static_range's forced
 unroll of the per-spike loop, both replaced). n_blocks itself was always a
 pure runtime launch parameter with no compile-time cost, which is why N
@@ -27,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 N = 4000
+N_BUCKETS = 8
 
 
 @pytest.fixture
@@ -38,13 +40,14 @@ def net():
     B = delay_probe() * N
     B.potential = torch.zeros(N)
     B.timestep = 1.0
-    # group_size/n_delay_buckets/spike_block all stay at their real defaults
-    # -> n_blocks = 125, multiple workgroups
+    B.delay_resolution = 1.0 / N_BUCKETS
+    # group_size/spike_block stay at their real defaults -> n_blocks = 125,
+    # multiple workgroups
 
     conn = A >> all_to_all >> B
     idx = torch.arange(N)
     conn.weight = (idx % 2 == 0).float()  # even targets get weight 1, odd weight 0
-    conn.delay = (idx % B.n_delay_buckets).float() * (1.0 / B.n_delay_buckets)
+    conn.delay = (idx % N_BUCKETS).float() * (1.0 / N_BUCKETS)
 
     return A.network, A, B, conn
 
@@ -82,7 +85,7 @@ def test_targets_fire_at_their_own_bucket_s_arrival_time_in_ascending_order(net)
         times += block_times
         by_block[b] = list(zip(block_nodes, block_times))
 
-    n_buckets = B.n_delay_buckets
+    n_buckets = N_BUCKETS
     expected_nodes = [i for i in range(N) if i % 2 == 0]
     expected_bucket = [(i % n_buckets) for i in expected_nodes]
     w = 1.0 / n_buckets

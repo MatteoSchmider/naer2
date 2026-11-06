@@ -55,7 +55,8 @@ binary-search rank. Sizes are runtime arguments, so one compiled kernel
 serves every population size. Output is sorted by time only; ties have no
 defined order.
 
-merge()/combine() still use the original trick to turn a sort into a single
+combine() merges two sorted streams the same way (rank-based, no sort).
+merge() still uses the original trick to turn a sort into a single
 `tl.sort` call (which only orders one tensor of keys, no attached payload):
 pack every field being carried into one sortable integer key, sort that,
 unpack after.
@@ -451,44 +452,32 @@ def _combine_kernel(
     a_time_ptr, a_node_ptr, a_conn_ptr, a_count_ptr,
     b_time_ptr, b_node_ptr, b_conn_ptr, b_count_ptr,
     out_time_ptr, out_node_ptr, out_conn_ptr, out_count_ptr,
-    CAP_A: tl.constexpr, CAP_B: tl.constexpr, TOTAL_CAP: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    idx = tl.arange(0, TOTAL_CAP)
-    is_a = idx < CAP_A
-    a_count = tl.load(a_count_ptr)
-    b_count = tl.load(b_count_ptr)
-
-    a_valid = is_a & (idx < a_count)
-    time_a = tl.load(a_time_ptr + idx, mask=is_a, other=0.0)
-    node_a = tl.load(a_node_ptr + idx, mask=is_a, other=0)
-    conn_a = tl.load(a_conn_ptr + idx, mask=is_a, other=0)
-
-    b_idx = idx - CAP_A
-    is_b = (idx >= CAP_A) & (idx < CAP_A + CAP_B)
-    b_valid = is_b & (b_idx < b_count)
-    time_b = tl.load(b_time_ptr + b_idx, mask=is_b, other=0.0)
-    node_b = tl.load(b_node_ptr + b_idx, mask=is_b, other=0)
-    conn_b = tl.load(b_conn_ptr + b_idx, mask=is_b, other=0)
-
-    valid = tl.where(is_a, a_valid, b_valid)
-    time = tl.where(is_a, time_a, time_b)
-    node = tl.where(is_a, node_a, node_b)
-    conn = tl.where(is_a, conn_a, conn_b)
-    time = tl.where(valid, time, _INF)
-
-    low = (conn.to(tl.uint32) << 24) | (node.to(tl.uint32) & 0xFFFFFF)
-    key = (_to_ordered_u32(time).to(tl.uint64) << 32) | low.to(tl.uint64)
-    key = tl.sort(key)
-    sorted_node = (key & 0xFFFFFF).to(tl.int32)
-    sorted_conn = ((key >> 24) & 0xFF).to(tl.int32)
-    sorted_time = _from_ordered_u32((key >> 32).to(tl.uint32))
-
-    total = tl.sum(valid.to(tl.int32), axis=0)
-    out_mask = idx < total
-    tl.store(out_time_ptr + idx, sorted_time, mask=out_mask)
-    tl.store(out_node_ptr + idx, sorted_node, mask=out_mask)
-    tl.store(out_conn_ptr + idx, sorted_conn, mask=out_mask)
-    tl.store(out_count_ptr, total)
+    """Merge two time-sorted streams by binary-search rank, same scheme as
+    _compaction_kernel's merge step (ties: a first)."""
+    lanes = tl.arange(0, BLOCK)
+    n_a = tl.load(a_count_ptr)
+    n_b = tl.load(b_count_ptr)
+    iters_a = _bit_length(n_a)
+    iters_b = _bit_length(n_b)
+    for start in range(0, n_a, BLOCK):
+        i = start + lanes
+        m = i < n_a
+        time = tl.load(a_time_ptr + i, mask=m, other=_INF)
+        pos = i + _rank(b_time_ptr, n_b, time, iters_b, INCLUSIVE=False)
+        tl.store(out_time_ptr + pos, time, mask=m)
+        tl.store(out_node_ptr + pos, tl.load(a_node_ptr + i, mask=m), mask=m)
+        tl.store(out_conn_ptr + pos, tl.load(a_conn_ptr + i, mask=m), mask=m)
+    for start in range(0, n_b, BLOCK):
+        i = start + lanes
+        m = i < n_b
+        time = tl.load(b_time_ptr + i, mask=m, other=_INF)
+        pos = i + _rank(a_time_ptr, n_a, time, iters_a, INCLUSIVE=True)
+        tl.store(out_time_ptr + pos, time, mask=m)
+        tl.store(out_node_ptr + pos, tl.load(b_node_ptr + i, mask=m), mask=m)
+        tl.store(out_conn_ptr + pos, tl.load(b_conn_ptr + i, mask=m), mask=m)
+    tl.store(out_count_ptr, n_a + n_b)
 
 
 def combine(
@@ -505,37 +494,28 @@ def combine(
     merge_incoming() result just because a later round's overwrites it --
     see Network.step() and TODO.md.
 
-    CAP_A/CAP_B are each input's LIVE count, not its allocated size -- an
-    earlier version used the allocated size (matching merge()'s own
-    per_src_cap convention), which seemed like the more obvious choice
-    but is wrong here specifically: merge()/combine() always allocate a
-    full padded buffer regardless of how much is actually due, so sizing
-    off that padding instead of the live count made capacity compound
+    The output is sized from each input's LIVE count, not its allocated
+    size: merge() allocates a full padded buffer regardless of how much is
+    actually due, and sizing off that padding made capacity compound
     roughly geometrically across repeated scheduling rounds (combine(2048,
-    2048) -> 4096 -> 8192 -> ... even when almost nothing was actually
-    pending) -- found by it making compact()/merge()'s single-block
-    tl.sort compile time blow up (minutes, not seconds) at a population
-    size of just 1,000-2,000 once a population had to wait across a
-    couple of sub-steps. Reading the live count costs one extra .item()
-    sync per side (same latency-floor caveat merge()'s own host wrapper
-    already carries, see its docstring) but keeps the buffer honest.
+    2048) -> 4096 -> 8192 -> ...). Reading the live counts costs one
+    .item() sync per side (same latency-floor caveat as merge()'s host
+    wrapper). Ties keep `a` first.
     """
     a_time, a_node, a_conn, a_count = a
     b_time, b_node, b_conn, b_count = b
-    cap_a = max(int(a_count[0].item()), 1)
-    cap_b = max(int(b_count[0].item()), 1)
+    total = int(a_count[0].item()) + int(b_count[0].item())
     device = a_time.device
-    total_cap = _next_pow2(max(cap_a + cap_b, 1))
 
-    out_time = torch.zeros(total_cap, device=device, dtype=torch.float32)
-    out_node = torch.zeros(total_cap, device=device, dtype=torch.int32)
-    out_conn = torch.zeros(total_cap, device=device, dtype=torch.int32)
+    out_time = torch.zeros(max(total, 1), device=device, dtype=torch.float32)
+    out_node = torch.zeros(max(total, 1), device=device, dtype=torch.int32)
+    out_conn = torch.zeros(max(total, 1), device=device, dtype=torch.int32)
     out_count = torch.zeros(1, device=device, dtype=torch.int32)
 
     _combine_kernel[(1,)](
         a_time, a_node, a_conn, a_count,
         b_time, b_node, b_conn, b_count,
         out_time, out_node, out_conn, out_count,
-        CAP_A=cap_a, CAP_B=cap_b, TOTAL_CAP=total_cap,
+        BLOCK=_COMPACT_BLOCK,
     )
     return out_time, out_node, out_conn, out_count

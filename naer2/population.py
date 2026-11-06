@@ -28,7 +28,7 @@ class Population:
         carry_cap: int = 64,
         per_src_cap: int = 64,
         timestep: float | None = None,
-        n_delay_buckets: int = 8,
+        delay_resolution: float | None = None,
     ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
         self.shape: Region = Region(shape)
@@ -65,15 +65,13 @@ class Population:
         # Network._validate_schedulable and TODO.md.
         self.timestep = timestep
 
-        # Default bucket count for the per-link-delay kernel's intra-timestep
-        # transmission delay
-        # (naer2/transpiler/templates/per_link_delay_update_kernel.py) --
-        # only consulted when some incoming connection actually carries a
-        # real per-link delay tensor (uses_per_link_delay_kernel). A
-        # placeholder default (8); an event-driven population's own author
-        # knows their dynamics' delay-precision tolerance better than a
-        # network-wide default could, so this is overridable per population.
-        self.n_delay_buckets = n_delay_buckets
+        # Width w of the per-link-delay kernel's delay buckets and emission
+        # bins (naer2/transpiler/templates/per_link_delay_update_kernel.py),
+        # only used when some incoming connection carries a per-link delay
+        # tensor. None (default) adopts the network's sub-step; fixed once
+        # this population first compiles, together with the bucket count and
+        # the per-bucket topology splits (see _delay_layout).
+        self.delay_resolution = delay_resolution
 
         # Check that instance's type was decorated and registered
         if instance.__class__ not in node_types.keys():
@@ -101,9 +99,15 @@ class Population:
         self._carry: CarryBuffer | None = None
         self._fresh: BlockedSpikes | None = None
         self._due: CompactedSpikes | None = None
-        self._merged: tuple | None = (
-            None  # this round's merge_incoming() result, set by Network.step()
-        )
+        # Target-owned input: everything merged in (scheduling) plus, for the
+        # per-link-delay kernel, the spikes whose delay buckets aren't all
+        # delivered yet (inter-timestep transmission delay) -- emission-
+        # sorted, consumed and trimmed by _execute_update_kernel.
+        self._merged: tuple | None = None
+        # Last delay diagonal already delivered (per-link-delay kernel only).
+        self._k_done: int | None = None
+        self._delay_layout_cache: tuple[float, int] | None = None
+        self._blocked_cache: list | None = None
 
         # Real kernel execution (see _execute_update_kernel): compiled lazily
         # on first real launch, then cached -- a population's compiled source
@@ -158,19 +162,36 @@ class Population:
             )
         return min_d
 
-    def _effective_period(self) -> float:
-        """This population's own effective re-check period -- its explicit
-        `timestep` if set, otherwise the network-wide computation (see
-        Network._compute_effective_periods, which this just looks itself
-        up in). Used by compile()/_execute_update_kernel to know the width
-        the per-link-delay kernel's buckets need to span; computing the
-        whole network's periods here is a bit more than strictly needed
-        for a single population, but it's cheap (one fixed-point pass over
-        populations, not data) and keeps this consistent with how
-        Network.step() derives the same number."""
-        if self.timestep is not None:
-            return self.timestep
-        return self.network._compute_effective_periods()[self]
+    def _delay_layout(self) -> tuple[float, int]:
+        """(w, n_buckets) for the per-link-delay kernel, computed once and
+        then fixed: w is delay_resolution if set, else the network's
+        sub-step (the last step()'s, or -- when compiling before any
+        step() -- the finest positive effective period in the network);
+        n_buckets covers the largest incoming delay."""
+        if self._delay_layout_cache is None:
+            w = self.delay_resolution or self.network.sub_dt
+            if w is None:
+                positive = [
+                    p
+                    for p in self.network._compute_effective_periods().values()
+                    if 0.0 < p < math.inf
+                ]
+                if not positive:
+                    raise ValueError(
+                        f"{type(self.instance).__name__} population needs a delay "
+                        f"resolution before any network.step() has run: set "
+                        f"population.delay_resolution explicitly."
+                    )
+                w = min(positive)
+            max_bucket = 0
+            for conn in self.incoming:
+                d = getattr(conn.fabric, "delay", None)
+                if isinstance(d, torch.Tensor):
+                    max_bucket = max(max_bucket, int((d / w).floor().max()))
+                elif d is not None:
+                    max_bucket = max(max_bucket, math.floor(float(d) / w))
+            self._delay_layout_cache = (w, max_bucket + 1)
+        return self._delay_layout_cache
 
     def _is_due(self, t: float, period: float) -> bool:
         """Whether this population's update kernel needs to run at time t,
@@ -290,44 +311,18 @@ class Population:
         args["n_spikes"] = n_spikes
 
         delay_kernel = self.uses_per_link_delay_kernel
-        period = self._effective_period() if delay_kernel else None
+        if self._blocked_cache is None:
+            self._blocked_cache = self._blocked_topologies(device)
 
         for i, conn in enumerate(self.incoming):
             source_dynamic_attrs, edge_tensor_attrs = self._compiled_incoming_meta[i]
             conn._source._ensure_on_device(device)
-            if delay_kernel:
-                # Every connection on a per-link-delay population goes
-                # through the same bucketed layout, even one with no real
-                # delay of its own (scalar or unset) -- fall back to a
-                # uniform delay tensor so every connection lands in one
-                # consistent bucket (its own, or bucket 0 if unset), rather
-                # than needing the template to handle a per-connection mix
-                # of bucketed/unbucketed offset shapes.
-                d = getattr(conn.fabric, "delay", None)
-                if isinstance(d, torch.Tensor):
-                    delay_tensor = d
-                else:
-                    delay_tensor = torch.full(
-                        (len(conn.fabric.topology),), float(d) if d is not None else 0.0
-                    )
-                bt = conn.fabric.topology.blocked(
-                    self.group_size,
-                    n_neurons,
-                    delay=delay_tensor,
-                    n_buckets=self.n_delay_buckets,
-                    timestep=period,
-                )
-            else:
-                bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
-            args[f"conn{i}_src_offsets_ptr"] = bt.offsets.flatten().to(
-                device=device, dtype=torch.int64
-            )
-            args[f"conn{i}_target_indices_ptr"] = bt.target_local.to(
-                device=device, dtype=torch.int32
-            )
+            offsets, target_local, bucket = self._blocked_cache[i]
+            args[f"conn{i}_src_offsets_ptr"] = offsets
+            args[f"conn{i}_target_indices_ptr"] = target_local
+            args[f"conn{i}_bucket_ptr"] = bucket
             for attr in edge_tensor_attrs:
-                canonical = getattr(conn.fabric, attr)
-                args[f"conn{i}_{attr}_ptr"] = bt.to_blocked(canonical).to(device=device)
+                args[f"conn{i}_{attr}_ptr"] = conn.fabric.device_state[attr]
             for attr in source_dynamic_attrs:
                 args[f"conn{i}_source_{attr}_ptr"] = getattr(conn._source, attr)
 
@@ -350,9 +345,20 @@ class Population:
         )
 
         if delay_kernel:
-            args.update(
-                self._emission_bins(spike_time, n_spikes, period / self.n_delay_buckets)
+            w, n_buckets = self._delay_layout()
+            # last diagonal whose delivery time (k + 1) * w is <= t
+            k_t = math.floor(t / w + 1e-9) - 1
+            bins_args, n_delivered = self._emission_bins(
+                spike_time, n_spikes, w, k_t - n_buckets + 1
             )
+            args.update(bins_args)
+            k_lo = k_t + 1 if n_spikes == 0 else bins_args["first_bin"]
+            if self._k_done is not None:
+                # spikes owing a diagonal <= k_done arrived late: those
+                # deliveries are skipped, by design
+                k_lo = max(k_lo, self._k_done + 1)
+            args["k_lo"] = k_lo
+            args["k_hi"] = k_t
 
         args.update(
             GROUP_SIZE=self.group_size,
@@ -366,29 +372,87 @@ class Population:
         self.set_fresh_output(
             BlockedSpikes(local_spike_node, local_spike_time, local_spike_count, cap)
         )
-        self._merged = None
+        if delay_kernel:
+            # inter-timestep transmission delay: spikes with buckets still
+            # to deliver stay as this population's input (a suffix, since
+            # the buffer is emission-sorted); the scheduling step combines
+            # new input onto it next round
+            self._k_done = k_t
+            self._merged = (
+                (
+                    spike_time[n_delivered:n_spikes],
+                    spike_src[n_delivered:n_spikes],
+                    spike_conn[n_delivered:n_spikes],
+                    torch.tensor([n_spikes - n_delivered], device=device, dtype=torch.int32),
+                )
+                if n_delivered < n_spikes
+                else None
+            )
+        else:
+            self._merged = None
+
+    def _blocked_topologies(self, device) -> list:
+        """Per incoming connection: (offsets, target_local, bucket) on
+        `device` (bucket None without delay buckets), and the connection's
+        kernel-referenced per-link tensors moved onto the device in the same
+        blocked order for good (Fabric.bind_device). Computed once:
+        topology, delays and the delay layout are all fixed after the first
+        launch; nothing of the layout is kept host-side."""
+        n_neurons = len(self.shape)
+        result = []
+        for i, conn in enumerate(self.incoming):
+            if self.uses_per_link_delay_kernel:
+                w, n_buckets = self._delay_layout()
+                # A connection without its own per-link delay tensor still
+                # goes through the bucketed layout (uniform delay, 0 if
+                # unset) so every connection has the same offset shape.
+                d = getattr(conn.fabric, "delay", None)
+                if not isinstance(d, torch.Tensor):
+                    d = torch.full(
+                        (len(conn.fabric.topology),), float(d) if d is not None else 0.0
+                    )
+                bt = conn.fabric.topology.blocked(
+                    self.group_size, n_neurons,
+                    delay=d, n_buckets=n_buckets, bucket_width=w,
+                )
+            else:
+                bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
+            _, edge_tensor_attrs = self._compiled_incoming_meta[i]
+            conn.fabric.bind_device(bt.perm, edge_tensor_attrs, device)
+            result.append((
+                bt.offsets.flatten().to(device=device, dtype=torch.int32),
+                bt.target_local.to(device=device),
+                bt.bucket.to(device=device) if bt.bucket is not None else None,
+            ))
+            del bt
+        return result
 
     @staticmethod
-    def _emission_bins(spike_time: torch.Tensor, n_spikes: int, width: float) -> dict:
+    def _emission_bins(
+        spike_time: torch.Tensor, n_spikes: int, width: float, last_done_bin: int
+    ) -> tuple[dict, int]:
         """Emission-bin boundaries for the per-link-delay kernel's
-        (emission bin, delay bucket) convolution: bins of `width` on an
+        (emission bin, delay bucket) convolution -- bins of `width` on an
         absolute grid, so bin_start[m] : bin_start[m + 1] is bin
-        first_bin + m's range in the (emission-sorted) spike buffer."""
+        first_bin + m's range in the (emission-sorted) spike buffer -- plus
+        how many leading spikes are in bins <= last_done_bin (every one of
+        their buckets delivered by the end of this call). One host sync."""
         device = spike_time.device
         if n_spikes == 0:
             return dict(
                 bin_start_ptr=torch.zeros(1, device=device, dtype=torch.int32),
                 first_bin=0,
                 n_bins=0,
-            )
+            ), 0
         bins = torch.floor(spike_time[:n_spikes] / width).to(torch.int64)
-        first, last = torch.stack([bins[0], bins[-1]]).tolist()
+        n_done = (bins <= last_done_bin).sum()
+        first, last, n_delivered = torch.stack([bins[0], bins[-1], n_done]).tolist()
         edges = torch.arange(first, last + 2, device=device, dtype=torch.int64)
         return dict(
             bin_start_ptr=torch.searchsorted(bins, edges).to(torch.int32),
             first_bin=first,
             n_bins=last - first + 1,
-        )
+        ), n_delivered
 
     def _kernel(self):
         """Compile (once) and return the loaded @triton.jit update-kernel
@@ -557,16 +621,6 @@ class Population:
                         f"assignment and set any needed per-link tensor directly instead, "
                         f"e.g. conn.fabric.weight = tensor(...)."
                     )
-            period = self._effective_period()
-            for conn in self.incoming:
-                d = getattr(conn.fabric, "delay", None)
-                if isinstance(d, torch.Tensor) and float(d.max().item()) >= period:
-                    raise NotImplementedError(
-                        f"connection with max delay {float(d.max().item())} >= "
-                        f"{type(self.instance).__name__}'s own timestep/period ({period}) "
-                        f"-- inter-timestep transmission delay is not implemented yet, only "
-                        f"intra-timestep transmission delay. See TODO.md."
-                    )
 
         # one transpiled receive + edge-forward section per incoming connection
         incoming_with_hooks = []
@@ -642,7 +696,7 @@ class Population:
                 if (
                     attr not in conn.fabric.dynamic_attrs
                     and attr not in conn.fabric.static_attrs
-                    and attr not in conn.fabric.state
+                    and attr not in conn.fabric.tensor_attrs
                 ):
                     raise ValueError(
                         f"edge.{attr}/self.{attr} referenced but '{attr}' does not exist on {conn.fabric!r}"
@@ -653,7 +707,7 @@ class Population:
             edge_tensor_attrs = {
                 a
                 for a in referenced_edge_attrs
-                if a in conn.fabric.dynamic_attrs or a in conn.fabric.state
+                if a in conn.fabric.tensor_attrs
             }
             edge_constant_attrs = {
                 a: conn.fabric.static_attrs[a]
@@ -723,9 +777,9 @@ class Population:
                 PerLinkDelayUpdateKernelTemplate,
             )
 
-            bucket_width = period / self.n_delay_buckets
+            w, n_buckets = self._delay_layout()
             return PerLinkDelayUpdateKernelTemplate(
-                ctx, incoming_with_hooks, self.n_delay_buckets, bucket_width
+                ctx, incoming_with_hooks, n_buckets, w
             ).build(update_section, send_section)
 
         return NoDelayUpdateKernelTemplate(ctx, incoming_with_hooks).build(

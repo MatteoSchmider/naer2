@@ -8,8 +8,8 @@ One source neuron (A, a `counter` primed to fire exactly once, at exactly
 t=1.0, with no extra delay encoded in its own send() thresholds -- see
 test_gpu_hardware.py's identical trick) connects all-to-all to four target
 neurons (B, `delay_probe`): weight alternates [1, 0, 1, 0], delay places
-each target in a different one of B's 4 buckets (bucket_width = B.timestep
-/ B.n_delay_buckets = 1.0 / 4 = 0.25):
+each target in a different one of B's 4 buckets (bucket width =
+B.delay_resolution = 0.25):
 
     target  weight  delay  bucket  delivery time = diagonal centre (4 + bucket + 1) * 0.25
       0        1     0.00     0      1.25  -> fires (weight 1 crosses threshold 0.5)
@@ -51,7 +51,7 @@ def net():
     B = delay_probe() * 4
     B.potential = torch.zeros(4)
     B.timestep = 1.0
-    B.n_delay_buckets = 4
+    B.delay_resolution = 0.25
 
     conn = A >> all_to_all >> B
     conn.weight = torch.tensor([1.0, 0.0, 1.0, 0.0])
@@ -96,7 +96,7 @@ def test_deliveries_follow_arrival_order_not_emission_order():
     B = delay_probe() * 2
     B.potential = torch.zeros(2)
     B.timestep = 1.0
-    B.n_delay_buckets = 4
+    B.delay_resolution = 0.25
 
     conn = A >> all_to_all >> B
     # links in source-major order: A0->B0, A0->B1, A1->B0, A1->B1
@@ -115,6 +115,39 @@ def test_deliveries_follow_arrival_order_not_emission_order():
     count = int(B._fresh.count[0].item())
     fired = list(zip(B._fresh.node[:count].tolist(), B._fresh.time[:count].tolist()))
     assert fired == [(1, 1.75), (0, 2.0)]
+
+
+def test_inter_timestep_delays_deliver_once_each_in_their_own_later_call():
+    """Delays beyond B's own period (1.0): A fires once at t=1.0 (emission
+    bin 4, w=0.25); delays 0.0 / 1.25 / 2.5 are buckets 0 / 5 / 10 ->
+    diagonals 4 / 9 / 14 -> delivery times 1.25 / 2.5 / 3.75. B runs at
+    t=2, 3, 4, ...: each call may only deliver diagonals with time <= its t,
+    so each target fires in a different call, exactly once, and the spike
+    leaves B's pending input once its last bucket is delivered."""
+    torch.cuda.set_device(0)
+    A = counter() * 1
+    A.potential = torch.tensor([15.0])
+    B = delay_probe() * 3
+    B.potential = torch.zeros(3)
+    B.timestep = 1.0
+    B.delay_resolution = 0.25
+
+    conn = A >> all_to_all >> B
+    conn.weight = torch.ones(3)
+    conn.delay = torch.tensor([0.0, 1.25, 2.5])
+    network = A.network
+
+    network.step(1.0)  # t=1.0: A fires
+    fired_per_call = []
+    for _ in range(5):  # B runs at t=2..6
+        network.step(1.0)
+        count = int(B._fresh.count[0].item())
+        fired_per_call.append(
+            list(zip(B._fresh.node[:count].tolist(), B._fresh.time[:count].tolist()))
+        )
+
+    assert fired_per_call == [[(0, 1.25)], [(1, 2.5)], [(2, 3.75)], [], []]
+    assert B._merged is None
 
 
 def test_weight_zero_targets_never_cross_threshold(net):

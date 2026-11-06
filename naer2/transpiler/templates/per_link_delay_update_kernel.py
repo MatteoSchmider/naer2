@@ -1,14 +1,14 @@
 """
 Template for the merged update-receive-send Triton kernel -- the PER-LINK-
-DELAY variant, intra-timestep transmission delay only (see TODO.md): a
-connection whose links carry a real per-link delay tensor, with every delay
-value less than the target population's own timestep. Inter-timestep
-transmission delay (delay >= timestep) is not implemented -- Population.compile() raises
-before this template is ever reached in that case.
+DELAY variant (see TODO.md): used when some incoming connection's links
+carry a real per-link delay tensor. Handles both intra- and inter-timestep
+transmission delay.
 
-Each connection's links are statically split by delay bucket (bucket j
-holds delays in [j*w, (j+1)*w), w = timestep / n_buckets; Topology.
-blocked(..., delay=..., n_buckets=..., timestep=...), see naer2/topology.py).
+Each link statically belongs to a delay bucket (bucket j holds delays in
+[j*w, (j+1)*w), w = Population.delay_resolution or the network sub-step,
+n_buckets covering the largest delay): the plain per-(block, source) rows,
+sorted by bucket, plus a per-link bucket id (Topology.blocked(...,
+delay=..., n_buckets=..., bucket_width=...), see naer2/topology.py).
 The spike loop is a convolution over (emission bin, delay bucket): incoming
 spikes are already emission-sorted, so binning their emission times on an
 absolute grid of width w makes each bin a contiguous range of the buffer
@@ -17,10 +17,17 @@ absolute grid of width w makes each bin a contiguous range of the buffer
 delivers in arrival order up to one bucket width -- two deliveries can only
 be out of order across adjacent diagonals, by less than w:
 
-    for k in diagonals:                       time = (k+1)*w  (monotone)
+    for k in k_lo..k_hi:                      time = (k+1)*w  (monotone)
       for j in range(n_buckets):              bucket j, emission bin k-j
         for each spike s in bin k-j:
-          <conn dispatch>: walk s's links in bucket j's sub-range
+          <conn dispatch>: walk s's row, links in bucket j only
+
+A call only walks the diagonals whose delivery time (k+1)*w is <= its own t
+(k_hi), starting after the last diagonal it already delivered (k_lo). Spikes
+with buckets left over stay in the population's input for the next call
+(inter-timestep transmission delay, see Population._execute_update_kernel);
+a spike arriving after one of its diagonals was already walked just skips
+that delivery.
 
 Every delivery on diagonal k uses the same time, (k+1)*w -- the emission-
 bin centre plus the bucket centre -- so time never decreases between
@@ -108,7 +115,8 @@ mask = offs < n_neurons
 
     def _spike_loop(self, send_section: list) -> list[ast.stmt]:
         """The (emission bin, delay bucket) convolution -- see the module
-        docstring. bin_start_ptr[m] : bin_start_ptr[m + 1] is emission bin
+        docstring -- over this call's diagonals k_lo..k_hi (absolute
+        indices). bin_start_ptr[m] : bin_start_ptr[m + 1] is emission bin
         first_bin + m's range in the emission-sorted spike buffer. All
         loops are real loops (runtime bounds), nothing is unrolled."""
         per_spike_body: list[ast.stmt] = [
@@ -128,7 +136,7 @@ mask = offs < n_neurons
             target=ast.Name(id="_bk", ctx=ast.Store()),
             iter=_EXPR(f"range({self.n_buckets})"),
             body=[
-                *_STMTS("_m = _k - _bk"),
+                *_STMTS("_m = _k - _bk - first_bin"),
                 ast.If(
                     test=_EXPR("(_m >= 0) & (_m < n_bins)"),
                     body=[
@@ -147,10 +155,10 @@ mask = offs < n_neurons
         return [
             ast.For(
                 target=ast.Name(id="_k", ctx=ast.Store()),
-                iter=_EXPR(f"range(n_bins + {self.n_buckets - 1})"),
+                iter=_EXPR("range(k_lo, k_hi + 1)"),
                 body=[
                     # diagonal k's centre: emission-bin centre + bucket centre
-                    *_STMTS(f"time = (first_bin + _k + 1) * {self.bucket_width!r}"),
+                    *_STMTS(f"time = (_k + 1) * {self.bucket_width!r}"),
                     bucket_for,
                 ],
                 orelse=[],
@@ -190,13 +198,13 @@ mask = offs < n_neurons
         edge_tensor_attrs: set,
         send_section: list,
     ) -> list[ast.stmt]:
-        """One spike_conn_j == conn_idx branch, walking only delay bucket
-        `_bk`'s sub-range (a runtime index set by the convolution loop, see
-        _spike_loop). The sub-range comes from `conn{i}_src_offsets_ptr`'s
-        bucket axis (Topology.blocked(..., n_buckets=...) flattens
-        [n_blocks, n_buckets, N_src + 1] row-major, so bucket b's row for
-        program `pid` sits at flat offset `(pid * n_buckets + b) * (N_src +
-        1)`). Everything else -- link tiling, densify, receive, send -- is
+        """One spike_conn_j == conn_idx branch, delivering only the links in
+        delay bucket `_bk` (a runtime index set by the convolution loop, see
+        _spike_loop). The row is the plain per-(block, source) row from
+        `conn{i}_src_offsets_ptr`, same as the no-delay kernel; each link's
+        bucket comes from `conn{i}_bucket_ptr` and masks the walk. Rows are
+        sorted by bucket and typically only a few links long (see
+        Topology.blocked). Everything else -- densify, receive, send -- is
         exactly the no-delay template's.
         """
         i = conn_idx
@@ -215,7 +223,7 @@ mask = offs < n_neurons
         stmts: list[ast.stmt] = [
             *source_loads,
             *_STMTS(
-                f"_row = (pid.to(tl.int64) * {self.n_buckets} + _bk) * {row_stride}\n"
+                f"_row = pid.to(tl.int64) * {row_stride}\n"
                 f"link_start = tl.load(conn{i}_src_offsets_ptr + _row + spike_src_j)\n"
                 f"link_end = tl.load(conn{i}_src_offsets_ptr + _row + spike_src_j + 1)"
             ),
@@ -223,7 +231,8 @@ mask = offs < n_neurons
 
         link_loads: list[ast.stmt] = _STMTS(
             "_lk = link_tile + tl.arange(0, LINK_BLOCK)\n"
-            "_lk_valid = _lk < link_end\n"
+            "_lk_in_row = _lk < link_end\n"
+            f"_lk_valid = _lk_in_row & (tl.load(conn{i}_bucket_ptr + _lk, mask=_lk_in_row, other=0) == _bk)\n"
             f"_tgt = tl.load(conn{i}_target_indices_ptr + _lk, mask=_lk_valid, other=-1)"
         )
         for attr in edge_tensor_attrs:
@@ -297,6 +306,8 @@ mask = offs < n_neurons
             ast.arg(arg="bin_start_ptr"),
             ast.arg(arg="first_bin"),
             ast.arg(arg="n_bins"),
+            ast.arg(arg="k_lo"),
+            ast.arg(arg="k_hi"),
         ]
 
         for i, (conn, _, _, source_dynamic_attrs, edge_tensor_attrs) in enumerate(
@@ -305,6 +316,7 @@ mask = offs < n_neurons
             args += [
                 ast.arg(arg=f"conn{i}_src_offsets_ptr"),
                 ast.arg(arg=f"conn{i}_target_indices_ptr"),
+                ast.arg(arg=f"conn{i}_bucket_ptr"),
             ]
             for attr in edge_tensor_attrs:
                 args.append(ast.arg(arg=f"conn{i}_{attr}_ptr"))

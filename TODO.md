@@ -8,9 +8,9 @@ layout. Run everything with `python -m pytest`.
 | Name | What it is | Where it's handled |
 |---|---|---|
 | **emission delay** | a spike's own recorded time lies in the future (`n2.spike(time + d)`) | source-side: `compact()`'s carry buffer, owned by the source population |
-| **scheduling** | a target not due on this sub-step keeps every input it's handed until it next runs (formerly "retention") | target-side: `combine()` in `Network.step()` |
+| **scheduling** | a target not due on this sub-step keeps every input it's handed until it next runs (formerly "retention") | target-side: `combine()` in `Network.step()`, onto the same input buffer inter-timestep delay keeps |
 | **intra-timestep transmission delay** | per-link delay whose arrival still falls inside the target's current kernel call | inside the target's update kernel: delay buckets (`per_link_delay_update_kernel.py`) |
-| **inter-timestep transmission delay** | per-link delay pushing an arrival past the target's current kernel call | not implemented yet (formerly "cross-timestep" / "Part 2") |
+| **inter-timestep transmission delay** | per-link delay pushing an arrival past the target's current kernel call | target-side: the not-yet-fully-delivered suffix of the target's own input, kept across calls (formerly "cross-timestep" / "Part 2") |
 
 The update kernel itself has two phases, the **spike loop** and the **final
 propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
@@ -848,8 +848,9 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
            Still on `tl.sort`: `merge()`/`combine()` — the same blowup
            applies once their widths grow (`combine()` sizes off live
            counts, so it can grow at scale); same fix pattern.
-       **⚠ OPEN — correctness of the intra-timestep transmission delay
-       kernel, raised 2026-11-05, under discussion.** The owner flagged
+       **Resolved 2026-11-06 — correctness of the intra-timestep
+       transmission delay kernel** (raised 2026-11-05; both points fixed, see
+       below). The owner flagged
        (2026-11-03) that something about the already-shipped per-link-delay
        kernel looked off once inter-timestep delay came into view. Two
        candidate problems found reading the code (derived, not yet
@@ -900,23 +901,47 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
        walks are empty and cost two offset loads each; worth measuring once
        (a) runs at PD14 scale.
 
-       **Inter-timestep transmission delay (the part that still needs
-       solving).** A delay that exceeds one population timestep pushes a
-       delivery into a *later* timestep entirely, which is a different
-       kind of problem from bucketing within one — it's exactly what
-       `CarryBuffer`/`compact()` already exist for (holding a "not yet
-       due" entry across rounds). The new wrinkle: responsibility for that
-       spike's remaining lifetime transfers from the *source* population
-       (which today owns `_carry`/`_fresh`/`_due`, compacting its *own*
-       output once for all downstream targets) to the *receiving*
-       population specifically, once "how many of the receiver's own
-       timesteps away" becomes part of what's being tracked — not yet
-       designed: does this still fit the source-owns-compaction model
-       (same once-per-source economy of scale this was built for), or does
-       spanning multiple-of-the-*receiver's*-timestep intervals need the
-       receiver itself to hold a per-connection carry, since different
-       incoming connections to the same population could need different
-       bucket counts/timesteps? Open for the next pass at this.
+       **Done 2026-11-06 — inter-timestep transmission delay**, on top of the
+       convolution, merged with scheduling into one target-owned input:
+       - `_merged` is the target's emission-sorted input. Scheduling
+         (`combine()`, now rank-merge based, no `tl.sort`) keeps adding to
+         it; the kernel no longer clears it but trims it to the suffix of
+         spikes that still have undelivered buckets (one `searchsorted`-style
+         count folded into the existing host sync, then a host-side slice).
+       - Per-population state is that buffer plus `_k_done`, the last
+         diagonal delivered. A call at `t` walks diagonals
+         `k_done+1 … k_t`, `k_t` = largest k with `(k+1)·w ≤ t`, so no
+         delivery is ever after `t` (point 1 fixed).
+       - `w` = `Population.delay_resolution`, else the network's sub-step
+         (`Network.sub_dt`, set by `step()`; before any step, the finest
+         positive effective period). `n_buckets = floor(max_delay / w) + 1`.
+         Both, and the per-bucket topology splits, are computed once
+         (`_delay_layout`, `_blocked_topologies`) instead of on every
+         launch. `n_delay_buckets` and `compile()`'s `delay ≥ period`
+         guard are gone.
+       - Late arrivals (a spike owing a diagonal ≤ `k_done`) are skipped
+         silently, by decision — no host-side check. Shouldn't happen for
+         bare `n2.spike()` sources; may for a lagging event-driven source
+         emitting past times — part of the lifecycle review (1b).
+       - Test: `test_inter_timestep_delays_deliver_once_each_in_their_own_
+         later_call`.
+       - Topology layout fixed for real scale (2026-11-06): the bucketed
+         layout used to be a dense `[n_blocks, n_buckets, n_src + 1]` offset
+         table — O(blocks × buckets × sources), independent of link count —
+         which for PD14 (53 buckets at w = 0.1ms) was ~77GB int64 and
+         OOM-killed the first launch (27GB shared RAM on the APU). Now the
+         offsets are the plain per-(block, source) table, rows sorted by
+         bucket, plus a per-link uint8 bucket id; the kernel walks the row
+         and masks `bucket == j`. PD14 topology: 7.0GB host (mostly the
+         canonical tensors from build()) + 2.3GB GPU, peak 8.7GB. Only
+         `perm` (int32) stays host-side after upload. The old 8-bucket
+         layout would have been ~12GB too — the delay kernel could never
+         have run PD14 before this.
+       - Still recomputed per launch: `bt.to_blocked(canonical)` for edge
+         tensor attrs (kept so a changed `conn.weight` is picked up) — a
+         CPU gather + H2D copy per connection per call; also, the blocked
+         copy the kernel writes edge state into is discarded each call
+         (lifecycle review).
      - **Historical reasoning trail (superseded above, not the plan):**
        the original idea was to sort each source row's outgoing links by
        delay once, statically, then combine multiple simultaneously-firing
@@ -992,6 +1017,32 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      latency lever than how spike management sorts, since every population
      pays its own full kernel-launch overhead in sequence regardless. Not
      started; flagged here per request.
+1a. **PD14 runs (2026-11-06) — first real-scale run, starting point for the
+   refactor.** Stable activity 0–700ms, rates flat across 100ms windows:
+   E_23 0.0Hz, I_23 2.2, E_4 5.0, I_4 6.0, E_5 ~8.5, I_5 ~8.5, E_6 1.7,
+   I_6 7.6 (inhibitory above excitatory in every layer; not yet checked
+   against published rates). Open findings:
+   - **E_23 is silent** — PD14's L2/3e is sparse but not zero; check the
+     model/drive.
+   - **Crash at 700ms**: T (902 Poisson neurons, all `next_spike =
+     t_start`) fires in one step, exceeding `merge()`'s `per_src_cap = 64`.
+     Raising the cap isn't viable (`merge()` still does one `tl.sort`
+     over K × per_src_cap, the compile blowup removed from `compact()`);
+     needs the rank-based, live-count merge `combine()` now uses.
+   - **Recompiles**: the update kernel's runtime ints `first_bin`,
+     `n_bins`, `k_lo`, `k_hi` get Triton's divisibility-by-16
+     specialization, so each new combination compiles a new variant — 56
+     recompiles × ~0.7s in the first 75 steps, then none. Fix:
+     `do_not_specialize` for those args.
+   - **Speed**: ~0.085s per 0.1ms step with real activity (~14 min per
+     simulated second); first step ~22s (topology splits + compiles).
+   - **Delay buckets have no intra-step resolution**: bucket width is the
+     sub-step itself (w = 0.1ms → 52–59 step-offset buckets, one diagonal
+     per call, every delivery at `t`). Intended design: s sub-buckets per
+     step, width w/s (bucket id = floor(d / (w/s)) encodes step offset and
+     sub-bucket); bucket ids then exceed uint8 for s = 16. To discuss in the
+     refactor.
+
 1b. **Review the whole spike lifecycle, emission to consumption, end to
    end** (requested 2026-11-05, after inter-timestep delay lands). Most of
    it now exists but was built piece by piece: emission (`n2.spike`, local

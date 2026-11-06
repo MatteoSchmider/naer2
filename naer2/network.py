@@ -17,6 +17,9 @@ class Network:
         self.connections: Set[Connection] = set()
         self.kernels: Set[Kernel] = set()
         self.t: float = 0.0
+        # The sub-step the last step() ran at -- populations without an
+        # explicit delay_resolution adopt it (see Population._delay_layout).
+        self.sub_dt: float | None = None
         # Device every population's state lazily moves onto on its first
         # real kernel launch (Population._ensure_on_device) -- see TODO.md.
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -190,6 +193,7 @@ class Network:
         periods = self._compute_effective_periods()
         self._validate_schedulable(periods)
         sub_dt = self._sub_dt(t_step, periods)
+        self.sub_dt = sub_dt
         t_end = self.t + t_step
         while self.t < t_end - 1e-10:
             self.t = min(self.t + sub_dt, t_end)
