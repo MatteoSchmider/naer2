@@ -1043,6 +1043,102 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      sub-bucket); bucket ids then exceed uint8 for s = 16. To discuss in the
      refactor.
 
+1c. **Spike-management redesign — sizing and decisions (2026-11-07).**
+   Spike-granular entries everywhere: an entry is one source neuron firing,
+   (emission time, source neuron, connection id); links are only expanded
+   at delivery. Rates from the 0–700ms PD14 run, per-link delays N(1.5,
+   0.75) E / N(0.75, 0.375) I, clamped at 0.1; an entry is held until its
+   connection's longest delay (~mean + 4σ: ~4.5ms E, ~2.25ms I).
+
+   | Variant | Scale | Runs/pop per sim. s | Largest emission buffer/run | New entries per consumer per intake | Pending per consumer | Burst |
+   |---|---|---|---|---|---|---|
+   | PD14c (0.1ms) | ×1 | 10,000 | ~11 | 22–25 | ~900–960 | 902 |
+   | | ×10 | 10,000 | ~110 | ~250 | ~9.6k | ~9k |
+   | | ×100 | 10,000 | ~1.1k | ~2.5k | ~96k | ~90k |
+   | PD14e, W = 0.5ms | ×1 | ~2,000 | ~55 | ~125 | ~960 | 902 |
+   | | ×10 | ~2,000 | ~550 | ~1.25k | ~9.6k | ~9k |
+   | | ×100 | ~2,000 | ~5.5k | ~12.5k | ~96k | ~90k |
+   | PD14e, W = 1ms | ×1 | ~1,000 | ~110 | ~250 | ~960 | 902 |
+   | | ×10 | ~1,000 | ~1.1k | ~2.5k | ~9.6k | ~9k |
+   | | ×100 | ~1,000 | ~11k | ~25k | ~96k | ~90k |
+
+   - "New entries per consumer" is per target POPULATION: all its sources'
+     spikes of one step. Per target NEURON that is ~1–2 deliveries per 0.1ms
+     step (2.4k–5.9k incoming synapses at a few Hz), from spikes emitted at
+     many earlier times.
+   - Pending is set by the delay TAIL, not the mean: ~45 steps × ~22 new.
+     Each step an entry delivers only the links of the one delay bucket due
+     then (~44 buckets at 0.1ms); with ~5 links per (target block, source)
+     row, most (entry, block, bucket) combinations are empty.
+   - As written, every PD14 connection's minimum delay is exactly 0.1ms
+     (the clamp; 3–4% of each distribution falls below it), so PD14e would
+     also advance in 0.1ms windows (x = 1). The W = 0.5/1ms rows stand for
+     models whose delays start higher (e.g. from ~1.5ms); the bucket count
+     must stay variable for those.
+   - PD14e emits exact (unsorted) spike times within a window, so its
+     batches need a real sort; PD14c (bare n2.spike()) needs none.
+
+   **Per-connection delay quantization (decided):** `conn.resolution` or
+   `conn.num_buckets`, each derived from the other. Only the residual
+   d − d_min is quantized (d_min is the scheduling lookahead), on a grid
+   anchored at d_min. `num_buckets` set → equal-count (quantile) buckets;
+   `resolution` set → grid of that width, num_buckets = ⌈(d_max −
+   d_min) / res⌉. A bucket delivers at the mean delay of its links. With
+   `num_buckets`, `resolution` reports the average bucket width (feedback
+   only). PD14c with `resolution = 0.1` behaves like NEST. Buckets are
+   static sub-topologies stored as rows sorted by bucket + per-link bucket
+   id (never a dense per-bucket offset table). Don't over-partition: rows
+   are only ~5 links.
+
+   **Contradiction to resolve on the population side:** a consumer's ring
+   has one slot width, the finest resolution among its incoming
+   connections — so the per-connection resolution decided above becomes
+   effectively population-specific again. Still to implement on the
+   population side, together with the per-connection bucket topology
+   splits and bucket mean delays the intake kernel takes as input.
+
+   **Intake kernel implemented (2026-11-07, `naer2/intake.py`,
+   `test/test_intake_gpu.py`), not yet wired into Population.** Ring of
+   arrival slots per consumer, main run (append in emission order) + side
+   run (sorted insert) per slot, watermark split, pairwise merge of the
+   sources' per-block sorted emission runs (skipped when all sources are
+   sorted), late arrivals into the first undelivered slot, far-future and
+   full-slot flags raised by `Ring.check()`. Two kernels: the general one
+   (one program: gather, merge, sequential insert) and
+   `intake_uniform_kernel` for bare-`n2.spike()` sources, where a round's
+   spikes share one emission time: one program per 32 source blocks,
+   straight from the emission buffers into the ring with atomics, no
+   batch, no merge (a spike that would need a side run there violates the
+   contract and raises). Arguments packed into three int32 buffers (ring,
+   per-consumer `IntakePlan`, scratch), since Triton's launch cost grows
+   with the argument count (12µs at 5 args, 64µs at 40, empty kernel).
+   Steady state, median of 200 intakes, 7 PD14-sized sources, 44 buckets:
+
+   | Case | Kernel | Host launch | Launch to done |
+   |---|---|---|---|
+   | ×1 uniform (PD14c) | 31µs | 57µs | 99µs |
+   | ×1 unsorted | 162µs | 62µs | 249µs |
+   | ×10 uniform | 93µs | 54µs | 161µs |
+   | ×10 unsorted | 583µs | 58µs | 587µs |
+
+   Open:
+   - the general kernel's insertion is one sequential loop over the
+     batch (latency-bound: a few dependent global-memory round trips per
+     entry) — fine for precision-focused models, not for scale
+   - host launch: the per-round copy (active mask, window ends) could go
+     away by keeping source run ids and horizons on the device; then only
+     the launch itself (~15–25µs) remains, and CUDA graphs could remove
+     that too
+   - DEFAULT_SLOT_CAP = 10k covers ×1 but not ×10 with 44 buckets (~11k
+     per slot) or ×100 (~96k per slot)
+
+   **Distilled example to reason about** (PD14c proportions, hand-sized):
+   consumer X, 3 source populations S1–S3, each emitting 2 spikes per
+   0.1ms step; every connection has d_min = 0.1 and delays up to 0.5
+   (resolution 0.1 → 4 buckets on the residual [0, 0.4]). Then each
+   intake brings 6 new entries, every entry is held 5 steps, pending ≈ 30
+   entries, and each step every pending entry delivers one bucket's links.
+
 1b. **Review the whole spike lifecycle, emission to consumption, end to
    end** (requested 2026-11-05, after inter-timestep delay lands). Most of
    it now exists but was built piece by piece: emission (`n2.spike`, local

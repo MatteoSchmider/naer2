@@ -16,6 +16,14 @@ from .spike_gather import merge as _merge
 from .types import Region
 
 
+def _same_time(a: float, b: float) -> bool:
+    """Equality of two run times up to float rounding: 0.2 * 3 and 0.3 + 0.3
+    must count as the same round. inf only equals inf."""
+    if math.isinf(a) or math.isinf(b):
+        return a == b
+    return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+
+
 class Population:
     def __init__(
         self,
@@ -93,6 +101,28 @@ class Population:
         self.instance = instance
         self.incoming: list = []  # Connection objects whose target is this population
         self.last_update: float = -math.inf
+        # Scheduling (see _next_run_time, _relax_horizon):
+        # _horizon: no spike of this population before it is still unknown
+        #   (clocked/update populations: where their last run computed to;
+        #   event-driven ones: derived every round from their inputs).
+        # _bound: no input arrival before it is still unknown.
+        # _run_times: pending arrivals of an event-driven population --
+        #   intake appends arrival + the connection's minimum delay for a
+        #   connection whose source emitted new spikes; later per-link
+        #   arrivals are found while the update kernel expands spikes to
+        #   their links, which then records the next one.
+        self._horizon: float = 0.0
+        self._bound: float = math.inf
+        self._run_times: list[float] = []
+        self._min_delays: dict = {}
+        # Intake bookkeeping: _run_id counts this population's runs (0 =
+        # never run); _read_run[conn] is the source run intake last read
+        # from conn, so a source is read once per run even when rounds
+        # repeat at the same time; _summary caches (run id, n spikes,
+        # earliest emission time) of this population's own last run.
+        self._run_id: int = 0
+        self._read_run: dict = {}
+        self._summary: tuple[int, int, float] | None = None
 
         # Spike lifecycle (see naer2/spike_gather.py and TODO.md): _carry
         # persists across calls, _fresh/_due are this round's only.
@@ -275,17 +305,158 @@ class Population:
         # doesn't re-fold the same entries again next time.
         self._fresh.count.zero_()
 
+    @property
+    def _event_driven(self) -> bool:
+        return self.timestep is None and not self.has_autonomous_dynamics
+
+    # TODO (emission contract, fixed -- the update kernel must provide this):
+    #   Every run OVERWRITES this population's emission buffer; it is valid
+    #   until the population's next run, and consumers read it once per run
+    #   (intake, via _run_id), in the round it was written.
+    #   - node  [n_blocks * local_spike_cap] int32  population-local index
+    #   - time  [n_blocks * local_spike_cap] float32 emission time e: >= the
+    #           run's window start, possibly past its end (emission delay);
+    #           each block's valid entries SORTED ascending by e (sorted in
+    #           the kernel before writing out: once at the source, so every
+    #           consumer's intake only merges, never sorts; across blocks
+    #           there is no order -- no grid-wide barrier in Triton)
+    #   - count [n_blocks] int32  valid entries of block b are
+    #           [b * cap, b * cap + count[b]); setting it invalidates the rest
+    #   - summary [2] float32  (number of spikes, earliest emission time),
+    #           written by the kernel itself -- read back once per run by
+    #           _emission_summary, which computes it on the host side until
+    #           then
+    #   - a block emitting more than local_spike_cap spikes must flag
+    #     overflow, not write past its slice
+    def _emission_summary(self) -> tuple[int, float]:
+        """(number of spikes, earliest emission time) of this population's
+        last run, read back from the device once per run and shared by all
+        consumers. Computed from the current emission buffer (the update
+        kernel's per-block output); the update kernel should eventually
+        write this summary itself."""
+        if self._summary is None or self._summary[0] != self._run_id:
+            fresh = self._fresh
+            local = torch.arange(fresh.time.shape[0], device=fresh.time.device) % fresh.cap
+            valid = local < fresh.count.repeat_interleave(fresh.cap)
+            earliest = torch.where(valid, fresh.time, math.inf).min()
+            n, earliest = torch.stack([valid.sum().to(earliest.dtype), earliest]).tolist()
+            self._summary = (self._run_id, int(n), earliest)
+        return self._summary[1], self._summary[2]
+
+    def _intake(self, t: float) -> None:
+        """End of every round (Network.step): take in what every source that
+        ran since this population last read it emitted. Host side: read
+        each source once per run, and for an event-driven population
+        schedule a run at the source's earliest emission + the connection's
+        minimum delay (later per-link arrivals are found by the update
+        kernel)."""
+        new = []
+        for i, conn in enumerate(self.incoming):
+            source = conn._source
+            if source._run_id == 0 or self._read_run.get(conn) == source._run_id:
+                continue
+            self._read_run[conn] = source._run_id
+            n, earliest = source._emission_summary()
+            if n == 0:
+                continue
+            new.append(i)
+            if self._event_driven:
+                self._run_times.append(earliest + self._min_delay(conn))
+        # TODO (merge kernel): merge the emission buffers of the connections
+        # in `new` into this population's to-deliver buffer, using
+        # self._bound (relaxed at the start of this round) as the lower
+        # bound of its next window.
+
+    def _check_schedulable(self) -> None:
+        """An update() population needs a clock: its own timestep, or
+        inputs bounding how far it may integrate."""
+        if self.timestep is None and self.has_autonomous_dynamics and not self.incoming:
+            raise ValueError(
+                f"{type(self.instance).__name__} population has update() dynamics but "
+                f"neither an explicit timestep nor incoming connections, so nothing "
+                f"determines how far each update may integrate: set population.timestep."
+            )
+
+    def _min_delay(self, conn) -> float:
+        """Smallest delay on `conn` (0.0 if it has none), cached: delays
+        are static and a per-link tensor can be very large."""
+        if conn not in self._min_delays:
+            d = getattr(conn.fabric, "delay", None)
+            if d is None:
+                self._min_delays[conn] = 0.0
+            elif isinstance(d, torch.Tensor):
+                self._min_delays[conn] = float(d.min())
+            else:
+                self._min_delays[conn] = float(d)
+        return self._min_delays[conn]
+
+    def _reset_horizon(self) -> None:
+        """Start of a round's horizon fixed point: derived values restart at
+        inf and only shrink while relaxing (see Network.step)."""
+        if self.incoming:
+            self._bound = math.inf
+        if self._event_driven and self.last_update != -math.inf:
+            self._horizon = math.inf
+
+    def _relax_horizon(self) -> bool:
+        """One relaxation step: input bound = min over incoming connections
+        of (source horizon + minimum delay); an event-driven population
+        emits nothing before its earliest unprocessed arrival, so its own
+        horizon is min(bound, earliest pending arrival). True if anything
+        changed."""
+        bound = min(
+            (c._source._horizon + self._min_delay(c) for c in self.incoming),
+            default=math.inf,
+        )
+        horizon = self._horizon
+        if self._event_driven and self.last_update != -math.inf:
+            horizon = min(bound, min(self._run_times, default=math.inf))
+        changed = bound != self._bound or horizon != self._horizon
+        self._bound, self._horizon = bound, horizon
+        return changed
+
+    def _next_run_time(self) -> float:
+        """When this population next wants its update kernel to run, given
+        this round's relaxed horizons; math.inf for "not until something
+        changes". Never earlier than the network's current time.
+
+          - never run yet: 0.0, for every population
+          - explicit timestep: its horizon (last run + timestep)
+          - update() dynamics, no timestep: as soon as its input bound is
+            past its horizon, i.e. it can integrate further
+          - event-driven: its earliest pending arrival, once the input
+            bound has reached it"""
+        if self.last_update == -math.inf:
+            return 0.0
+        if self.timestep is not None:
+            return self._horizon
+        if self.has_autonomous_dynamics:
+            if self._bound > self._horizon and not _same_time(self._bound, self._horizon):
+                return max(self._horizon, self.network.t)
+            return math.inf
+        arrival = min(self._run_times, default=math.inf)
+        if arrival <= self._bound or _same_time(arrival, self._bound):
+            return arrival
+        return math.inf
+
     def _execute_update_kernel(self, t: float) -> None:
-        """Kernel 2: merged update-receive-send, actually compiled and
-        launched on `self.network.device` (naer2/transpiler/templates/
-        update_kernel.py). Consumes self._merged (this round's
-        merge_incoming() result, set by Network.step() before this is
-        called), applies receive per incoming connection, then runs update
-        and send across all neurons. Publishes this round's freshly emitted
-        spikes via set_fresh_output() for the NEXT round's gather phase to
-        fold in -- see the module docstring on the one-round pipeline
-        latency this implies, even for a nominally zero delay.
-        """
+        """Offered every round's time t by Network.step(); runs only if t is
+        this population's own next run time. The run's window ends at
+        t + timestep for a clocked population, else at its input bound."""
+        if not _same_time(self._next_run_time(), t):
+            return
+        self.last_update = t
+        self._run_id += 1
+        window_end = t + self.timestep if self.timestep is not None else self._bound
+        self._window = (t, window_end)
+        if not self._event_driven:
+            self._horizon = window_end
+        self._run_times = [
+            r for r in self._run_times if r > window_end and not _same_time(r, window_end)
+        ]
+
+        # TODO (spike-handling redesign): everything below is the old body,
+        # still consuming the old _merged/set_fresh_output handoff.
         device = self.network.device
         self._ensure_on_device(device)
         fn = self._kernel()
