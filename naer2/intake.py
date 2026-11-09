@@ -53,6 +53,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .emission import EmissionBuffer, emission_ptrs
 from .spike_gather import _bit_length
 
 # TODO: the slot capacity is a fixed constant for now; a burst (e.g. PD14's
@@ -91,10 +92,9 @@ def _ring(ring, N_SLOTS: tl.constexpr, SLOT_CAP: tl.constexpr):
 @triton.jit
 def _plan(plan, n_conns, MAX_BUCKETS: tl.constexpr):
     """Typed pointers into a consumer's plan buffer, see IntakePlan."""
-    addr = plan.to(tl.pointer_type(tl.int64))
-    base = plan + 8 * n_conns
+    base = plan + 2 * n_conns
     return (
-        addr, addr + n_conns, addr + 2 * n_conns, addr + 3 * n_conns,  # node, time, count, state addresses
+        plan.to(tl.pointer_type(tl.int64)),            # emission buffer addresses
         base, base + n_conns, base + 2 * n_conns,      # n_blocks, cap, n_buckets
         base + 3 * n_conns,                            # last-read run ids [2, n_conns]
         _f32(base + 5 * n_conns),                      # bucket means [n_conns, MAX_BUCKETS]
@@ -103,16 +103,20 @@ def _plan(plan, n_conns, MAX_BUCKETS: tl.constexpr):
 
 
 @triton.jit
-def _source_round(state_addr, last_read, c, n_conns, parity):
-    """Did connection c's source run since this consumer last read it, and
-    its last run's window end. Reads last_read[parity], writes the new value
-    to last_read[1 - parity] (idempotent across programs)."""
-    state = tl.load(state_addr + c).to(tl.pointer_type(tl.int32))
-    run_id = tl.load(state)
-    window_end = tl.load(_f32(state + 1))
+def _source(src_addr, src_n_blocks, src_cap, last_read, c, n_conns, parity):
+    """Connection c's source emission buffer (see naer2/emission.py): node,
+    time and count pointers, its block count and cap, its last run's window
+    end, and whether it ran since this consumer last read it. Reads
+    last_read[parity], writes the new value to last_read[1 - parity]
+    (idempotent across programs)."""
+    n_blocks = tl.load(src_n_blocks + c)
+    cap = tl.load(src_cap + c)
+    buf = tl.load(src_addr + c).to(tl.pointer_type(tl.int32))
+    node, time, count, run_id_p, window_end_p, _sc, _sm, _of = emission_ptrs(buf, n_blocks, cap)
+    run_id = tl.load(run_id_p)
     fresh = run_id != tl.load(last_read + parity * n_conns + c)
     tl.store(last_read + (1 - parity) * n_conns + c, run_id)
-    return fresh, window_end
+    return node, time, count, n_blocks, cap, tl.load(window_end_p), fresh
 
 
 @triton.jit
@@ -149,8 +153,8 @@ def intake_kernel(
     N_SLOTS: tl.constexpr, SLOT_CAP: tl.constexpr, MAX_BUCKETS: tl.constexpr,
     BLOCK: tl.constexpr, BLOCK_G: tl.constexpr,
 ):
-    (src_node_addr, src_time_addr, src_count_addr, src_state_addr, src_n_blocks, src_cap,
-     n_buckets, last_read, bucket_mean, _progs) = _plan(plan, n_conns, MAX_BUCKETS)
+    (src_addr, src_n_blocks, src_cap, n_buckets, last_read, bucket_mean,
+     _progs) = _plan(plan, n_conns, MAX_BUCKETS)
     window_end = _f32(_scratch(scratch, batch_cap)[9] + batch_cap + 1)  # [n_conns]
     (a_time, a_node, a_conn, a_run, b_time, b_node, b_conn, b_run,
      run_start, run_tmp) = _scratch(scratch, batch_cap)
@@ -163,14 +167,11 @@ def intake_kernel(
     n = tl.cast(0, tl.int32)
     n_runs = tl.cast(0, tl.int32)
     for c in range(n_conns):
-        fresh, wend = _source_round(src_state_addr, last_read, c, n_conns, parity)
+        node_p, time_p, count_p, n_blocks, cap, wend, fresh = _source(
+            src_addr, src_n_blocks, src_cap, last_read, c, n_conns, parity
+        )
         tl.store(window_end + c, wend)
         if fresh:
-            node_p = tl.load(src_node_addr + c).to(tl.pointer_type(tl.int32))
-            time_p = tl.load(src_time_addr + c).to(tl.pointer_type(tl.float32))
-            count_p = tl.load(src_count_addr + c).to(tl.pointer_type(tl.int32))
-            n_blocks = tl.load(src_n_blocks + c)
-            cap = tl.load(src_cap + c)
             for b0 in range(0, n_blocks, BLOCK_G):
                 blk = b0 + tl.arange(0, BLOCK_G)
                 bm = blk < n_blocks
@@ -311,24 +312,22 @@ def intake_uniform_kernel(
     N_SLOTS: tl.constexpr, SLOT_CAP: tl.constexpr, MAX_BUCKETS: tl.constexpr,
     BLOCK_B: tl.constexpr,
 ):
-    (src_node_addr, src_time_addr, src_count_addr, src_state_addr, src_n_blocks, src_cap,
-     n_buckets, last_read, bucket_mean, progs) = _plan(plan, n_conns, MAX_BUCKETS)
+    (src_addr, src_n_blocks, src_cap, n_buckets, last_read, bucket_mean,
+     progs) = _plan(plan, n_conns, MAX_BUCKETS)
     (main_time, main_node, main_conn, main_bucket, main_count,
      _side_time, _side_node, _side_conn, _side_bucket, _side_count,
      watermark, flags) = _ring(ring, N_SLOTS, SLOT_CAP)
 
     pid = tl.program_id(0)
     c = tl.load(progs + pid)
-    fresh, wend = _source_round(src_state_addr, last_read, c, n_conns, parity)
+    node_p, time_p, count_p, n_blocks, cap, wend, fresh = _source(
+        src_addr, src_n_blocks, src_cap, last_read, c, n_conns, parity
+    )
     if fresh:
-        node_p = tl.load(src_node_addr + c).to(tl.pointer_type(tl.int32))
-        time_p = tl.load(src_time_addr + c).to(tl.pointer_type(tl.float32))
-        count_p = tl.load(src_count_addr + c).to(tl.pointer_type(tl.int32))
-        cap = tl.load(src_cap + c)
         mark = tl.load(watermark)
 
         blk = tl.load(progs + tl.num_programs(0) + pid) + tl.arange(0, BLOCK_B)
-        bm = blk < tl.load(src_n_blocks + c)
+        bm = blk < n_blocks
         cnt = tl.minimum(tl.load(count_p + blk, mask=bm, other=0), cap)
         js = tl.arange(0, MAX_BUCKETS)
         jm = js < tl.load(n_buckets + c)
@@ -397,51 +396,39 @@ class Ring:
             )
 
 
-def source_state(device) -> torch.Tensor:
-    """A source population's device-side intake state: [run id (int32),
-    window end of its last run (float32 bits)]. Its update kernel bumps the
-    run id and writes the window end on every run; run id 0 = never ran."""
-    return torch.zeros(2, device=device, dtype=torch.int32)
-
-
 class IntakePlan:
     """Everything about one consumer's intake, built once into one int32
-    buffer: per connection the addresses (int64) of its source's emission
-    buffer (node, time, count) and source state, block counts, capacities,
-    bucket counts, the last-read run ids (double-buffered), the bucket mean
-    delays (float32 [n_conns, MAX_BUCKETS]) and the uniform kernel's program
-    table (connection, first block). Requires every buffer it points to to
-    stay allocated (constant addresses). run() copies nothing: it launches
-    with scalars only."""
+    buffer: per incoming connection its source's EmissionBuffer address
+    (int64), block count, cap and bucket count, the last-read run ids
+    (double-buffered), the bucket mean delays (float32 [n_conns,
+    MAX_BUCKETS]) and the uniform kernel's program table (connection, first
+    block). The emission buffers must stay allocated (they do: one per
+    population, for good). run() copies nothing: it launches with scalars
+    only."""
 
-    def __init__(self, ring: Ring, sources: list, states: list, bucket_mean: list[list[float]]):
+    def __init__(self, ring: Ring, emissions: list[EmissionBuffer], bucket_mean: list[list[float]]):
         device = ring.buf.device
-        n = len(sources)
+        n = len(emissions)
         self.ring, self.n_conns, self.parity = ring, n, 0
+        self.emissions = emissions
         self.max_buckets = triton.next_power_of_2(max(max((len(m) for m in bucket_mean), default=1), 1))
-        progs = [(c, b0) for c, s in enumerate(sources) for b0 in range(0, s.count.shape[0], _BLOCK_B)]
+        progs = [(c, b0) for c, em in enumerate(emissions) for b0 in range(0, em.n_blocks, _BLOCK_B)]
         self.n_progs = max(len(progs), 1)
 
-        plan = torch.zeros(13 * n + n * self.max_buckets + 2 * self.n_progs, dtype=torch.int32)
-        plan[: 8 * n].view(torch.int64)[:] = torch.tensor(
-            [s.node.data_ptr() for s in sources]
-            + [s.time.data_ptr() for s in sources]
-            + [s.count.data_ptr() for s in sources]
-            + [st.data_ptr() for st in states],
-            dtype=torch.int64,
-        )
-        plan[8 * n:9 * n] = torch.tensor([s.count.shape[0] for s in sources], dtype=torch.int32)
-        plan[9 * n:10 * n] = torch.tensor([s.cap for s in sources], dtype=torch.int32)
-        plan[10 * n:11 * n] = torch.tensor([len(m) for m in bucket_mean], dtype=torch.int32)
-        means = plan[13 * n:13 * n + n * self.max_buckets].view(torch.float32).view(n, self.max_buckets)
+        plan = torch.zeros(7 * n + n * self.max_buckets + 2 * self.n_progs, dtype=torch.int32)
+        plan[: 2 * n].view(torch.int64)[:] = torch.tensor([em.buf.data_ptr() for em in emissions], dtype=torch.int64)
+        plan[2 * n:3 * n] = torch.tensor([em.n_blocks for em in emissions], dtype=torch.int32)
+        plan[3 * n:4 * n] = torch.tensor([em.cap for em in emissions], dtype=torch.int32)
+        plan[4 * n:5 * n] = torch.tensor([len(m) for m in bucket_mean], dtype=torch.int32)
+        means = plan[7 * n:7 * n + n * self.max_buckets].view(torch.float32).view(n, self.max_buckets)
         for c, m in enumerate(bucket_mean):
             means[c, : len(m)] = torch.tensor(m, dtype=torch.float32)
-        table = plan[13 * n + n * self.max_buckets:]
+        table = plan[7 * n + n * self.max_buckets:]
         table[: len(progs)] = torch.tensor([c for c, _ in progs], dtype=torch.int32)
         table[self.n_progs:self.n_progs + len(progs)] = torch.tensor([b for _, b in progs], dtype=torch.int32)
         self.plan = plan.to(device)
 
-        self.batch_cap = sum(s.count.shape[0] * s.cap for s in sources) + 1
+        self.batch_cap = sum(em.n_blocks * em.cap for em in emissions) + 1
         self.scratch = torch.empty(10 * self.batch_cap + 2 + n, device=device, dtype=torch.int32)
 
     def run(self, uniform_time: bool = False) -> None:
@@ -460,27 +447,3 @@ class IntakePlan:
                 BLOCK=_BLOCK, BLOCK_G=_BLOCK_G,
             )
         self.parity ^= 1
-
-
-def intake(
-    ring: Ring,
-    sources: list,
-    active: list[bool],
-    window_end: list[float],
-    bucket_mean: list[list[float]],
-    uniform_time: bool = False,
-) -> None:
-    """One-shot intake for tests: builds source states marking the active
-    sources as freshly run, an IntakePlan, and checks the flags right away.
-    sources[i] is connection i's source emission buffer (node, time, count,
-    cap -- a BlockedSpikes); window_end[i] its source's last run window
-    end; bucket_mean[i] its delay buckets' mean delays."""
-    device = ring.buf.device
-    states = []
-    for a, w in zip(active, window_end):
-        st = source_state(device)
-        st[0] = int(a)
-        st[1:].view(torch.float32)[0] = w
-        states.append(st)
-    IntakePlan(ring, sources, states, bucket_mean).run(uniform_time)
-    ring.check()

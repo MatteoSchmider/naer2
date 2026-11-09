@@ -123,9 +123,7 @@ class Topology:
         self,
         group_size: int,
         n_targets: int,
-        delay: torch.Tensor | None = None,
-        n_buckets: int = 1,
-        bucket_width: float | None = None,
+        bucket: torch.Tensor | None = None,
     ) -> "BlockedTopology":
         """
         Re-lay this topology out per target block, for the update kernel.
@@ -140,44 +138,30 @@ class Topology:
         group_size is the kernel's GROUP_SIZE and must match at launch —
         the layout is meaningless for any other value.
 
-        delay/n_buckets/bucket_width additionally sort each (block, source)
-        row's links by delay bucket (bucket j holds delays in
-        [j*bucket_width, (j+1)*bucket_width)) and record each link's bucket
-        in `bucket` -- the offsets stay exactly the plain [n_blocks, N_src
-        + 1] table, so memory is O(links + blocks * sources) rather than
-        O(blocks * buckets * sources), which is what makes real-scale
-        networks fit (PD14: ~1GB instead of ~77GB). The caller sizes
-        n_buckets to cover the largest delay (see Population._delay_layout);
-        a delay past the last bucket clamps into it; n_buckets must be
-        <= 256 (uint8). n_buckets=1 (default) is the plain layout, with
-        `bucket` None.
+        bucket (one delay-bucket id per link, canonical order; see
+        delay_buckets) additionally sorts each (block, source) row by bucket
+        and keeps each link's id in `bucket` -- the offsets stay the plain
+        [n_blocks, N_src + 1] table, so memory is O(links + blocks *
+        sources), not O(blocks * buckets * sources).
         """
         n_src = len(self.source_offsets) - 1
         n_blocks = -(-n_targets // group_size)
         if len(self.target_indices) and int(self.target_indices.max()) >= n_targets:
             raise ValueError("topology has a target index >= n_targets")
-
-        bucketed = n_buckets > 1
-        if bucketed:
-            if delay is None or bucket_width is None:
-                raise ValueError("n_buckets > 1 needs both delay and bucket_width")
-            if len(delay) != len(self.target_indices):
-                raise ValueError("delay must have exactly one entry per link")
-            if n_buckets > 256:
-                raise ValueError(f"n_buckets={n_buckets} exceeds the uint8 bucket id range")
+        if bucket is not None and len(bucket) != len(self.target_indices):
+            raise ValueError("bucket must have exactly one entry per link")
 
         row = (self.target_indices // group_size) * n_src + torch.repeat_interleave(
             torch.arange(n_src), self.source_offsets.diff()
         )
         counts = torch.bincount(row, minlength=n_blocks * n_src)
-        if bucketed:
-            bucket = (delay / bucket_width).floor().clamp(0, n_buckets - 1).to(torch.int64)
+        n_buckets = int(bucket.max()) + 1 if bucket is not None and len(bucket) else 1
+        if bucket is not None:
             # stable: keeps target order within a (row, bucket)
-            perm = torch.argsort(row * n_buckets + bucket, stable=True)
-            bucket = bucket[perm].to(torch.uint8)
+            perm = torch.argsort(row * n_buckets + bucket.to(torch.int64), stable=True)
+            bucket = bucket[perm].to(torch.int16)
         else:
             perm = torch.argsort(row, stable=True)  # stable: keeps target order within a row
-            bucket = None
         del row
 
         starts = torch.cumsum(counts, 0) - counts
@@ -194,8 +178,7 @@ class Topology:
         target_local = (self.target_indices[perm] % group_size).to(torch.int32)
         return BlockedTopology(
             offsets, target_local, perm.to(torch.int32), block_base, group_size, n_targets,
-            n_buckets=n_buckets, bucket_width=bucket_width if bucketed else None,
-            bucket=bucket,
+            n_buckets=n_buckets, bucket=bucket,
         )
 
     @staticmethod
@@ -269,11 +252,9 @@ class BlockedTopology:
                   blocked position k
     block_base    [n_blocks + 1] int64 — block b owns positions
                   block_base[b] : block_base[b + 1]
-    n_buckets     delay buckets per block (1 = no bucketing, the default)
-    bucket_width  the delay span one bucket covers,
-                  or None when n_buckets == 1
-    bucket        [n_links] uint8 — each blocked link's delay bucket, or None
-                  when n_buckets == 1
+    n_buckets     number of delay buckets (1 without bucketing)
+    bucket        [n_links] int16 — each blocked link's delay bucket, or None
+                  without bucketing
 
     Per-link tensors (weights, ...) must be laid out the same way: to_blocked()
     before handing them to the kernel, from_blocked() to read results back in
@@ -283,8 +264,7 @@ class BlockedTopology:
 
     def __init__(
         self, offsets, target_local, perm, block_base, group_size, n_targets,
-        n_buckets: int = 1, bucket_width: float | None = None,
-        bucket: torch.Tensor | None = None,
+        n_buckets: int = 1, bucket: torch.Tensor | None = None,
     ):
         self.offsets = offsets
         self.target_local = target_local
@@ -293,7 +273,6 @@ class BlockedTopology:
         self.group_size = group_size
         self.n_targets = n_targets
         self.n_buckets = n_buckets
-        self.bucket_width = bucket_width
         self.bucket = bucket
 
     @property
@@ -310,3 +289,62 @@ class BlockedTopology:
         out = torch.empty_like(blocked)
         out[self.perm] = blocked
         return out
+
+
+class DelayBuckets:
+    """One connection's static delay quantization (see delay_buckets).
+
+    bucket      [n_links] int64, canonical link order: each link's bucket
+    mean        [num_buckets] float32: mean delay of each bucket's links --
+                the delay a bucket delivers at
+    d_min       the connection's minimum delay (the scheduling lookahead)
+    resolution  bucket width (grid), or the average width (equal-count;
+                feedback only)
+    """
+
+    def __init__(self, bucket, mean, d_min, resolution):
+        self.bucket, self.mean, self.d_min, self.resolution = bucket, mean, d_min, resolution
+
+    @property
+    def num_buckets(self) -> int:
+        return len(self.mean)
+
+
+def delay_buckets(
+    delay: torch.Tensor, resolution: float | None = None, num_buckets: int | None = None
+) -> DelayBuckets:
+    """Quantize one connection's per-link delays into buckets. Only the
+    residual above the minimum delay d_min is quantized (d_min is already
+    the scheduling lookahead):
+
+      resolution    a grid anchored at d_min: bucket j holds residuals in
+                    [j * resolution, (j + 1) * resolution)
+      num_buckets   equal-count buckets: boundaries at quantiles of the
+                    residuals, so each holds ~len(delay) / num_buckets links
+                    (links with equal delays always share a bucket, so a
+                    bucket can come out larger and the count smaller)
+
+    Exactly one of the two must be given; the other is reported (for
+    num_buckets, `resolution` is the average bucket width). Empty buckets
+    are dropped and the ids renumbered, so every bucket has links and a
+    mean delay."""
+    if (resolution is None) == (num_buckets is None):
+        raise ValueError("give exactly one of resolution or num_buckets")
+    delay = delay.to(torch.float64)
+    d_min, d_max = float(delay.min()), float(delay.max())
+    residual = delay - d_min
+    if resolution is not None:
+        bucket = torch.floor(residual / resolution + 1e-9).to(torch.int64)
+    else:
+        sorted_res = torch.sort(residual).values
+        idx = (torch.arange(1, num_buckets) * len(sorted_res)) // num_buckets
+        bounds = torch.unique(sorted_res[idx])
+        bounds = bounds[bounds > 0]
+        bucket = torch.searchsorted(bounds, residual, right=True)
+    used, bucket = torch.unique(bucket, return_inverse=True)
+    n = len(used)
+    mean = torch.zeros(n, dtype=torch.float64).index_add_(0, bucket, delay)
+    mean /= torch.bincount(bucket, minlength=n).to(torch.float64)
+    if num_buckets is not None:
+        resolution = (d_max - d_min) / n if d_max > d_min else 0.0
+    return DelayBuckets(bucket, mean.to(torch.float32), d_min, resolution)

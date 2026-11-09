@@ -16,8 +16,8 @@ import random
 import pytest
 import torch
 
-from naer2.intake import Ring, intake
-from naer2.spike_gather import BlockedSpikes
+from naer2.emission import EmissionBuffer
+from naer2.intake import IntakePlan, Ring
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a real GPU (CUDA/ROCm) to launch the kernel"
@@ -31,19 +31,41 @@ def _device():
     torch.cuda.set_device(0)
 
 
-def _emission(blocks: list[list[tuple[float, int]]], cap: int) -> BlockedSpikes:
-    """blocks[b] = [(time, node), ...], sorted by time (the emission
-    contract); padded to cap with garbage that must never be read."""
-    n = len(blocks)
-    time = torch.full((n * cap,), float("nan"))
-    node = torch.full((n * cap,), -1, dtype=torch.int32)
-    count = torch.zeros(n, dtype=torch.int32)
+def _emission(blocks: list[list[tuple[float, int]]], cap: int) -> EmissionBuffer:
+    """An EmissionBuffer holding blocks[b] = [(time, node), ...], sorted by
+    time (the emission contract); padded to cap with garbage that must never
+    be read. Its run id is 0 (never ran) until _ran marks it."""
+    em = EmissionBuffer(len(blocks), cap, DEVICE)
+    time = torch.full((len(blocks) * cap,), float("nan"))
+    node = torch.full((len(blocks) * cap,), -1, dtype=torch.int32)
+    count = torch.zeros(len(blocks), dtype=torch.int32)
     for b, entries in enumerate(blocks):
         assert [t for t, _ in entries] == sorted(t for t, _ in entries)
         for i, (t, s) in enumerate(entries):
             time[b * cap + i], node[b * cap + i] = t, s
         count[b] = len(entries)
-    return BlockedSpikes(node.to(DEVICE), time.to(DEVICE), count.to(DEVICE), cap)
+    em.time.copy_(time)
+    em.node.copy_(node)
+    em.count.copy_(count)
+    return em
+
+
+def _ran(em: EmissionBuffer, window_end: float) -> None:
+    """What the source's update kernel does on every run: bump its run id,
+    record its window end."""
+    em.state[0] += 1
+    em.state[1:].view(torch.float32).fill_(window_end)
+
+
+def intake(ring, sources, active, window_end, bucket_mean, uniform_time=False):
+    """One-shot intake: the active sources ran (window_end[i]), the others
+    never did; a fresh IntakePlan reads them; flags checked right away."""
+    for em, a, w in zip(sources, active, window_end):
+        em.state.zero_()
+        if a:
+            _ran(em, w)
+    IntakePlan(ring, sources, bucket_mean).run(uniform_time)
+    ring.check()
 
 
 class Reference:
@@ -167,18 +189,14 @@ def test_persistent_plan_reads_each_source_run_exactly_once(uniform_time):
     which sources ran since it last read them (source run id vs last-read
     id, double-buffered): a source that didn't run again must not be read
     again, even though its emission buffer still holds the old spikes."""
-    from naer2.intake import IntakePlan, source_state
-
     ring = Ring(32, 0.1, DEVICE)
     a, b = _emission([[(1.0, 0)], [(1.0, 1)]], cap=4), _emission([[(1.0, 2)]], cap=4)
-    states = [source_state(DEVICE), source_state(DEVICE)]
-    plan = IntakePlan(ring, [a, b], states, BUCKET_MEAN[:2])
+    plan = IntakePlan(ring, [a, b], BUCKET_MEAN[:2])
 
-    def ran(i, t, window_end):  # what the source's update kernel will do on the device
+    def ran(i, t, window_end):
         src = (a, b)[i]  # its spikes (the non-nan entries), restamped t
         src.time[:] = torch.where(torch.isnan(src.time), src.time, torch.full_like(src.time, t))
-        states[i][0] += 1
-        states[i][1:].view(torch.float32)[0] = window_end
+        _ran(src, window_end)
 
     ran(0, 1.0, 1.1); ran(1, 1.0, 1.1)
     plan.run(uniform_time)   # both fresh: 3 spikes x 5 buckets

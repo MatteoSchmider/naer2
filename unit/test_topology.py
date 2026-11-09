@@ -11,7 +11,7 @@ round-trip through to_blocked / from_blocked.
 import torch
 import pytest
 
-from naer2.topology import Topology
+from naer2.topology import Topology, delay_buckets
 
 
 def _topology(n_src: int, n_tgt: int, density: float, seed: int) -> Topology:
@@ -65,27 +65,22 @@ def test_to_blocked_from_blocked_roundtrip(topo: Topology, n_tgt: int, group_siz
 
 # ------------------------------------------------------------------ delay bucketing
 #
-# Links split into fixed-width delay buckets; the caller sizes n_buckets to
-# cover the largest delay, and anything past the last bucket clamps into it.
+# blocked(bucket=...) sorts each (block, source) row by a given per-link
+# bucket id; delay_buckets() computes those ids from per-link delays.
 
 
-def test_default_n_buckets_is_unchanged_from_plain_blocked():
+def test_no_buckets_is_the_plain_layout():
     topo = _topology(6, 10, 1.0, 0)
-    bt_plain = topo.blocked(4, 10)
-    bt_default = topo.blocked(4, 10, n_buckets=1)
-    assert bt_default.offsets.ndim == 2
-    assert torch.equal(bt_default.offsets, bt_plain.offsets)
-    assert torch.equal(bt_default.perm, bt_plain.perm)
-    assert bt_default.n_buckets == 1
-    assert bt_default.bucket_width is None
+    bt = topo.blocked(4, 10)
+    assert bt.offsets.ndim == 2
+    assert bt.n_buckets == 1
+    assert bt.bucket is None
 
 
-def test_n_buckets_without_delay_or_bucket_width_raises():
+def test_bucket_ids_must_cover_every_link():
     topo = _topology(6, 10, 1.0, 0)
-    with pytest.raises(ValueError, match="n_buckets"):
-        topo.blocked(4, 10, n_buckets=4)
-    with pytest.raises(ValueError, match="n_buckets"):
-        topo.blocked(4, 10, delay=torch.zeros(len(topo)), n_buckets=4)
+    with pytest.raises(ValueError, match="one entry per link"):
+        topo.blocked(4, 10, bucket=torch.zeros(len(topo) - 1, dtype=torch.int64))
 
 
 def _bucket_links(bt, b, s, bucket):
@@ -96,16 +91,14 @@ def _bucket_links(bt, b, s, bucket):
 
 def test_one_source_four_links_land_in_four_distinct_buckets():
     # 1 block (group_size=4, 4 targets), one source neuron with 4 outgoing
-    # links to targets 0..3, delays [0.1, 0.4, 0.6, 0.9], n_buckets=4,
-    # bucket_width=0.25 -> buckets [0, 1, 2, 3].
+    # links to targets 0..3 in buckets [0, 1, 2, 3].
     topo = Topology(torch.tensor([0, 4]), torch.tensor([0, 1, 2, 3]))
-    delay = torch.tensor([0.1, 0.4, 0.6, 0.9])
 
-    bt = topo.blocked(4, 4, delay=delay, n_buckets=4, bucket_width=0.25)
+    bt = topo.blocked(4, 4, bucket=torch.tensor([0, 1, 2, 3]))
 
     assert bt.offsets.shape == (1, 2)  # same table as unbucketed: n_blocks=1, n_src+1=2
-    assert bt.bucket_width == 0.25
-    assert bt.bucket.dtype == torch.uint8
+    assert bt.n_buckets == 4
+    assert bt.bucket.dtype == torch.int16
     for bucket, expected_target in enumerate([0, 1, 2, 3]):
         links = _bucket_links(bt, 0, 0, bucket)
         assert len(links) == 1, f"bucket {bucket} should hold exactly one link"
@@ -113,33 +106,19 @@ def test_one_source_four_links_land_in_four_distinct_buckets():
 
 
 def test_multiple_links_share_a_bucket_and_rows_are_sorted_by_bucket():
-    # Same single block, one source, 4 links, delays grouped two-and-two
-    # into buckets 0 and 2 (bucket_width=0.25): [0.05, 0.1] -> bucket 0,
-    # [0.55, 0.6] -> bucket 2. Buckets 1 and 3 stay empty.
     topo = Topology(torch.tensor([0, 4]), torch.tensor([0, 1, 2, 3]))
-    delay = torch.tensor([0.05, 0.55, 0.1, 0.6])
 
-    bt = topo.blocked(4, 4, delay=delay, n_buckets=4, bucket_width=0.25)
+    bt = topo.blocked(4, 4, bucket=torch.tensor([0, 2, 0, 2]))
 
     def bucket_targets(bucket):
         return sorted(int(bt.target_local[k]) for k in _bucket_links(bt, 0, 0, bucket))
 
-    assert bucket_targets(0) == [0, 2]  # targets of delay 0.05 and 0.1
+    assert bucket_targets(0) == [0, 2]
     assert bucket_targets(1) == []
-    assert bucket_targets(2) == [1, 3]  # targets of delay 0.55 and 0.6
-    assert bucket_targets(3) == []
+    assert bucket_targets(2) == [1, 3]
     assert bt.bucket.tolist() == [0, 0, 2, 2]
     assert int(bt.block_base[0]) == 0
     assert int(bt.block_base[1]) == 4
-
-
-def test_delay_past_the_last_bucket_clamps_into_it():
-    topo = Topology(torch.tensor([0, 2]), torch.tensor([0, 1]))
-    delay = torch.tensor([1.0, 5.0])  # both >= n_buckets * bucket_width = 1.0
-
-    bt = topo.blocked(4, 4, delay=delay, n_buckets=4, bucket_width=0.25)
-
-    assert bt.bucket.tolist() == [3, 3]
 
 
 @pytest.mark.parametrize("topo,n_tgt,group_size", CASES)
@@ -148,9 +127,9 @@ def test_bucketed_perm_is_still_a_full_permutation_faithful_to_canonical_csr(
 ):
     n_buckets = 4
     torch.manual_seed(0)
-    delay = torch.rand(len(topo))  # all within the 4 buckets of width 0.25
+    bucket = torch.randint(0, n_buckets, (len(topo),))
 
-    bt = topo.blocked(group_size, n_tgt, delay=delay, n_buckets=n_buckets, bucket_width=0.25)
+    bt = topo.blocked(group_size, n_tgt, bucket=bucket)
     n_src = len(topo.source_offsets) - 1
     m = len(topo)
 
@@ -158,10 +137,9 @@ def test_bucketed_perm_is_still_a_full_permutation_faithful_to_canonical_csr(
     assert torch.equal(bt.offsets, topo.blocked(group_size, n_tgt).offsets)
     assert int(bt.block_base[-1]) == m
     assert sorted(bt.perm.tolist()) == list(range(m))
+    assert torch.equal(bt.bucket.to(torch.int64), bucket[bt.perm.to(torch.int64)])
 
     canon_src = torch.repeat_interleave(torch.arange(n_src), topo.source_offsets.diff())
-    bucket = (delay / 0.25).floor().clamp(0, n_buckets - 1).to(torch.int64)
-    assert torch.equal(bt.bucket.to(torch.int64), bucket[bt.perm.to(torch.int64)])
     for b in range(bt.n_blocks):
         owned = (topo.target_indices // group_size) == b
         for s in range(n_src):
@@ -172,3 +150,53 @@ def test_bucketed_perm_is_still_a_full_permutation_faithful_to_canonical_csr(
                 expect = sorted(torch.nonzero(owned & (canon_src == s) & (bucket == bk)).flatten().tolist())
                 got = sorted(int(bt.perm[k]) for k in _bucket_links(bt, b, s, bk))
                 assert got == expect
+
+
+# ------------------------------------------------------------------ delay_buckets
+
+
+def test_resolution_grid_is_anchored_at_the_minimum_delay():
+    # residuals above d_min = 0.15: 0, 0.05, 0.12, 0.31 -> grid of 0.1
+    db = delay_buckets(torch.tensor([0.15, 0.2, 0.27, 0.46]), resolution=0.1)
+    assert db.d_min == pytest.approx(0.15)
+    assert db.bucket.tolist() == [0, 0, 1, 2]  # 0.0x -> 0, 0.12 -> 1, 0.31 -> 3, renumbered to 2
+    assert db.mean.tolist() == pytest.approx([0.175, 0.27, 0.46])
+    assert db.resolution == 0.1
+
+
+def test_empty_grid_buckets_are_dropped_and_renumbered():
+    db = delay_buckets(torch.tensor([1.0, 1.05, 1.9]), resolution=0.1)
+    assert db.num_buckets == 2
+    assert db.bucket.tolist() == [0, 0, 1]
+
+
+def test_num_buckets_gives_equal_count_buckets():
+    delay = torch.linspace(0.1, 5.0, 1000)
+    db = delay_buckets(delay, num_buckets=8)
+    assert db.num_buckets == 8
+    counts = torch.bincount(db.bucket)
+    assert counts.min() >= 120 and counts.max() <= 130
+    # buckets are ordered by delay and their means increase
+    assert torch.all(db.mean[1:] > db.mean[:-1])
+    assert db.resolution == pytest.approx((5.0 - 0.1) / 8)
+
+
+def test_equal_delays_always_share_a_bucket():
+    delay = torch.tensor([0.5] * 50 + [1.0] * 10 + [2.0] * 40)
+    db = delay_buckets(delay, num_buckets=10)
+    for value in (0.5, 1.0, 2.0):
+        assert len(set(db.bucket[delay == value].tolist())) == 1
+    assert db.num_buckets == 3
+
+
+def test_homogeneous_delay_is_one_bucket():
+    db = delay_buckets(torch.full((20,), 1.5), resolution=0.1)
+    assert db.num_buckets == 1
+    assert db.mean.tolist() == pytest.approx([1.5])
+
+
+def test_exactly_one_of_resolution_or_num_buckets():
+    with pytest.raises(ValueError, match="exactly one"):
+        delay_buckets(torch.rand(5))
+    with pytest.raises(ValueError, match="exactly one"):
+        delay_buckets(torch.rand(5), resolution=0.1, num_buckets=4)
