@@ -337,13 +337,13 @@ def delay_buckets(
         bucket = torch.floor(residual / resolution + 1e-9).to(torch.int64)
     else:
         sorted_res = torch.sort(residual).values
-        idx = (torch.arange(1, num_buckets) * len(sorted_res)) // num_buckets
+        idx = (torch.arange(1, num_buckets, device=delay.device) * len(sorted_res)) // num_buckets
         bounds = torch.unique(sorted_res[idx])
         bounds = bounds[bounds > 0]
         bucket = torch.searchsorted(bounds, residual, right=True)
     used, bucket = torch.unique(bucket, return_inverse=True)
     n = len(used)
-    mean = torch.zeros(n, dtype=torch.float64).index_add_(0, bucket, delay)
+    mean = torch.zeros(n, dtype=torch.float64, device=delay.device).index_add_(0, bucket, delay)
     mean /= torch.bincount(bucket, minlength=n).to(torch.float64)
     if num_buckets is not None:
         resolution = (d_max - d_min) / n if d_max > d_min else 0.0
