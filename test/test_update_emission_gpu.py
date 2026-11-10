@@ -15,9 +15,18 @@ transpiler templates.
                (once at the source, so intake only merges), the source
                state (run id, window end), the summary (count, earliest e)
                for scheduling
-  interface:   the consumer's per-group rings (due slots k_lo..k_hi) and a
-               connection's TopologyNew -- passed, not walked yet (next step:
-               delivery)
+  delivery:    every program walks its own group's due slots k_lo..k_hi of
+               the consumer's rings in slot order, main and side runs merged
+               by emission time with two cursors; each entry is one segment
+               of a connection's TopologyNew (reached through the consumer's
+               IntakePlan buffer), walked as a contiguous link range: per
+               slot, headers and first links of a chunk of entries are
+               prefetched in one bandwidth-bound load, then delivered one
+               entry at a time in emission order; the delivered cells are
+               freed. Stand-in receive: per target the
+               summed weight and the number of links delivered, plus an
+               optional log of every delivered link (slot, e, connection,
+               source, target) for the order checks.
 
 The emission output is fed into the real intake kernel and checked against
 test_intake_gpu.py's reference end to end.
@@ -32,10 +41,10 @@ import triton
 import triton.language as tl
 
 from naer2.emission import EmissionBuffer, emission_ptrs
-from naer2.intake import IntakePlan, Ring
+from naer2.intake import IntakePlan, Ring, _plan, _ring
 from naer2.spike_gather import _from_ordered_u32, _to_ordered_u32
 from naer2.topology import Topology
-from naer2.topology_new import TopologyNew
+from naer2.topology_new import TopologyNew, topology_ptrs
 from test.test_intake_gpu import Reference, _check, _topology
 
 pytestmark = pytest.mark.skipif(
@@ -44,6 +53,7 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda:0"
 GROUP_SIZE = 32
+BACKEND = "triton"  # Pop's update kernel; test_update_gluon_gpu.py reruns the uniform tests on "gluon"
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -54,16 +64,180 @@ def _device():
 # ------------------------------------------------------------ the kernel
 
 
-@triton.jit(do_not_specialize=["n_neurons", "k_lo", "k_hi", "run_id"])
+@triton.jit
+def _f32p(p):
+    return p.to(tl.pointer_type(tl.float32))
+
+
+# ------------------------------------------------ in-kernel tracing (AMD)
+# TRACE=1: phases; TRACE=2: also every delivered entry. External profilers
+# don't work alongside Triton here (rocprofv3 crashes), so the kernel stamps
+# itself: per program a header (wall-clock start/end, 100 MHz REALTIME,
+# comparable across programs; event count), then (tag << 24 | aux, shader
+# cycle) pairs, cycles 20 bit (deltas mod 2^20). A stamp taken after
+# _pin(x) is after x is computed / loaded. gfx10.3+ / gfx11 asm.
+
+_TRACE_HDR = 6  # words: realtime start (int64), realtime end (int64), event count, pad
+TRACE_HDR = tl.constexpr(_TRACE_HDR)
+TRACE_TAGS = ("start", "state", "slot", "fetched", "staged", "entry", "tail", "delivered", "sent", "end")
+(T_START, T_STATE, T_SLOT, T_FETCHED, T_STAGED, T_ENTRY, T_TAIL, T_DELIVERED, T_SENT,
+ T_END) = (tl.constexpr(i) for i in range(len(TRACE_TAGS)))
+
+
+@triton.jit
+def _cycles():
+    return tl.inline_asm_elementwise("s_getreg_b32 $0, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", "=s", [],
+                                     dtype=tl.int32, is_pure=False, pack=1)
+
+
+def _realtime_asm() -> str:
+    """The 100 MHz REALTIME counter: s_memrealtime on RDNA2 (gfx10),
+    s_sendmsg_rtn_b64 on RDNA3+ (gfx11 dropped s_memrealtime)."""
+    arch = torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else ""
+    if arch.startswith("gfx10"):
+        return "s_memrealtime $0\ns_waitcnt lgkmcnt(0)"
+    return "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\ns_waitcnt lgkmcnt(0)"
+
+
+REALTIME_ASM = tl.constexpr(_realtime_asm())
+
+
+@triton.jit
+def _realtime():
+    return tl.inline_asm_elementwise(REALTIME_ASM, "=s", [], dtype=tl.int64, is_pure=False, pack=1)
+
+
+@triton.jit
+def _pin(x):
+    """x, but only once it is ready (an opaque identity move)."""
+    return tl.inline_asm_elementwise("v_mov_b32 $0, $1", "=v,v", [x], dtype=x.dtype, is_pure=False, pack=1)
+
+
+@triton.jit
+def _pin_s(x):
+    """_pin for a (uniform) 32-bit scalar, kept in an SGPR so nothing
+    downstream turns divergent."""
+    return tl.inline_asm_elementwise("v_readfirstlane_b32 $0, $1", "=s,v", [x], dtype=x.dtype, is_pure=False, pack=1)
+
+
+@triton.jit
+def _mark(trace, n_ev, tag, aux, TRACE_CAP: tl.constexpr):
+    t = _cycles()
+    ok = n_ev < TRACE_CAP
+    tl.store(trace + TRACE_HDR + 2 * n_ev, (tag << 24) | tl.minimum(aux, 0xFFFFFF), mask=ok)
+    tl.store(trace + TRACE_HDR + 2 * n_ev + 1, t, mask=ok)
+    return n_ev + 1
+
+
+@triton.jit
+def _receive(tgt, w, m, k, e, c, src, pid, current, received, n_received, mask,
+             log_ptr, log_e, log_cap, GROUP_SIZE: tl.constexpr, LOG: tl.constexpr):
+    """Deliver one entry's links (tgt: target within the group, w: weight,
+    m: valid) to the group: per target summed weight (a multapse sums) by a
+    one-hot compare in registers, then the receive -- PD14's current +=
+    weight, plus the stand-in's received sum, link count and log."""
+    lane = tl.arange(0, GROUP_SIZE)
+    hit = (lane[:, None] == tgt[None, :]) & m[None, :]
+    edge_weight = tl.sum(tl.where(hit, w[None, :], 0.0), axis=1)
+    hits = tl.sum(hit.to(tl.int32), axis=1)
+    is_target = (hits > 0) & mask
+    current = tl.where(is_target, current + edge_weight, current)  # PD14 receive
+    received = tl.where(is_target, received + edge_weight, received)
+    n_received = n_received + tl.where(mask, hits, 0)
+    if LOG:
+        at = tl.atomic_add(log_ptr + tl.zeros_like(tgt), 1, mask=m)
+        ok = m & (at < log_cap)
+        rec = log_ptr + 1 + 4 * at
+        tl.store(rec, k + tl.zeros_like(tgt), mask=ok)
+        tl.store(rec + 1, c + tl.zeros_like(tgt), mask=ok)
+        tl.store(rec + 2, src + tl.zeros_like(tgt), mask=ok)
+        tl.store(rec + 3, pid * GROUP_SIZE + tgt, mask=ok)
+        tl.store(log_e + at, e + tl.zeros_like(w), mask=ok)
+    return current, received, n_received
+
+
+@triton.jit
+def _walk(lo, hi, link_target_addr, attr_addr, k, e, c, src, pid, current, received, n_received, mask,
+          log_ptr, log_e, log_cap, GROUP_SIZE: tl.constexpr, MAX_L: tl.constexpr, LOG: tl.constexpr):
+    """Deliver links [lo, hi) of connection c, MAX_L at a time, from memory."""
+    ltp = tl.load(link_target_addr + c).to(tl.pointer_type(tl.int16))
+    atp = tl.load(attr_addr + c).to(tl.pointer_type(tl.float32))
+    for l0 in range(lo, hi, MAX_L):
+        lk = l0 + tl.arange(0, MAX_L)
+        lm = lk < hi
+        tgt = tl.load(ltp + lk, mask=lm, other=0).to(tl.int32) & 0xFFFF
+        w = tl.load(atp + lk, mask=lm, other=0.0)
+        current, received, n_received = _receive(
+            tgt, w, lm, k, e, c, src, pid, current, received, n_received, mask,
+            log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
+    return current, received, n_received
+
+
+@triton.jit
+def _receive1(t, w, k, e, c, src, pid, current, received, n_received, mask,
+              log_ptr, log_e, log_cap, GROUP_SIZE: tl.constexpr, LOG: tl.constexpr):
+    """Deliver ONE link (t: its target within the group, uniform over the
+    program, -1 for none; w: its weight): every lane compares against t and
+    the target lane runs the receive -- the model's receive code, guarded,
+    with no layout conversion or reduction. A multapse's weights arrive one
+    link at a time, in link order. PD14: current += weight; plus the
+    stand-in's received sum, link count and log."""
+    lane = tl.arange(0, GROUP_SIZE)
+    hit = (lane == t) & mask
+    current = tl.where(hit, current + w, current)  # PD14 receive
+    received = tl.where(hit, received + w, received)
+    n_received = n_received + hit.to(tl.int32)
+    if LOG:
+        if t >= 0:
+            at = tl.atomic_add(log_ptr, 1)
+            if at < log_cap:
+                rec = log_ptr + 1 + 4 * at
+                tl.store(rec, k)
+                tl.store(rec + 1, c)
+                tl.store(rec + 2, src)
+                tl.store(rec + 3, pid * GROUP_SIZE + t)
+                tl.store(log_e + at, e)
+    return current, received, n_received
+
+
+@triton.jit
+def _walk1(lo, hi, link_target_addr, attr_addr, k, e, c, src, pid, current, received, n_received, mask,
+           log_ptr, log_e, log_cap, GROUP_SIZE: tl.constexpr, U: tl.constexpr, LOG: tl.constexpr):
+    """Deliver links [lo, hi) of connection c straight from memory, U links'
+    loads issued together per round trip, then received one by one."""
+    ltp = tl.load(link_target_addr + c).to(tl.pointer_type(tl.int16))
+    atp = tl.load(attr_addr + c).to(tl.pointer_type(tl.float32))
+    for l0 in range(lo, hi, U):
+        for u in tl.static_range(U):
+            ok = l0 + u < hi
+            t = tl.where(ok, tl.load(ltp + l0 + u, mask=ok, other=0).to(tl.int32) & 0xFFFF, -1)
+            w = tl.load(atp + l0 + u, mask=ok, other=0.0)
+            current, received, n_received = _receive1(
+                t, w, k, e, c, src, pid, current, received, n_received, mask,
+                log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
+    return current, received, n_received
+
+
+@triton.jit(do_not_specialize=["n_neurons", "n_conns", "k_lo", "k_hi", "run_id", "log_cap"])
 def update_kernel(
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr, n_neurons,
-    topo, ring, k_lo, k_hi,            # delivery input (next step): not walked yet
-    fire_time_ptr, emit_delay_ptr,     # stand-in for receive/send
-    emission, run_id, t_start, t_end,
+    plan, n_conns, ring, k_lo, k_hi, slot_width, scratch,   # delivery input
+    received_ptr, n_received_ptr, log_ptr, log_cap,          # stand-in receive, delivery log
+    fire_time_ptr, emit_delay_ptr,                           # stand-in send
+    emission, run_id, t_start, t_end, trace_ptr,
     GROUP_SIZE: tl.constexpr, LOCAL_SPIKE_CAP: tl.constexpr, UNIFORM_TIME: tl.constexpr,
+    N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
+    ENTRY_BLOCK: tl.constexpr, MAX_L: tl.constexpr, LOG: tl.constexpr,
+    TRACE: tl.constexpr = 0, TRACE_CAP: tl.constexpr = 1, WALK: tl.constexpr = 2,
+    STREAM: tl.constexpr = 64, U: tl.constexpr = 8,
 ):
     pid = tl.program_id(0)
     n_groups = tl.num_programs(0)
+    trace = trace_ptr + pid * (TRACE_HDR + 2 * TRACE_CAP)
+    n_ev = tl.cast(0, tl.int32)
+    if TRACE:
+        tl.store(trace.to(tl.pointer_type(tl.int64)), _realtime())
+        n_ev = _mark(trace, n_ev, T_START, 0, TRACE_CAP)
     offs = pid * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
     mask = offs < n_neurons
     (spike_node, spike_time, spike_count, state_run, state_end,
@@ -74,11 +248,231 @@ def update_kernel(
     potential = tl.load(potential_ptr + offs, mask=mask)
     current = tl.load(current_ptr + offs, mask=mask)
     last_time = tl.load(last_time_ptr + offs, mask=mask)
+    if TRACE:
+        current = _pin(current)
+        n_ev = _mark(trace, n_ev, T_STATE, 0, TRACE_CAP)
 
-    # TODO (delivery): for each due slot k_lo..k_hi of this group's ring,
-    # walk its main and side runs with two cursors in emission order; every
-    # entry is one segment of `topo` -- walk its link range [seg_start[i],
-    # seg_start[i + 1]) and run receive/send.
+    # delivery: this group's due slots, in slot order; within a slot main
+    # and side runs merged by emission time; each entry is one segment, i.e.
+    # a contiguous range of this group's own links, delivered one entry at a
+    # time in emission order
+    (_em_addr, _topo_addr, seg_start_addr, link_target_addr, attr_addr, _eng, _ecap, _tns, _tnseg,
+     _tnb, _tnl, _last_read, _progs) = _plan(plan, n_conns)
+    (main_time, main_src, main_seg, main_count, side_time, side_src, side_seg, side_count,
+     _watermark, _flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
+    received = tl.load(received_ptr + offs, mask=mask, other=0.0)
+    n_received = tl.load(n_received_ptr + offs, mask=mask, other=0)
+    log_e = (log_ptr + 4 * log_cap + 1).to(tl.pointer_type(tl.float32))
+    ei = tl.arange(0, ENTRY_BLOCK)
+    li = tl.arange(0, MAX_L)
+    buf_hdr = scratch + pid * ENTRY_BLOCK * (4 + 2 * MAX_L)  # this program's delivery buffer
+    buf_link = buf_hdr + 4 * ENTRY_BLOCK
+    buf_stream = buf_link  # WALK 2: the link stream (target, weight, entry) after the headers
+    qi = tl.arange(0, STREAM)
+    for k in range(k_lo, k_hi + 1):
+        time = (k + 0.5) * slot_width  # every delivery of a slot at its centre
+        cell = pid * N_SLOTS + k % N_SLOTS
+        nm = tl.minimum(tl.load(main_count + cell), MAIN_CAP)
+        ns = tl.minimum(tl.load(side_count + cell), SIDE_CAP)
+        if TRACE:
+            nm = _pin_s(nm)
+            n_ev = _mark(trace, n_ev, T_SLOT, nm, TRACE_CAP)
+        if ns == 0:
+            # main run only (always, for uniform emissions): prefetch the
+            # headers and first MAX_L links of ENTRY_BLOCK entries in one go
+            # (bandwidth-bound), then deliver them one by one, in order
+            for b0 in range(0, nm, ENTRY_BLOCK):
+                em_ = b0 + ei < nm
+                at = cell * MAIN_CAP + b0 + ei
+                ev = tl.load(main_time + at, mask=em_, other=0.0)
+                srcw = tl.load(main_src + at, mask=em_, other=0)
+                seg = tl.load(main_seg + at, mask=em_, other=0)
+                cv = srcw >> 24
+                ss = tl.load(seg_start_addr + cv, mask=em_, other=0).to(tl.pointer_type(tl.int32))
+                lo = tl.load(ss + seg, mask=em_, other=0)
+                hi = tl.load(ss + seg + 1, mask=em_, other=0)
+                ltp = tl.load(link_target_addr + cv, mask=em_, other=0).to(tl.pointer_type(tl.int16))
+                atp = tl.load(attr_addr + cv, mask=em_, other=0).to(tl.pointer_type(tl.float32))
+                if WALK == 2:
+                    # scalar receive: the chunk's links become one stream in
+                    # delivery order (entry, then link -- long segments
+                    # whole), gathered one link per lane (bandwidth-bound),
+                    # then walked U links per memory round trip, each link a
+                    # uniform scalar every lane compares against
+                    n = tl.where(em_, hi - lo, 0)
+                    pos = tl.cumsum(n, axis=0) - n  # stream position of each entry's first link
+                    n_links = tl.sum(n, axis=0)
+                    tl.store(buf_hdr + ei, lo)
+                    tl.store(buf_hdr + ENTRY_BLOCK + ei, pos)
+                    tl.store(buf_hdr + 2 * ENTRY_BLOCK + ei, srcw)
+                    tl.store(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ei), ev)
+                    tl.debug_barrier()
+                    if TRACE:
+                        n_ev = _mark(trace, n_ev, T_FETCHED, n_links, TRACE_CAP)
+                    for s0 in range(0, n_links, STREAM):
+                        q = s0 + qi
+                        qv = q < n_links
+                        # entry of stream position q: the last one starting at or before it
+                        ent = tl.sum(((pos[None, :] <= q[:, None]) & em_[None, :]).to(tl.int32), axis=1) - 1
+                        ent = tl.maximum(ent, 0)
+                        lo_q = tl.load(buf_hdr + ent, mask=qv, other=0)
+                        pos_q = tl.load(buf_hdr + ENTRY_BLOCK + ent, mask=qv, other=0)
+                        c_q = tl.load(buf_hdr + 2 * ENTRY_BLOCK + ent, mask=qv, other=0) >> 24
+                        ltp_q = tl.load(link_target_addr + c_q, mask=qv, other=0).to(tl.pointer_type(tl.int16))
+                        atp_q = tl.load(attr_addr + c_q, mask=qv, other=0).to(tl.pointer_type(tl.float32))
+                        l_q = lo_q + q - pos_q
+                        t_q = tl.load(ltp_q + l_q, mask=qv, other=0).to(tl.int32) & 0xFFFF
+                        w_q = tl.load(atp_q + l_q, mask=qv, other=0.0)
+                        tl.store(buf_stream + qi, tl.where(qv, t_q, -1))
+                        tl.store(_f32p(buf_stream + STREAM + qi), w_q)
+                        if LOG:
+                            tl.store(buf_stream + 2 * STREAM + qi, ent)
+                        tl.debug_barrier()
+                        if TRACE:
+                            n_ev = _mark(trace, n_ev, T_STAGED, 0, TRACE_CAP)
+                        nq = tl.minimum(n_links - s0, STREAM)
+                        for u0 in range(0, nq, U):
+                            for u in tl.static_range(U):
+                                ok = u0 + u < nq
+                                t = tl.load(buf_stream + u0 + u, mask=ok, other=-1)
+                                w = tl.load(_f32p(buf_stream + STREAM + u0 + u), mask=ok, other=0.0)
+                                c = tl.cast(0, tl.int32)
+                                src = tl.cast(0, tl.int32)
+                                e = tl.cast(0.0, tl.float32)
+                                if LOG:
+                                    ent_j = tl.load(buf_stream + 2 * STREAM + u0 + u, mask=ok, other=0)
+                                    srcword = tl.load(buf_hdr + 2 * ENTRY_BLOCK + ent_j)
+                                    c = srcword >> 24
+                                    src = srcword & 0xFFFFFF
+                                    e = tl.load(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ent_j))
+                                current, received, n_received = _receive1(
+                                    t, w, k, e, c, src, pid, current, received, n_received, mask,
+                                    log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
+                        if TRACE >= 2:
+                            current = _pin(current)
+                            n_ev = _mark(trace, n_ev, T_ENTRY, nq, TRACE_CAP)
+                        tl.debug_barrier()  # the stream is refilled next
+                else:
+                    m2 = em_[:, None] & (li[None, :] < (hi - lo)[:, None])
+                    tgt2 = tl.load(ltp[:, None] + lo[:, None] + li[None, :], mask=m2, other=0).to(tl.int32) & 0xFFFF
+                    w2 = tl.load(atp[:, None] + lo[:, None] + li[None, :], mask=m2, other=0.0)
+                    if TRACE:
+                        tgt2 = _pin(tgt2)
+                        w2 = _pin(w2)
+                        n_ev = _mark(trace, n_ev, T_FETCHED, tl.sum(m2.to(tl.int32)), TRACE_CAP)
+                    if WALK == 1:
+                        # the chunk stays in registers: each entry's row and
+                        # header word are picked out by a masked reduction, in
+                        # order (exact: everything else summed is zero); an
+                        # invalid link is target -1, which no lane matches
+                        tgt2 = tl.where(m2, tgt2, -1)
+                        nl = tl.where(em_, hi - lo, 0)
+                        for i in range(tl.minimum(nm - b0, ENTRY_BLOCK)):
+                            sel = ei == i
+                            tgt = tl.sum(tl.where(sel[:, None], tgt2, 0), axis=0)
+                            w = tl.sum(tl.where(sel[:, None], w2, 0.0), axis=0)
+                            n_i = tl.sum(tl.where(sel, nl, 0), axis=0)
+                            c = tl.cast(0, tl.int32)
+                            src = tl.cast(0, tl.int32)
+                            e = tl.cast(0.0, tl.float32)
+                            if LOG:
+                                srcword = tl.sum(tl.where(sel, srcw, 0), axis=0)
+                                c = srcword >> 24
+                                src = srcword & 0xFFFFFF
+                                e = tl.sum(tl.where(sel, ev, 0.0), axis=0)
+                            current, received, n_received = _receive(
+                                tgt, w, tgt >= 0, k, e, c, src, pid, current, received, n_received, mask,
+                                log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
+                            if TRACE >= 2:
+                                current = _pin(current)
+                                n_ev = _mark(trace, n_ev, T_ENTRY, tl.minimum(n_i, MAX_L), TRACE_CAP)
+                            # the rest of a long segment, straight from memory, before the next entry
+                            if n_i > MAX_L:
+                                lo_i = tl.sum(tl.where(sel, lo, 0), axis=0)
+                                srcword_t = tl.sum(tl.where(sel, srcw, 0), axis=0)
+                                current, received, n_received = _walk(
+                                    lo_i + MAX_L, lo_i + n_i, link_target_addr, attr_addr, k,
+                                    tl.sum(tl.where(sel, ev, 0.0), axis=0), srcword_t >> 24, srcword_t & 0xFFFFFF,
+                                    pid, current, received, n_received, mask, log_ptr, log_e, log_cap,
+                                    GROUP_SIZE, MAX_L, LOG)
+                                if TRACE >= 2:
+                                    current = _pin(current)
+                                    n_ev = _mark(trace, n_ev, T_TAIL, n_i - MAX_L, TRACE_CAP)
+                    else:
+                        # into this program's buffer, one coalesced store per field;
+                        # entries then read their own row back with independent loads
+                        row = buf_link + ei[:, None] * MAX_L + li[None, :]
+                        tl.store(row, tgt2)
+                        tl.store(_f32p(row + ENTRY_BLOCK * MAX_L), w2)
+                        tl.store(buf_hdr + ei, lo)
+                        tl.store(buf_hdr + ENTRY_BLOCK + ei, hi)
+                        tl.store(buf_hdr + 2 * ENTRY_BLOCK + ei, srcw)
+                        tl.store(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ei), ev)
+                        tl.debug_barrier()
+                        if TRACE:
+                            n_ev = _mark(trace, n_ev, T_STAGED, 0, TRACE_CAP)
+                        for i in range(tl.minimum(nm - b0, ENTRY_BLOCK)):
+                            lo_i = tl.load(buf_hdr + i)
+                            hi_i = tl.load(buf_hdr + ENTRY_BLOCK + i)
+                            srcword = tl.load(buf_hdr + 2 * ENTRY_BLOCK + i)
+                            e = tl.load(_f32p(buf_hdr + 3 * ENTRY_BLOCK + i))
+                            tgt = tl.load(buf_link + i * MAX_L + li)
+                            w = tl.load(_f32p(buf_link + ENTRY_BLOCK * MAX_L + i * MAX_L + li))
+                            m = li < hi_i - lo_i
+                            c = srcword >> 24
+                            src = srcword & 0xFFFFFF
+                            current, received, n_received = _receive(
+                                tgt, w, m, k, e, c, src, pid, current, received, n_received, mask,
+                                log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
+                            if TRACE >= 2:
+                                current = _pin(current)
+                                n_ev = _mark(trace, n_ev, T_ENTRY, tl.minimum(hi_i - lo_i, MAX_L), TRACE_CAP)
+                            # the rest of a long segment, straight from memory, before the next entry
+                            if hi_i - lo_i > MAX_L:
+                                current, received, n_received = _walk(
+                                    lo_i + MAX_L, hi_i, link_target_addr, attr_addr, k, e, c, src, pid,
+                                    current, received, n_received, mask, log_ptr, log_e, log_cap,
+                                    GROUP_SIZE, MAX_L, LOG)
+                                if TRACE >= 2:
+                                    current = _pin(current)
+                                    n_ev = _mark(trace, n_ev, T_TAIL, hi_i - lo_i - MAX_L, TRACE_CAP)
+                        tl.debug_barrier()  # the buffer is reused by the next chunk
+        else:
+            # main and side runs merged by emission time, two cursors
+            im = tl.cast(0, tl.int32)
+            js = tl.cast(0, tl.int32)
+            for _ in range(nm + ns):
+                em = tl.load(main_time + cell * MAIN_CAP + im, mask=im < nm, other=float("inf"))
+                es = tl.load(side_time + cell * SIDE_CAP + js, mask=js < ns, other=float("inf"))
+                if (im < nm) & (em <= es):
+                    e = em
+                    srcword = tl.load(main_src + cell * MAIN_CAP + im)
+                    seg_i = tl.load(main_seg + cell * MAIN_CAP + im)
+                    im += 1
+                else:
+                    e = es
+                    srcword = tl.load(side_src + cell * SIDE_CAP + js)
+                    seg_i = tl.load(side_seg + cell * SIDE_CAP + js)
+                    js += 1
+                c = srcword >> 24
+                ss_i = tl.load(seg_start_addr + c).to(tl.pointer_type(tl.int32))
+                if WALK == 2:
+                    current, received, n_received = _walk1(
+                        tl.load(ss_i + seg_i), tl.load(ss_i + seg_i + 1), link_target_addr, attr_addr,
+                        k, e, c, srcword & 0xFFFFFF, pid, current, received, n_received, mask,
+                        log_ptr, log_e, log_cap, GROUP_SIZE, U, LOG)
+                else:
+                    current, received, n_received = _walk(
+                        tl.load(ss_i + seg_i), tl.load(ss_i + seg_i + 1), link_target_addr, attr_addr,
+                        k, e, c, srcword & 0xFFFFFF, pid, current, received, n_received, mask,
+                        log_ptr, log_e, log_cap, GROUP_SIZE, MAX_L, LOG)
+        tl.store(main_count + cell, 0)
+        tl.store(side_count + cell, 0)
+    tl.store(received_ptr + offs, received, mask=mask)
+    tl.store(n_received_ptr + offs, n_received, mask=mask)
+    if TRACE:
+        current = _pin(current)
+        n_ev = _mark(trace, n_ev, T_DELIVERED, 0, TRACE_CAP)
 
     # final propagation to the window end (PD14)
     time = t_end
@@ -112,6 +506,8 @@ def update_kernel(
     tl.store(potential_ptr + offs, potential, mask=mask)
     tl.store(current_ptr + offs, current, mask=mask)
     tl.store(last_time_ptr + offs, last_time, mask=mask)
+    if TRACE:
+        n_ev = _mark(trace, n_ev, T_SENT, 0, TRACE_CAP)
 
     # emission contract: sort the group's entries by e (once, at the source)
     if local_spike_count > LOCAL_SPIKE_CAP:
@@ -140,36 +536,118 @@ def update_kernel(
         tl.store(sum_min + (1 - p), float("inf"))
         tl.store(state_run, run_id)
         tl.store(state_end, t_end)
+    if TRACE:
+        n_ev = _mark(trace, n_ev, T_END, 0, TRACE_CAP)
+        tl.store(trace + 4, n_ev)
+        tl.store((trace + 2).to(tl.pointer_type(tl.int64)), _realtime())
 
 
 # ------------------------------------------------------------ helpers
 
 
 class Pop:
-    """A PD14-like population's state plus its emission buffer."""
+    """A PD14-like population's state plus its emission buffer; with
+    connect(), also the consumer side: its rings, its IntakePlan over the
+    incoming connections, and the stand-in receive's buffers."""
 
-    def __init__(self, n: int, cap: int = 64):
-        self.n = n
-        self.n_groups = -(-n // GROUP_SIZE)
+    def __init__(self, n: int, cap: int = 64, group_size: int = GROUP_SIZE):
+        self.n, self.group_size = n, group_size
+        self.n_groups = -(-n // group_size)
         self.potential = torch.full((n,), -65.0, device=DEVICE)
         self.current = torch.zeros(n, device=DEVICE)
         self.t_ref_end = torch.zeros(n, device=DEVICE)
         self.last_time = torch.zeros(n, device=DEVICE)
         self.emission = EmissionBuffer(self.n_groups, cap, DEVICE)
         self.run_id = 0
-        empty = Topology(torch.zeros(2, dtype=torch.int64), torch.zeros(0, dtype=torch.int64))
-        self.topo = TopologyNew(empty, n, GROUP_SIZE, DEVICE)
-        self.ring = Ring(self.n_groups, 4, 0.1, DEVICE, main_cap=16, side_cap=16)
+        self.received = torch.zeros(n, device=DEVICE)
+        self.n_received = torch.zeros(n, device=DEVICE, dtype=torch.int32)
+        self.log_cap = 0
+        self.log = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        self.scratch = torch.zeros(self.n_groups * 32 * (4 + 2 * 16), device=DEVICE, dtype=torch.int32)  # >= 4*32 + 3*STREAM
+        self.trace_level, self.trace_cap = 0, 1
+        # delivery walk: 2 scalar receive over a link stream (default), 0 one-hot
+        # over a staged chunk, 1 one-hot over a chunk kept in registers (slower)
+        self.walk, self.stream, self.unroll = 2, 64, 8
+        # "triton", or "gluon": test/update_gluon.py (LDS stream walk; uniform emission only)
+        self.backend = BACKEND
+        self.trace = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        self.connect([], [], n_slots=1)
 
-    def run(self, t_start, t_end, fire_time, emit_delay=None, uniform=True):
+    def set_trace(self, level: int, cap: int = 1024):
+        """Trace the following runs (see TRACE above; each run overwrites)."""
+        self.trace_level, self.trace_cap = level, cap if level else 1
+        self.trace = torch.zeros(self.n_groups * (_TRACE_HDR + 2 * self.trace_cap) if level else 1,
+                                 device=DEVICE, dtype=torch.int32)
+
+    def traced(self) -> list[dict]:
+        """Per program: wall-clock start/end (10 ns ticks), and its events as
+        (tag, aux, cycles since the program's first stamp, unwrapped)."""
+        hdr = _TRACE_HDR
+        tr =self.trace.view(self.n_groups, hdr + 2 * self.trace_cap).cpu()
+        rt = tr[:, :4].contiguous().view(torch.int64)
+        out = []
+        for g in range(self.n_groups):
+            n = min(int(tr[g, 4]), self.trace_cap)
+            ev = tr[g, hdr:hdr + 2 * n].view(n, 2).tolist()
+            events, base, prev, acc = [], None, None, 0
+            for word, cyc in ev:
+                if prev is not None:
+                    acc += (cyc - prev) % (1 << 20)
+                prev = cyc
+                events.append((TRACE_TAGS[(word >> 24) & 0xFF], word & 0xFFFFFF, acc))
+            out.append(dict(start=int(rt[g, 0]), end=int(rt[g, 1]), events=events, dropped=int(tr[g, 4]) - n))
+        return out
+
+    def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
+                main_cap: int | None = None, side_cap: int | None = None):
+        caps = {k: v for k, v in (("main_cap", main_cap), ("side_cap", side_cap)) if v}
+        self.ring = Ring(self.n_groups, n_slots, slot_width, DEVICE, **caps)
+        self.plan = IntakePlan(self.ring, [p.emission for p in sources], topologies)
+        self.log_cap = log_cap
+        self.log = torch.zeros(1 + 5 * max(log_cap, 1), device=DEVICE, dtype=torch.int32)
+
+    def run(self, t_start, t_end, fire_time, emit_delay=None, uniform=True, deliver_until=None, num_warps=4):
+        """One run of the update kernel over [t_start, t_end): deliver every
+        ring slot that ends by `deliver_until` (default t_end), then emit."""
         self.run_id += 1
+        w = self.ring.slot_width
+        k_lo = self.ring.ring_pos
+        k_hi = int(((deliver_until if deliver_until is not None else t_end) + 1e-6) // w) - 1
+        if self.backend == "gluon" and uniform:
+            from test.update_gluon import update_kernel_gluon
+            update_kernel_gluon[(self.n_groups,)](
+                self.t_ref_end, self.potential, self.current, self.last_time, self.n,
+                self.plan.plan, self.plan.n_conns, self.ring.buf, k_lo, k_hi, w, self.scratch,
+                self.received, self.n_received, self.log, self.log_cap,
+                fire_time.to(DEVICE), (emit_delay if emit_delay is not None else torch.zeros(self.n)).to(DEVICE),
+                self.emission.buf, self.run_id, t_start, t_end,
+                GROUP_SIZE=self.group_size, LOCAL_SPIKE_CAP=self.emission.cap, UNIFORM_TIME=True,
+                N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap, SIDE_CAP=self.ring.side_cap,
+                ENTRY_BLOCK=32, LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
+                SPT=max(self.group_size // (32 * num_warps), 1), NUM_WARPS=num_warps, num_warps=num_warps,
+            )
+            self.ring.ring_pos = max(k_lo, k_hi + 1)
+            return
         update_kernel[(self.n_groups,)](
             self.t_ref_end, self.potential, self.current, self.last_time, self.n,
-            self.topo.buf, self.ring.buf, 0, -1,
+            self.plan.plan, self.plan.n_conns, self.ring.buf, k_lo, k_hi, w, self.scratch,
+            self.received, self.n_received, self.log, self.log_cap,
             fire_time.to(DEVICE), (emit_delay if emit_delay is not None else torch.zeros(self.n)).to(DEVICE),
-            self.emission.buf, self.run_id, t_start, t_end,
-            GROUP_SIZE=GROUP_SIZE, LOCAL_SPIKE_CAP=self.emission.cap, UNIFORM_TIME=uniform,
+            self.emission.buf, self.run_id, t_start, t_end, self.trace,
+            GROUP_SIZE=self.group_size, LOCAL_SPIKE_CAP=self.emission.cap, UNIFORM_TIME=uniform,
+            N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap, SIDE_CAP=self.ring.side_cap,
+            ENTRY_BLOCK=32, MAX_L=16, LOG=self.log_cap > 0,
+            TRACE=self.trace_level, TRACE_CAP=self.trace_cap, WALK=self.walk, STREAM=self.stream, U=self.unroll,
+            num_warps=num_warps,
         )
+        self.ring.ring_pos = max(k_lo, k_hi + 1)
+
+    def deliveries(self) -> list[tuple[int, float, int, int, int]]:
+        """The delivery log, in log order: (slot, e, connection, source, target)."""
+        n = min(int(self.log[0]), self.log_cap)
+        rec = self.log[1:1 + 4 * self.log_cap].view(-1, 4)[:n].tolist()
+        e = self.log[1 + 4 * self.log_cap:].view(torch.float32)[:n].tolist()
+        return [(k, ei, c, s, t) for (k, c, s, t), ei in zip(rec, e)]
 
     def emitted(self) -> dict[int, list[tuple[float, int]]]:
         """group -> [(time, node)] in buffer order."""
@@ -268,3 +746,129 @@ def test_kernel_takes_a_segment_topology():
     pop.topo = _topology(50, 96, GROUP_SIZE, seed=4)
     pop.run(1.0, 1.1, torch.full((96,), math.inf))
     assert pop.emission.summary(1) == (0, math.inf)
+
+
+# ------------------------------------------------------------ delivery
+
+
+def _expected_deliveries(topo: TopologyNew, c: int, spikes, ring_pos: int, slot_width: float):
+    """Per spike (e, source) of connection c taken in at ring position
+    ring_pos: every link it delivers, as (slot, e, connection, source,
+    target, weight) -- through its segments, like intake and the walk."""
+    w = torch.tensor(slot_width, dtype=torch.float32)
+    offsets, start, gb = topo.seg_offsets.tolist(), topo.seg_start.tolist(), topo.seg_gb.tolist()
+    mean, target, weight = topo.bucket_mean.tolist(), topo.link_target.tolist(), topo.attrs["weight"].tolist()
+    out = []
+    for e, s in spikes:
+        for seg in range(offsets[s], offsets[s + 1]):
+            group, j = (gb[seg] >> 16) & 0xFFFF, gb[seg] & 0xFFFF
+            arrival = torch.tensor(e, dtype=torch.float32) + torch.tensor(mean[j], dtype=torch.float32)
+            k = max(int(torch.floor(arrival / w)), ring_pos)
+            for link in range(start[seg], start[seg + 1]):
+                out.append((k, e, c, s, group * topo.group_size + (target[link] & 0xFFFF), weight[link]))
+    return out
+
+
+@pytest.mark.parametrize("long_segments", [False, True])
+@pytest.mark.parametrize("uniform", [True, False])
+def test_deliveries_arrive_in_their_run_in_slot_then_emission_order(uniform, long_segments):
+    """Sources A, B -> consumer C (3 groups) over six rounds, in network
+    order: every population's update kernel (C delivers its due slots),
+    then intake. Every delivered link must come out in the run that covers
+    its slot, per group in slot order and within a slot in emission order,
+    and C's stand-in receive must sum exactly those weights."""
+    rng = random.Random(5)
+    a, b, consumer = Pop(150), Pop(90), Pop(96)
+    topologies = [  # per-link delays (A -> C) and one homogeneous delay (B -> C)
+        _topology(a.n, 96, GROUP_SIZE, delay="random", k=24, seed=10, weight=True),
+        # long_segments: ~30 links per (source, group), past the 16 prefetched
+        _topology(b.n, 96, GROUP_SIZE, delay=0.2, k=90 if long_segments else 24, seed=11, weight=True),
+    ]
+    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000)
+
+    expected_by_run, delivered_by_run = [], []
+    for r in range(6):
+        t = round(1.0 + 0.1 * r, 6)
+        before = len(consumer.deliveries())
+        consumer.run(t, t + 0.1, torch.full((96,), math.inf), uniform=uniform)
+        delivered_by_run.append(consumer.deliveries()[before:])
+        for src in (a, b):
+            src.run(t, t + 0.1, _fire_pattern(src.n, t, t + 0.1, 0.3, rng),
+                    torch.tensor([rng.choice([0.0, 0.0, 0.15]) for _ in range(src.n)]), uniform=uniform)
+        ring_pos = consumer.ring.ring_pos
+        consumer.plan.run(uniform)
+        consumer.ring.check()
+        spikes = [[(e, s) for entries in src.emitted().values() for e, s in entries] for src in (a, b)]
+        expected_by_run.append([d for c in range(2) for d in
+                                _expected_deliveries(topologies[c], c, spikes[c], ring_pos, 0.1)])
+
+    # which run delivers which slot: run r delivers slots up to (t_r + 0.1) / 0.1 - 1
+    due_until = [int(round((1.0 + 0.1 * r + 0.1) / 0.1)) - 1 for r in range(6)]
+    pending = [d for run in expected_by_run for d in run]
+    for r, delivered in enumerate(delivered_by_run):
+        lo = due_until[r - 1] + 1 if r else -10**9
+        want = sorted((k, e, c, s, tg) for k, e, c, s, tg, _ in pending if lo <= k <= due_until[r])
+        got = sorted(delivered)
+        assert got == want, f"run {r}"
+        for grp in range(consumer.n_groups):
+            order = [(k, e) for k, e, c, s, tg in delivered if tg // GROUP_SIZE == grp]
+            assert order == sorted(order), f"run {r}, group {grp}: not in slot then emission order"
+
+    delivered_all = [d for run in delivered_by_run for d in run]
+    assert delivered_all, "nothing was delivered"
+    sums = torch.zeros(96, dtype=torch.float64)
+    counts = torch.zeros(96, dtype=torch.int64)
+    for k, e, c, s, tg, wt in pending:
+        if k <= due_until[-1]:
+            sums[tg] += wt
+            counts[tg] += 1
+    assert torch.equal(consumer.n_received.cpu().long(), counts)
+    assert torch.allclose(consumer.received.cpu().double(), sums, atol=1e-4)
+    # delivered cells are freed: every cell not holding a still-pending slot is empty
+    still_pending = {consumer.ring.cell(tg // GROUP_SIZE, k) for k, e, c, s, tg, _ in pending if k > due_until[-1]}
+    counts_now = (consumer.ring.main_count + consumer.ring.side_count).tolist()
+    assert all(n == 0 for cell, n in enumerate(counts_now) if cell not in still_pending)
+    assert all(counts_now[cell] > 0 for cell in still_pending)
+
+
+# ------------------------------------------------------------ tracing
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_tracing_changes_nothing_and_stamps_every_entry(level):
+    """The traced kernel delivers exactly what the untraced one does; every
+    program stamps its phases, and with TRACE=2 the walk accounts for every
+    link gathered into the stream."""
+    results = []
+    for traced in (False, True):
+        rng = random.Random(5)
+        a, consumer = Pop(150), Pop(96)
+        topo = _topology(a.n, 96, GROUP_SIZE, delay="random", k=40, seed=10, weight=True)
+        consumer.connect([a], [topo], n_slots=16)
+        if traced:
+            consumer.set_trace(level, 4096)
+        programs = []
+        for r in range(6):
+            t = round(1.0 + 0.1 * r, 6)
+            consumer.run(t, t + 0.1, torch.full((96,), math.inf))
+            if traced:
+                programs.append(consumer.traced())
+            a.run(t, t + 0.1, _fire_pattern(a.n, t, t + 0.1, 0.3, rng), uniform=True)
+            consumer.plan.run(True)
+        results.append((consumer.n_received.cpu(), consumer.received.cpu(), programs))
+    assert torch.equal(results[0][0], results[1][0])
+    # uniform intake appends equal-e entries by parallel atomics: their order,
+    # hence the float summation order, varies run to run
+    assert torch.allclose(results[0][1], results[1][1], atol=1e-4)
+    for run in results[1][2]:
+        for prog in run:
+            tags = [tag for tag, _, _ in prog["events"]]
+            assert prog["dropped"] == 0 and tags[0] == "start" and tags[-1] == "end"
+            assert {"state", "delivered", "sent"} <= set(tags)
+            assert prog["end"] >= prog["start"] > 0
+            cycles = [c for _, _, c in prog["events"]]
+            assert cycles == sorted(cycles)
+            if level == 2:  # stream walk: every link gathered at prefetch is walked
+                fetched = sum(aux for tag, aux, _ in prog["events"] if tag == "fetched")
+                walked = sum(aux for tag, aux, _ in prog["events"] if tag == "entry")
+                assert walked == fetched

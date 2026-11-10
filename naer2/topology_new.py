@@ -125,6 +125,7 @@ class TopologyNew:
         self.seg_gb = self.buf[o:o + self.n_segments]; o += self.n_segments
         self.bucket_mean = self.buf[o:o + self.n_buckets].view(torch.float32); o += self.n_buckets
         self.link_target = self.buf[o:o + link_words].view(torch.int16)[: self.n_links]; o += link_words
+        self._attr_offset = o
         attr_block = self.buf[o:o + n_attr_words].view(torch.float32).view(len(attrs), self.n_links)
 
         self.seg_offsets.copy_(torch.searchsorted(seg_source, torch.arange(self.n_sources + 1, device=device)))
@@ -138,6 +139,12 @@ class TopologyNew:
         for i, (name, values) in enumerate(attrs.items()):
             self.attrs[name] = attr_block[i]
             self.write(name, values)
+
+    def link_addresses(self) -> tuple[int, int, int]:
+        """Device addresses of seg_start, link_target and the attribute block
+        (attribute i of link l at attrs + 4 * (i * n_links + l)), for kernels
+        that keep them per connection instead of recomputing the layout."""
+        return self.seg_start.data_ptr(), self.link_target.data_ptr(), self.buf.data_ptr() + 4 * self._attr_offset
 
     def write(self, name: str, canonical: torch.Tensor) -> None:
         """Set a per-link attribute from canonical link order."""
@@ -163,5 +170,20 @@ class TopologyNew:
 
     def locality(self) -> float:
         """Links per segment: how well connectivity and delays line up with
-        target groups (higher is better; ~1 is the per-link regime)."""
+        target groups (higher is better; ~1 is the per-link regime).
+
+        TODO (choosing group_size automatically, at reintegration): with the
+        scalar receive every wave of a program executes every link (~9 VALU
+        per link per wave), so delivery's ALU work is ~ links * group_size /
+        32, independent of locality; per-entry costs (headers, the stream
+        gather) and intake's work are ~ entries = links / locality(group_size),
+        and fewer, larger programs shorten the per-program chains. The
+        optimum is set by latency and occupancy more than by ALU work and
+        depends on the device: PD14, 0.1ms buckets, full round trip -- 780M:
+        G=32 3.40, 128 1.76, 256 1.31, 512 1.29 ms/round (one-hot receive
+        before: best 3.11 at G=128); RX 6600 (one-hot): best at G=32. Model
+        it as  a * links * G + b * entries(G) + latency(n_groups, per-program
+        chain), fitted per device, subject to n_groups >= a few programs per
+        compute unit; entries(G) can be estimated by building at a small G
+        and counting how many of a source's segments share a larger group."""
         return self.n_links / max(self.n_segments, 1)

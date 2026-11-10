@@ -65,18 +65,20 @@ def _ran(em: EmissionBuffer, window_end: float) -> None:
     em.state[1:].view(torch.float32).fill_(window_end)
 
 
-def _topology(n_src, n_tgt, group_size, delay="random", k=6, seed=0):
+def _topology(n_src, n_tgt, group_size, delay="random", k=6, seed=0, weight=False):
     """A random connection: every source gets up to k distinct targets
     (sorted, canonical), per-link delays in [0.1, 0.6) at resolution 0.1
-    ("random"), one homogeneous delay (a float), or none."""
+    ("random"), one homogeneous delay (a float), or none; with `weight`, a
+    random per-link weight attribute."""
     g = torch.Generator().manual_seed(seed)
     rows = [torch.sort(torch.randperm(n_tgt, generator=g)[: torch.randint(1, k + 1, (1,), generator=g).item()]).values
             for _ in range(n_src)]
     topo = Topology(torch.tensor([0] + [len(r) for r in rows]).cumsum(0), torch.cat(rows))
+    attrs = {"weight": torch.rand(len(topo), generator=g)} if weight else None
     if delay == "random":
         d = torch.rand(len(topo), generator=g) * 0.5 + 0.1
-        return TopologyNew(topo, n_tgt, group_size, DEVICE, delay=d, resolution=0.1)
-    return TopologyNew(topo, n_tgt, group_size, DEVICE, delay=delay)
+        return TopologyNew(topo, n_tgt, group_size, DEVICE, delay=d, resolution=0.1, attrs=attrs)
+    return TopologyNew(topo, n_tgt, group_size, DEVICE, delay=delay, attrs=attrs)
 
 
 def intake(ring, sources, active, window_end, topologies, uniform_time=False):

@@ -96,10 +96,11 @@ def _ring(ring, n_groups, N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CA
 @triton.jit
 def _plan(plan, n_conns):
     """Typed pointers into a consumer's plan buffer, see IntakePlan."""
-    base = plan + 4 * n_conns
+    addr = plan.to(tl.pointer_type(tl.int64))
+    base = plan + 10 * n_conns
     return (
-        plan.to(tl.pointer_type(tl.int64)),                    # emission buffer addresses
-        (plan + 2 * n_conns).to(tl.pointer_type(tl.int64)),    # topology addresses
+        addr, addr + n_conns,                                  # emission buffer, topology addresses
+        addr + 2 * n_conns, addr + 3 * n_conns, addr + 4 * n_conns,  # seg_start, link_target, attrs addresses
         base, base + n_conns,                                  # source n_groups, cap
         base + 2 * n_conns, base + 3 * n_conns,                # topology n_sources, n_segments
         base + 4 * n_conns, base + 5 * n_conns,                # topology n_buckets, n_links
@@ -248,8 +249,8 @@ def intake_kernel(
     N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
     BLOCK: tl.constexpr, BLOCK_G: tl.constexpr, BLOCK_S: tl.constexpr,
 ):
-    (em_addr, topo_addr, em_n_groups, em_cap, t_n_sources, t_n_segments, t_n_buckets,
-     t_n_links, last_read, _progs) = _plan(plan, n_conns)
+    (em_addr, topo_addr, _ssa, _lta, _ata, em_n_groups, em_cap, t_n_sources, t_n_segments,
+     t_n_buckets, t_n_links, last_read, _progs) = _plan(plan, n_conns)
     (a_time, a_node, a_conn, a_run, b_time, b_node, b_conn, b_run,
      run_start, run_tmp, window_end) = _scratch(scratch, batch_cap)
     (main_time, main_src, main_seg, main_count, side_time, side_src, side_seg, side_count,
@@ -359,8 +360,8 @@ def intake_uniform_kernel(
     N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_S: tl.constexpr,
 ):
-    (em_addr, topo_addr, em_n_groups, em_cap, t_n_sources, t_n_segments, t_n_buckets,
-     t_n_links, last_read, progs) = _plan(plan, n_conns)
+    (em_addr, topo_addr, _ssa, _lta, _ata, em_n_groups, em_cap, t_n_sources, t_n_segments,
+     t_n_buckets, t_n_links, last_read, progs) = _plan(plan, n_conns)
     (main_time, main_src, main_seg, main_count, _st, _ss, _sg, _sc,
      watermark, flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
 
@@ -445,8 +446,10 @@ class Ring:
 
 class IntakePlan:
     """Everything about one consumer's intake, built once into one int32
-    buffer: per incoming connection its source's EmissionBuffer address and
-    its TopologyNew address (int64 each), the source's group count and cap,
+    buffer: per incoming connection its source's EmissionBuffer address, its
+    TopologyNew address and the addresses of that topology's seg_start,
+    link_target and attribute arrays (int64 each; the update kernel's
+    delivery walk reads links through these), the source's group count and cap,
     the topology's source, segment, bucket and link counts, the last-read
     run ids (double-buffered) and the uniform kernel's program table
     (connection, first source group). Emission buffers and topologies must
@@ -468,17 +471,20 @@ class IntakePlan:
         progs = [(c, g0) for c, em in enumerate(emissions) for g0 in range(0, em.n_groups, _BLOCK_B)]
         self.n_progs = max(len(progs), 1)
 
-        plan = torch.zeros(12 * n + 2 * self.n_progs, dtype=torch.int32)
-        plan[: 4 * n].view(torch.int64)[:] = torch.tensor(
-            [em.buf.data_ptr() for em in emissions] + [t.buf.data_ptr() for t in topologies], dtype=torch.int64
+        plan = torch.zeros(18 * n + 2 * self.n_progs, dtype=torch.int32)
+        links = [t.link_addresses() for t in topologies]
+        plan[: 10 * n].view(torch.int64)[:] = torch.tensor(
+            [em.buf.data_ptr() for em in emissions] + [t.buf.data_ptr() for t in topologies]
+            + [a[0] for a in links] + [a[1] for a in links] + [a[2] for a in links],
+            dtype=torch.int64,
         )
         for i, values in enumerate((
             [em.n_groups for em in emissions], [em.cap for em in emissions],
             [t.n_sources for t in topologies], [t.n_segments for t in topologies],
             [t.n_buckets for t in topologies], [t.n_links for t in topologies],
         )):
-            plan[(4 + i) * n:(5 + i) * n] = torch.tensor(values, dtype=torch.int32)
-        table = plan[12 * n:]
+            plan[(10 + i) * n:(11 + i) * n] = torch.tensor(values, dtype=torch.int32)
+        table = plan[18 * n:]
         table[: len(progs)] = torch.tensor([c for c, _ in progs], dtype=torch.int32)
         table[self.n_progs:self.n_progs + len(progs)] = torch.tensor([g for _, g in progs], dtype=torch.int32)
         self.plan = plan.to(device)
@@ -486,9 +492,10 @@ class IntakePlan:
         self.batch_cap = sum(em.n_groups * em.cap for em in emissions) + 1
         self.scratch = torch.empty(10 * self.batch_cap + 2 + n, device=device, dtype=torch.int32)
 
-    def run(self, uniform_time: bool = False) -> None:
+    def run(self, uniform_time: bool = False, num_warps: int = 4) -> None:
         ring = self.ring
-        consts = dict(N_SLOTS=ring.n_slots, MAIN_CAP=ring.main_cap, SIDE_CAP=ring.side_cap, BLOCK_S=_BLOCK_S)
+        consts = dict(N_SLOTS=ring.n_slots, MAIN_CAP=ring.main_cap, SIDE_CAP=ring.side_cap, BLOCK_S=_BLOCK_S,
+                      num_warps=num_warps)
         if uniform_time:
             intake_uniform_kernel[(self.n_progs,)](
                 self.plan, ring.buf, self.n_conns, ring.n_groups, ring.ring_pos, self.parity,
