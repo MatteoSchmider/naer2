@@ -30,3 +30,41 @@ def test_emission_feeds_intake_end_to_end():
 @pytest.mark.parametrize("long_segments", [False, True])
 def test_deliveries_arrive_in_their_run_in_slot_then_emission_order(long_segments):
     T.test_deliveries_arrive_in_their_run_in_slot_then_emission_order(True, long_segments)
+
+
+def test_tracing_changes_nothing():
+    """The traced Gluon kernel delivers what the untraced one does and
+    stamps every phase."""
+    import math
+    import random
+
+    import torch
+
+    results = []
+    for traced in (False, True):
+        rng = random.Random(5)
+        a, consumer = T.Pop(150), T.Pop(96)
+        topo = T._topology(a.n, 96, T.GROUP_SIZE, delay="random", k=40, seed=10, weight=True)
+        consumer.connect([a], [topo], n_slots=16)
+        if traced:
+            consumer.set_trace(1, 512)
+        runs = []
+        for r in range(6):
+            t = round(1.0 + 0.1 * r, 6)
+            consumer.run(t, t + 0.1, torch.full((96,), math.inf))
+            if traced:
+                runs.append(consumer.traced())
+            a.run(t, t + 0.1, T._fire_pattern(a.n, t, t + 0.1, 0.3, rng), uniform=True)
+            consumer.plan.run(True)
+        results.append((consumer.n_received.cpu(), consumer.received.cpu(), runs))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.allclose(results[0][1], results[1][1], atol=1e-4)
+    for run in results[1][2]:
+        for prog in run:
+            tags = [tag for tag, _, _ in prog["events"]]
+            assert prog["dropped"] == 0 and tags[0] == "start" and tags[-1] == "end"
+            assert {"state", "delivered", "sent"} <= set(tags)
+            assert prog["end"] >= prog["start"] > 0
+            streamed = sum(aux for tag, aux, _ in prog["events"] if tag == "streamed")
+            walked = sum(aux for tag, aux, _ in prog["events"] if tag == "walked")
+            assert streamed == walked

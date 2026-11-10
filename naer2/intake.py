@@ -52,6 +52,7 @@ import triton.language as tl
 from .emission import EmissionBuffer, emission_ptrs
 from .spike_gather import _bit_length
 from .topology_new import TopologyNew, topology_ptrs
+from .trace import mark, pin_s, trace_begin, trace_end
 
 # TODO: run capacities are fixed constants for now; a burst (e.g. PD14's
 # 902-spike thalamic volley) lands in every slot of its delay range at once.
@@ -354,18 +355,26 @@ def intake_kernel(
 # ------------------------------------------------------------ uniform kernel
 
 
+INTAKE_TRACE_TAGS = ("start", "source", "spike", "inserted", "end")
+
+
 @triton.jit(do_not_specialize=["n_conns", "n_groups", "ring_pos", "parity"])
 def intake_uniform_kernel(
-    plan, ring, n_conns, n_groups, ring_pos, parity, slot_width,
+    plan, ring, n_conns, n_groups, ring_pos, parity, slot_width, trace_ptr,
     N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_S: tl.constexpr,
+    TRACE: tl.constexpr = 0, TRACE_CAP: tl.constexpr = 1,
 ):
+    pid = tl.program_id(0)
+    n_ev = tl.cast(0, tl.int32)
+    if TRACE:  # see naer2/trace.py; tags INTAKE_TRACE_TAGS
+        trace = trace_begin(trace_ptr, pid, TRACE_CAP)
+        n_ev = mark(trace, n_ev, 0, 0, TRACE_CAP)
     (em_addr, topo_addr, _ssa, _lta, _ata, em_n_groups, em_cap, t_n_sources, t_n_segments,
      t_n_buckets, t_n_links, last_read, progs) = _plan(plan, n_conns)
     (main_time, main_src, main_seg, main_count, _st, _ss, _sg, _sc,
      watermark, flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
 
-    pid = tl.program_id(0)
     c = tl.load(progs + pid)
     node_p, time_p, count_p, src_groups, cap, wend, fresh = _source(
         em_addr, em_n_groups, em_cap, last_read, c, n_conns, parity
@@ -374,24 +383,36 @@ def intake_uniform_kernel(
         lanes = tl.arange(0, BLOCK_B)
         grp = tl.load(progs + tl.num_programs(0) + pid) + lanes
         cnt = tl.minimum(tl.load(count_p + grp, mask=grp < src_groups, other=0), cap)
+        if TRACE:
+            n_ev = mark(trace, n_ev, 1, pin_s(tl.max(cnt, axis=0)), TRACE_CAP)
         if tl.max(cnt, axis=0) > 0:
             seg_offsets, seg_gb, bucket_mean = _topology(
                 topo_addr, t_n_sources, t_n_segments, t_n_buckets, t_n_links, c
             )
-            mark = tl.load(watermark)
+            wmark = tl.load(watermark)
             for b in range(BLOCK_B):
                 g_src = tl.sum(tl.where(lanes == b, grp, 0), axis=0)
                 for l in range(tl.sum(tl.where(lanes == b, cnt, 0), axis=0)):
                     e = tl.load(time_p + g_src * cap + l)
                     s = tl.load(node_p + g_src * cap + l)
-                    main = (e >= mark) & (e < wend)
+                    main = (e >= wmark) & (e < wend)
                     if main:
-                        _insert_main(e, (c << 24) | s, tl.load(seg_offsets + s), tl.load(seg_offsets + s + 1),
+                        seg_lo = tl.load(seg_offsets + s)
+                        seg_hi = tl.load(seg_offsets + s + 1)
+                        if TRACE:
+                            seg_hi = pin_s(seg_hi)
+                            n_ev = mark(trace, n_ev, 2, seg_hi - seg_lo, TRACE_CAP)
+                        _insert_main(e, (c << 24) | s, seg_lo, seg_hi,
                                      seg_gb, bucket_mean, main_time, main_src, main_seg, main_count,
                                      flags, ring_pos, slot_width, N_SLOTS, MAIN_CAP, BLOCK_S)
                         tl.atomic_max(watermark, e)
+                        if TRACE:
+                            n_ev = mark(trace, n_ev, 3, seg_hi - seg_lo, TRACE_CAP)
                     else:
                         tl.atomic_max(flags + 2, 1)
+    if TRACE:
+        n_ev = mark(trace, n_ev, 4, 0, TRACE_CAP)
+        trace_end(trace, n_ev)
 
 
 # ------------------------------------------------------------ host side
@@ -492,14 +513,16 @@ class IntakePlan:
         self.batch_cap = sum(em.n_groups * em.cap for em in emissions) + 1
         self.scratch = torch.empty(10 * self.batch_cap + 2 + n, device=device, dtype=torch.int32)
 
-    def run(self, uniform_time: bool = False, num_warps: int = 4) -> None:
+    def run(self, uniform_time: bool = False, num_warps: int = 4, trace=None) -> None:
+        """trace: a naer2.trace.Trace over n_progs programs (uniform kernel only)."""
         ring = self.ring
         consts = dict(N_SLOTS=ring.n_slots, MAIN_CAP=ring.main_cap, SIDE_CAP=ring.side_cap, BLOCK_S=_BLOCK_S,
                       num_warps=num_warps)
         if uniform_time:
             intake_uniform_kernel[(self.n_progs,)](
                 self.plan, ring.buf, self.n_conns, ring.n_groups, ring.ring_pos, self.parity,
-                ring.slot_width, BLOCK_B=_BLOCK_B, **consts,
+                ring.slot_width, trace.buf if trace is not None else ring.buf, BLOCK_B=_BLOCK_B,
+                TRACE=int(trace is not None), TRACE_CAP=trace.cap if trace is not None else 1, **consts,
             )
         else:
             intake_kernel[(1,)](

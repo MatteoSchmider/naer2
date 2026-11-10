@@ -45,6 +45,7 @@ from naer2.intake import IntakePlan, Ring, _plan, _ring
 from naer2.spike_gather import _from_ordered_u32, _to_ordered_u32
 from naer2.topology import Topology
 from naer2.topology_new import TopologyNew, topology_ptrs
+from naer2.trace import TRACE_HDR, TRACE_WORDS, mark, pin, pin_s, realtime
 from test.test_intake_gpu import Reference, _check, _topology
 
 pytestmark = pytest.mark.skipif(
@@ -70,63 +71,13 @@ def _f32p(p):
 
 
 # ------------------------------------------------ in-kernel tracing (AMD)
-# TRACE=1: phases; TRACE=2: also every delivered entry. External profilers
-# don't work alongside Triton here (rocprofv3 crashes), so the kernel stamps
-# itself: per program a header (wall-clock start/end, 100 MHz REALTIME,
-# comparable across programs; event count), then (tag << 24 | aux, shader
-# cycle) pairs, cycles 20 bit (deltas mod 2^20). A stamp taken after
-# _pin(x) is after x is computed / loaded. gfx10.3+ / gfx11 asm.
+# TRACE=1: phases; TRACE=2: also the walk (see naer2/trace.py)
 
-_TRACE_HDR = 6  # words: realtime start (int64), realtime end (int64), event count, pad
-TRACE_HDR = tl.constexpr(_TRACE_HDR)
+_TRACE_HDR = TRACE_WORDS
 TRACE_TAGS = ("start", "state", "slot", "fetched", "staged", "entry", "tail", "delivered", "sent", "end")
 (T_START, T_STATE, T_SLOT, T_FETCHED, T_STAGED, T_ENTRY, T_TAIL, T_DELIVERED, T_SENT,
  T_END) = (tl.constexpr(i) for i in range(len(TRACE_TAGS)))
-
-
-@triton.jit
-def _cycles():
-    return tl.inline_asm_elementwise("s_getreg_b32 $0, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", "=s", [],
-                                     dtype=tl.int32, is_pure=False, pack=1)
-
-
-def _realtime_asm() -> str:
-    """The 100 MHz REALTIME counter: s_memrealtime on RDNA2 (gfx10),
-    s_sendmsg_rtn_b64 on RDNA3+ (gfx11 dropped s_memrealtime)."""
-    arch = torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else ""
-    if arch.startswith("gfx10"):
-        return "s_memrealtime $0\ns_waitcnt lgkmcnt(0)"
-    return "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\ns_waitcnt lgkmcnt(0)"
-
-
-REALTIME_ASM = tl.constexpr(_realtime_asm())
-
-
-@triton.jit
-def _realtime():
-    return tl.inline_asm_elementwise(REALTIME_ASM, "=s", [], dtype=tl.int64, is_pure=False, pack=1)
-
-
-@triton.jit
-def _pin(x):
-    """x, but only once it is ready (an opaque identity move)."""
-    return tl.inline_asm_elementwise("v_mov_b32 $0, $1", "=v,v", [x], dtype=x.dtype, is_pure=False, pack=1)
-
-
-@triton.jit
-def _pin_s(x):
-    """_pin for a (uniform) 32-bit scalar, kept in an SGPR so nothing
-    downstream turns divergent."""
-    return tl.inline_asm_elementwise("v_readfirstlane_b32 $0, $1", "=s,v", [x], dtype=x.dtype, is_pure=False, pack=1)
-
-
-@triton.jit
-def _mark(trace, n_ev, tag, aux, TRACE_CAP: tl.constexpr):
-    t = _cycles()
-    ok = n_ev < TRACE_CAP
-    tl.store(trace + TRACE_HDR + 2 * n_ev, (tag << 24) | tl.minimum(aux, 0xFFFFFF), mask=ok)
-    tl.store(trace + TRACE_HDR + 2 * n_ev + 1, t, mask=ok)
-    return n_ev + 1
+_realtime, _pin, _pin_s, _mark = realtime, pin, pin_s, mark
 
 
 @triton.jit
@@ -583,7 +534,11 @@ class Pop:
         """Per program: wall-clock start/end (10 ns ticks), and its events as
         (tag, aux, cycles since the program's first stamp, unwrapped)."""
         hdr = _TRACE_HDR
-        tr =self.trace.view(self.n_groups, hdr + 2 * self.trace_cap).cpu()
+        if self.backend == "gluon":
+            from test.update_gluon import GLUON_TRACE_TAGS as tags
+        else:
+            tags = TRACE_TAGS
+        tr = self.trace.view(self.n_groups, hdr + 2 * self.trace_cap).cpu()
         rt = tr[:, :4].contiguous().view(torch.int64)
         out = []
         for g in range(self.n_groups):
@@ -594,7 +549,7 @@ class Pop:
                 if prev is not None:
                     acc += (cyc - prev) % (1 << 20)
                 prev = cyc
-                events.append((TRACE_TAGS[(word >> 24) & 0xFF], word & 0xFFFFFF, acc))
+                events.append((tags[(word >> 24) & 0xFF], word & 0xFFFFFF, acc))
             out.append(dict(start=int(rt[g, 0]), end=int(rt[g, 1]), events=events, dropped=int(tr[g, 4]) - n))
         return out
 
@@ -620,11 +575,12 @@ class Pop:
                 self.plan.plan, self.plan.n_conns, self.ring.buf, k_lo, k_hi, w, self.scratch,
                 self.received, self.n_received, self.log, self.log_cap,
                 fire_time.to(DEVICE), (emit_delay if emit_delay is not None else torch.zeros(self.n)).to(DEVICE),
-                self.emission.buf, self.run_id, t_start, t_end,
+                self.emission.buf, self.run_id, t_start, t_end, self.trace,
                 GROUP_SIZE=self.group_size, LOCAL_SPIKE_CAP=self.emission.cap, UNIFORM_TIME=True,
                 N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap, SIDE_CAP=self.ring.side_cap,
                 ENTRY_BLOCK=32, LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
-                SPT=max(self.group_size // (32 * num_warps), 1), NUM_WARPS=num_warps, num_warps=num_warps,
+                SPT=max(self.group_size // (32 * num_warps), 1), NUM_WARPS=num_warps,
+                TRACE=int(self.trace_level > 0), TRACE_CAP=self.trace_cap, num_warps=num_warps,
             )
             self.ring.ring_pos = max(k_lo, k_hi + 1)
             return

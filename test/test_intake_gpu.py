@@ -324,3 +324,28 @@ def test_full_run_raises():
     sources, active, window_end = _toy_round(0.0)  # 6 spikes into the same cell
     with pytest.raises(RuntimeError, match="capacity"):
         intake(ring, sources, active, window_end, topos)
+
+
+def test_uniform_intake_tracing_changes_nothing():
+    """The traced uniform intake fills the ring exactly like the untraced one
+    and stamps every taken-in spike."""
+    from naer2.intake import INTAKE_TRACE_TAGS
+    from naer2.trace import Trace
+
+    rings = []
+    for traced in (False, True):
+        em = _emission([[(1.0, g * 8), (1.0, g * 8 + 1), (1.0, g * 8 + 5)] for g in range(4)], 16)
+        n_src = 4 * 8
+        _ran(em, 1.1)
+        topo = _topology(n_src, 64, 32, delay=0.3, k=6, seed=3)
+        ring = Ring(topo.n_groups, 8, 0.1, DEVICE)
+        plan = IntakePlan(ring, [em], [topo])
+        trace = Trace(plan.n_progs, 64) if traced else None
+        plan.run(True, trace=trace)
+        rings.append(ring.main_count.cpu().clone())
+        if traced:
+            progs = trace.decode(INTAKE_TRACE_TAGS)
+            spikes = sum(1 for p in progs for tag, _, _ in p["events"] if tag == "inserted")
+            assert spikes == 12
+            assert all(p["events"][0][0] == "start" and p["events"][-1][0] == "end" for p in progs)
+    assert torch.equal(rings[0], rings[1])

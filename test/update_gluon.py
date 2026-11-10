@@ -26,6 +26,9 @@ from triton.experimental.gluon import language as gl
 
 from naer2.emission import emission_ptrs
 from naer2.intake import _plan, _ring
+from naer2.trace import mark, pin, pin_s, trace_begin, trace_end
+
+GLUON_TRACE_TAGS = ("start", "state", "slot", "headers", "streamed", "walked", "delivered", "sent", "end")
 
 
 @gluon.jit
@@ -39,11 +42,12 @@ def update_kernel_gluon(
     plan, n_conns, ring, k_lo, k_hi, slot_width, scratch,   # delivery input
     received_ptr, n_received_ptr, log_ptr, log_cap,          # stand-in receive, delivery log
     fire_time_ptr, emit_delay_ptr,                           # stand-in send
-    emission, run_id, t_start, t_end,
+    emission, run_id, t_start, t_end, trace_ptr,
     GROUP_SIZE: gl.constexpr, LOCAL_SPIKE_CAP: gl.constexpr, UNIFORM_TIME: gl.constexpr,
     N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr,
     ENTRY_BLOCK: gl.constexpr, LOG: gl.constexpr,
     STREAM: gl.constexpr, U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr,
+    TRACE: gl.constexpr = 0, TRACE_CAP: gl.constexpr = 1,
 ):
     gl.static_assert(UNIFORM_TIME, "the Gluon kernel covers uniform emission times only")
     gl.static_assert(STREAM % U == 0, "STREAM must be a multiple of U")
@@ -60,6 +64,10 @@ def update_kernel_gluon(
 
     pid = gl.program_id(0)
     n_groups = gl.num_programs(0)
+    n_ev = gl.to_tensor(0)
+    if TRACE:  # see naer2/trace.py; tags GLUON_TRACE_TAGS
+        trace = trace_begin(trace_ptr, pid, TRACE_CAP)
+        n_ev = mark(trace, n_ev, 0, 0, TRACE_CAP)
     lane = gl.arange(0, GROUP_SIZE, layout=LN)
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
@@ -70,6 +78,9 @@ def update_kernel_gluon(
     potential = gl.load(potential_ptr + offs, mask=mask)
     current = gl.load(current_ptr + offs, mask=mask)
     last_time = gl.load(last_time_ptr + offs, mask=mask)
+    if TRACE:
+        current = pin(current)
+        n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
 
     # delivery: this group's due slots in slot order; per slot the main run
     # in emission order, every entry's links in order -- as one link stream
@@ -90,6 +101,9 @@ def update_kernel_gluon(
     for k in range(k_lo, k_hi + 1):
         cell = pid * N_SLOTS + k % N_SLOTS
         nm = gl.minimum(gl.load(main_count + cell), MAIN_CAP)
+        if TRACE:
+            nm = pin_s(nm)
+            n_ev = mark(trace, n_ev, 2, nm, TRACE_CAP)
         for b0 in range(0, nm, ENTRY_BLOCK):
             em_ = b0 + ei < nm
             at = cell * MAIN_CAP + b0 + ei
@@ -108,6 +122,8 @@ def update_kernel_gluon(
             pos_p = gl.convert_layout(pos, LP)
             live_p = gl.convert_layout(n, LP) > 0  # segments are never empty
             gl.barrier()
+            if TRACE:
+                n_ev = mark(trace, n_ev, 3, n_links, TRACE_CAP)
             for s0 in range(0, n_links, STREAM):
                 # gather: one stream position per lane, in delivery order
                 q = s0 + qi
@@ -127,6 +143,8 @@ def update_kernel_gluon(
                 if LOG:
                     s_ent.store(ent)
                 gl.barrier()
+                if TRACE:
+                    n_ev = mark(trace, n_ev, 4, gl.minimum(n_links - s0, STREAM), TRACE_CAP)
                 # walk: U links per broadcast LDS read, received one by one
                 nq = gl.minimum(n_links - s0, STREAM)
                 for g in gl.static_range(STREAM // U):
@@ -154,11 +172,16 @@ def update_kernel_gluon(
                                         gl.store(rec + 2, srcword & 0xFFFFFF)
                                         gl.store(rec + 3, pid * GROUP_SIZE + t)
                                         gl.store(log_e + at_log, gl.load(_f32p(hdr + 3 * ENTRY_BLOCK + ent_u)))
+                if TRACE:
+                    current = pin(current)
+                    n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
                 gl.barrier()  # the stream is refilled next
         gl.store(main_count + cell, 0)
         gl.store(side_count + cell, 0)
     gl.store(received_ptr + offs, received, mask=mask)
     gl.store(n_received_ptr + offs, n_received, mask=mask)
+    if TRACE:
+        n_ev = mark(trace, n_ev, 6, 0, TRACE_CAP)
 
     # final propagation to the window end (PD14)
     time = t_end
@@ -188,6 +211,8 @@ def update_kernel_gluon(
     gl.store(potential_ptr + offs, potential, mask=mask)
     gl.store(current_ptr + offs, current, mask=mask)
     gl.store(last_time_ptr + offs, last_time, mask=mask)
+    if TRACE:
+        n_ev = mark(trace, n_ev, 7, 0, TRACE_CAP)
 
     # emission contract (uniform: already sorted), summary, source state
     if local_spike_count > LOCAL_SPIKE_CAP:
@@ -202,3 +227,6 @@ def update_kernel_gluon(
         gl.store(sum_min + (1 - p), float("inf"))
         gl.store(state_run, run_id)
         gl.store(state_end, t_end)
+    if TRACE:
+        n_ev = mark(trace, n_ev, 8, 0, TRACE_CAP)
+        trace_end(trace, n_ev)
