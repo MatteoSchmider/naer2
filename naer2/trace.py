@@ -86,8 +86,8 @@ def trace_end(trace, n_ev):
 class Trace:
     """A trace buffer for n_programs programs of up to cap events each."""
 
-    def __init__(self, n_programs: int, cap: int, device="cuda"):
-        self.n_programs, self.cap = n_programs, cap
+    def __init__(self, n_programs: int, cap: int, device="cuda", level: int = 1):
+        self.n_programs, self.cap, self.level = n_programs, cap, level
         self.buf = torch.zeros(n_programs * (TRACE_WORDS + 2 * cap), device=device, dtype=torch.int32)
 
     def decode(self, tags) -> list[dict]:

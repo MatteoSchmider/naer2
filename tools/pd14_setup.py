@@ -17,7 +17,9 @@ RES = 0.1  # ms: timestep, delay buckets and ring slots
 
 
 class PD14:
-    def __init__(self, G: int, backend="triton", walk=2, unroll=8, stream=64, warps_update=4, warps_intake=4):
+    def __init__(self, G: int, backend="triton", unroll=None, stream=None, warps_update=4, warps_intake=4,
+                 main_cap: int | None = None, entry_block: int | None = None):
+        """unroll / stream / entry_block: None = the backend's walk default (T.WALK)."""
         T.BACKEND = backend
         torch.cuda.set_device(0)
         torch.manual_seed(0)
@@ -27,7 +29,9 @@ class PD14:
         cortical = {p: names[len(p.shape)] for p in net.populations if len(p.shape) in names}
         self.pops = {name: T.Pop(len(p.shape), group_size=G) for p, name in cortical.items()}
         for p in self.pops.values():
-            p.walk, p.unroll, p.stream = walk, unroll, stream
+            p.unroll = unroll or p.unroll
+            p.stream = stream or p.stream
+            p.entry_block = entry_block or p.entry_block
         t0 = time.time()
         self.links = self.segments = 0
         for p, name in cortical.items():
@@ -38,12 +42,23 @@ class PD14:
             self.segments += sum(t.n_segments for t in topos)
             n_slots = int((max(float(t.bucket_mean.max()) for t in topos) + 0.2) / RES) + 2
             self.pops[name].connect([self.pops[cortical[c._source]] for c in conns], topos, n_slots,
-                                    main_cap=8 * G, side_cap=16)
+                                    main_cap=main_cap or 8 * G, side_cap=16)
         torch.cuda.synchronize()
         self.build_s = time.time() - t0
         del net
         self.zeros = {n: torch.zeros(p.n, device="cuda") for n, p in self.pops.items()}
         self.streams = {n: torch.cuda.Stream() for n in self.pops}
+
+    def fire_mask(self, r: int) -> dict:
+        """Which neurons fire in round r (deterministic per round)."""
+        g = torch.Generator(device="cuda").manual_seed(1000 + r)
+        return {n: torch.rand(p.n, device="cuda", generator=g) < RATE[n] * 1e-4 for n, p in self.pops.items()}
+
+    def fire_at(self, mask: dict, r: int) -> dict:
+        """Round r's stand-in fire times from a fire mask (fire times are
+        absolute: a neuron fires iff its time lies in the run's window)."""
+        t = 10.0 + RES * r
+        return {n: torch.where(m, t, math.inf) for n, m in mask.items()}
 
     def fire(self, r: int) -> dict:
         """Round r's stand-in fire times (deterministic per round)."""

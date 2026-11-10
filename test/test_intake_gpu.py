@@ -60,9 +60,16 @@ def _emission(groups: list[list[tuple[float, int]]], cap: int) -> EmissionBuffer
 
 def _ran(em: EmissionBuffer, window_end: float) -> None:
     """What the source's update kernel does on every run: bump its run id,
-    record its window end."""
+    record its window end, and write the run's summary count and flat spike
+    list (here in group order; the kernel's is arbitrary)."""
     em.state[0] += 1
     em.state[1:].view(torch.float32).fill_(window_end)
+    count, cap = em.count.tolist(), em.cap
+    idx = torch.tensor([g * cap + i for g, n in enumerate(count) for i in range(min(n, cap))], dtype=torch.int64)
+    em._sum_count[int(em.state[0]) % 2] = len(idx)
+    if len(idx):
+        em.flat_node[: len(idx)] = em.node[idx.to(em.node.device)]
+        em.flat_time[: len(idx)] = em.time[idx.to(em.node.device)]
 
 
 def _topology(n_src, n_tgt, group_size, delay="random", k=6, seed=0, weight=False):
@@ -116,6 +123,7 @@ class Reference:
                 self.mark = e
             t = topologies[c]
             offsets, gb, mean = t.seg_offsets.tolist(), t.seg_gb.tolist(), t.bucket_mean.tolist()
+            start = t.seg_start.tolist()
             for seg in range(offsets[s], offsets[s + 1]):
                 group, j = (gb[seg] >> 16) & 0xFFFF, gb[seg] & 0xFFFF
                 arrival = torch.tensor(e, dtype=torch.float32) + torch.tensor(mean[j], dtype=torch.float32)
@@ -124,18 +132,16 @@ class Reference:
                     self.far = True
                     continue
                 cell = group * self.n_slots + k % self.n_slots
-                (self.main if to_main else self.side)[cell].append((e, (c << 24) | s, seg))
+                (self.main if to_main else self.side)[cell].append(
+                    (e, (c << 24) | s, start[seg], start[seg + 1] - start[seg]))
 
 
 def _ring_contents(ring: Ring, which: str):
-    time, src, seg = (t.cpu() for t in getattr(ring, which))
+    """cell -> [(e, source word, first link, link count)] in run order."""
+    fields = [t.cpu() for t in getattr(ring, which)]
     counts = getattr(ring, f"{which}_count").tolist()
     cap = ring.main_cap if which == "main" else ring.side_cap
-    return {
-        k: list(zip(time[k * cap:k * cap + n].tolist(), src[k * cap:k * cap + n].tolist(),
-                    seg[k * cap:k * cap + n].tolist()))
-        for k, n in enumerate(counts)
-    }
+    return {k: list(zip(*(f[k * cap:k * cap + n].tolist() for f in fields))) for k, n in enumerate(counts)}
 
 
 def _check(ring: Ring, ref: Reference):
@@ -146,7 +152,7 @@ def _check(ring: Ring, ref: Reference):
             times = [e for e, *_ in got[k]]
             assert times == sorted(times), f"{which} run of cell {k} is not sorted: {times}"
             g = sorted(got[k])
-            w = sorted((torch.tensor(e, dtype=torch.float32).item(), s, seg) for e, s, seg in want[k])
+            w = sorted((torch.tensor(e, dtype=torch.float32).item(), *rest) for e, *rest in want[k])
             assert g == w, f"{which} run of cell {k}"
     if ref.mark != -math.inf:
         assert ring.watermark.item() == pytest.approx(ref.mark)
@@ -320,7 +326,7 @@ def test_far_future_arrivals_raise_not_implemented():
 
 def test_full_run_raises():
     topos = [_topology(2, 8, 8, delay=0.15, k=8, seed=c) for c in range(3)]  # one group, one bucket
-    ring = Ring(1, 8, 0.1, DEVICE, main_cap=5)
+    ring = Ring(1, 8, 0.1, DEVICE, main_cap=4)
     sources, active, window_end = _toy_round(0.0)  # 6 spikes into the same cell
     with pytest.raises(RuntimeError, match="capacity"):
         intake(ring, sources, active, window_end, topos)
@@ -328,7 +334,7 @@ def test_full_run_raises():
 
 def test_uniform_intake_tracing_changes_nothing():
     """The traced uniform intake fills the ring exactly like the untraced one
-    and stamps every taken-in spike."""
+    and its tiles account for every inserted segment."""
     from naer2.intake import INTAKE_TRACE_TAGS
     from naer2.trace import Trace
 
@@ -345,7 +351,14 @@ def test_uniform_intake_tracing_changes_nothing():
         rings.append(ring.main_count.cpu().clone())
         if traced:
             progs = trace.decode(INTAKE_TRACE_TAGS)
-            spikes = sum(1 for p in progs for tag, _, _ in p["events"] if tag == "inserted")
-            assert spikes == 12
+            segments = sum(aux for p in progs for tag, aux, _ in p["events"] if tag == "tile")
+            spikes = [(g * 8 + d) for g in range(4) for d in (0, 1, 5)]
+            offsets = topo.seg_offsets.tolist()
+            assert segments == sum(offsets[s + 1] - offsets[s] for s in spikes)
             assert all(p["events"][0][0] == "start" and p["events"][-1][0] == "end" for p in progs)
     assert torch.equal(rings[0], rings[1])
+
+
+def test_run_capacity_must_be_a_multiple_of_4():
+    with pytest.raises(ValueError, match="multiples of 4"):
+        Ring(1, 8, 0.1, DEVICE, main_cap=6)

@@ -3,7 +3,7 @@ cortical population's green-field update kernel (delivery + emission), then
 every intake kernel, populations on their own streams (or sequential).
 
     python tools/pd14_roundtrip.py G [--backend triton|gluon] [--warps-update 4]
-        [--warps-intake 4] [--sequential] [--rounds 50] [--walk 2] [--unroll 8]
+        [--warps-intake 4] [--sequential] [--rounds 50] [--unroll 8]
         [--stream 64] [--rdna2] [--breakdown]
 
 --rdna2: for the RX 6600 eGPU, with
@@ -22,9 +22,9 @@ ap.add_argument("--warps-update", type=int, default=4)
 ap.add_argument("--warps-intake", type=int, default=4)
 ap.add_argument("--sequential", action="store_true")
 ap.add_argument("--rounds", type=int, default=50)
-ap.add_argument("--walk", type=int, default=2)
-ap.add_argument("--unroll", type=int, default=8)
-ap.add_argument("--stream", type=int, default=64)
+ap.add_argument("--unroll", type=int, default=None)
+ap.add_argument("--stream", type=int, default=None)
+ap.add_argument("--entry-block", type=int, default=None)
 ap.add_argument("--rdna2", action="store_true")
 ap.add_argument("--breakdown", action="store_true")
 args = ap.parse_args()
@@ -36,8 +36,12 @@ import torch
 from pd14_setup import PD14
 
 WARMUP, ROUNDS, CONC = 20, args.rounds, not args.sequential
-b = PD14(args.G, args.backend, args.walk, args.unroll, args.stream, args.warps_update, args.warps_intake)
-fires = [b.fire(r) for r in range(WARMUP + 3 * ROUNDS)]
+b = PD14(args.G, args.backend, args.unroll, args.stream, args.warps_update, args.warps_intake,
+         entry_block=args.entry_block)
+# fire patterns: a pool of masks reused cyclically, turned into each round's
+# (absolute) fire times up front, so the timed loop launches only the kernels
+masks = [b.fire_mask(r) for r in range(min(WARMUP + 3 * ROUNDS, 200))]
+fires = [b.fire_at(masks[r % len(masks)], r) for r in range(WARMUP + 3 * ROUNDS)]
 for r in range(WARMUP):
     b.round(r, fires[r], CONC)
 torch.cuda.synchronize()
@@ -47,8 +51,9 @@ for r in range(WARMUP, WARMUP + ROUNDS):
 torch.cuda.synchronize()
 per_round = (time.perf_counter() - t0) / ROUNDS
 b.check()
-print(f"{torch.cuda.get_device_name(0)}: {args.backend:6s} G={args.G:4d} walk={args.walk} U={args.unroll} "
-      f"S={args.stream} warps update={args.warps_update} intake={args.warps_intake} "
+p0 = next(iter(b.pops.values()))
+print(f"{torch.cuda.get_device_name(0)}: {args.backend:6s} G={args.G:4d} U={p0.unroll} "
+      f"S={p0.stream} chunk={p0.entry_block} warps update={args.warps_update} intake={args.warps_intake} "
       f"{'streams' if CONC else 'sequential':10s} per round {per_round * 1e3:6.2f} ms  "
       f"(~{b.delivered() / (WARMUP + ROUNDS):,.0f} links delivered/round; {b.links / 1e6:.0f}M links, "
       f"locality {b.links / b.segments:.2f}, topologies built in {b.build_s:.0f}s)", flush=True)

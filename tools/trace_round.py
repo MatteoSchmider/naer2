@@ -22,8 +22,14 @@ ap = argparse.ArgumentParser()
 ap.add_argument("G", type=int)
 ap.add_argument("--backend", default="gluon", choices=["triton", "gluon"])
 ap.add_argument("--rounds", type=int, default=10)
-ap.add_argument("--unroll", type=int, default=8)
+ap.add_argument("--unroll", type=int, default=None)
 ap.add_argument("--rdna2", action="store_true")
+ap.add_argument("--main-cap", type=int, default=None)
+ap.add_argument("--heat", type=int, default=0,
+                help="untraced rounds before each mode, and HEAT // 20 between measured rounds, so power "
+                     "management keeps the clock up (short bursty runs stay at the lowest DPM level)")
+ap.add_argument("--entry-block", type=int, default=None)
+ap.add_argument("--stream", type=int, default=None)
 args = ap.parse_args()
 if args.rdna2:
     import rdna2  # noqa: F401
@@ -36,8 +42,17 @@ from pd14_setup import PD14
 
 US = 0.01  # REALTIME tick: 10 ns
 med = st.median
-b = PD14(args.G, args.backend, unroll=args.unroll)
-fires = [b.fire(r) for r in range(40 + 3 * args.rounds)]
+b = PD14(args.G, args.backend, unroll=args.unroll, stream=args.stream, main_cap=args.main_cap,
+         entry_block=args.entry_block)
+_masks = [b.fire_mask(r) for r in range(200)]
+
+
+class _Fires:  # round r's fire times, made on use from a cyclic pool of fire masks
+    def __getitem__(self, r):
+        return b.fire_at(_masks[r % len(_masks)], r)
+
+
+fires = _Fires()
 r = 0
 for _ in range(20):
     b.round(r, fires[r]); r += 1
@@ -65,9 +80,19 @@ def reset():
         t.buf.zero_()
 
 
+def heat(n):
+    global r
+    if n:
+        for _ in range(n):
+            b.round(r, fires[r]); r += 1
+        torch.cuda.synchronize()
+
+
 # ---- concurrent: the round timeline
 timeline = []
+heat(args.heat)
 for _ in range(args.rounds):
+    heat(args.heat // 20)
     reset()
     b.round(r, fires[r], intake_traces=itraces); r += 1
     torch.cuda.synchronize()
@@ -76,7 +101,9 @@ for _ in range(args.rounds):
 
 # ---- isolated: each kernel alone
 iso = defaultdict(list)
+heat(args.heat)
 for _ in range(args.rounds):
+    heat(args.heat // 20)
     reset()
     t = 10.0 + 0.1 * r
     for n, p in b.pops.items():
@@ -104,7 +131,9 @@ def union(intervals):
     return total
 
 
-print(f"{torch.cuda.get_device_name(0)} {args.backend} G={args.G} U={args.unroll}, "
+p0 = next(iter(b.pops.values()))
+print(f"{torch.cuda.get_device_name(0)} {args.backend} G={args.G} U={p0.unroll} "
+      f"chunk={p0.entry_block} stream={p0.stream}, "
       f"{args.rounds} rounds per mode\n")
 print("CONCURRENT (production): median over rounds, us")
 rows = defaultdict(list)
@@ -133,10 +162,9 @@ def phases(events, kind):
             if key is None:
                 key = "empty slots" if a == "slot" else "between blocks" if a == "walked" else f"{a}->{bb}"
         else:
-            key = {("start", "source"): "read source", ("source", "spike"): "first spike setup",
-                   ("spike", "inserted"): "insert", ("inserted", "spike"): "next spike",
-                   ("inserted", "end"): "finish", ("source", "end"): "no spikes",
-                   ("start", "end"): "not fresh"}.get((a, bb), f"{a}->{bb}")
+            key = {("start", "sources"): "read sources", ("sources", "tile"): "first tile",
+                   ("tile", "tile"): "later tiles", ("tile", "end"): "finish",
+                   ("sources", "end"): "no work"}.get((a, bb), f"{a}->{bb}")
         out[key] += cb - ca
     return out
 
@@ -174,8 +202,8 @@ for kind in ("update", "intake"):
             if kind == "update":
                 work["links"].append(sum(x for t_, x, _ in sum((q["events"] for q in ps), []) if t_ == "walked"))
             else:
-                ins = [x for q in ps for t_, x, _ in q["events"] if t_ == "inserted"]
-                work["spikes"].append(len(ins)); work["segments"].append(sum(ins))
+                tiles = [x for q in ps for t_, x, _ in q["events"] if t_ == "tile"]
+                work["tiles"].append(len(tiles)); work["segments"].append(sum(tiles))
         f = med(mhz) if mhz else 1
         w = " ".join(f"{key} {med(v):,.0f}" for key, v in work.items())
         print(f"  {kind + ' ' + n:14s} {len(rounds[0]):5d} {med(span):8.1f} {med(pmed):8.1f} {med(pmax):8.1f} "

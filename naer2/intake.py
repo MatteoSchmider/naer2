@@ -11,7 +11,10 @@ slot_width) and lives at index k % N_SLOTS. Each slot holds
   - a side run: out-of-order entries (emission-delayed, or below the
     watermark), kept sorted by emission time by insertion.
 An entry is one SEGMENT of one spike (see naer2/topology_new.py): emission
-time e, (connection << 24) | source neuron, segment index. A spike from
+time e, (connection << 24) | source neuron, and the segment's link range in
+its connection (first link, link count) -- intake reads it with the
+segment's (group, bucket) word, in the same round trip, so delivery goes
+from the entry straight to the links. A spike from
 source s expands into one entry per segment of s -- exactly the (group,
 bucket) pieces s has links in -- each into its group's slot of arrival
 e + mean delay of the segment's bucket. Delivery then walks the slot's
@@ -27,11 +30,16 @@ Two kernels:
     is a set of sorted runs), merge the runs pairwise bottom-up (log2(runs)
     passes of a binary-search rank merge, never a sort from scratch), then
     insert in e order.
-  intake_uniform_kernel (one program per chunk of source groups): the host
+  intake_uniform_kernel (a fixed grid of persistent programs): the host
     knows every entry of the round has the same emission time (all active
     sources emit bare n2.spike()). Order is then free and every segment
-    entry is inserted in parallel with atomics, straight from the emission
-    buffers. Such entries never need a side run; one that would sets flag 2.
+    entry is inserted in parallel with atomics. The work is read straight
+    off the sources' flat spike lists (see naer2/emission.py): per
+    connection, its source's fresh spikes times the connection's most
+    segments per source in blocks of ITEM_SEGS -- items (connection, spike,
+    segment block), strided over the programs, ITEMS at a time; a heavy
+    spike spreads over many programs, an empty source costs nothing. Such
+    entries never need a side run; one that would sets flag 2.
 
 An arrival before the ring position (already delivered) goes into the first
 undelivered slot (late, the timestep quantization); one at or past ring
@@ -49,10 +57,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .emission import EmissionBuffer, emission_ptrs
+from .emission import EmissionBuffer, emission_flat_ptrs, emission_ptrs
 from .spike_gather import _bit_length
 from .topology_new import TopologyNew, topology_ptrs
-from .trace import mark, pin_s, trace_begin, trace_end
+from .trace import mark, pin, pin_s, trace_begin, trace_end
 
 # TODO: run capacities are fixed constants for now; a burst (e.g. PD14's
 # 902-spike thalamic volley) lands in every slot of its delay range at once.
@@ -61,8 +69,9 @@ DEFAULT_MAIN_CAP = 2048  # PD14 at group size 512: ~280 entries per (group, slot
 DEFAULT_SIDE_CAP = 512
 _BLOCK = 128      # vector width of the general kernel
 _BLOCK_G = 1024   # source groups per gather chunk (general kernel)
-_BLOCK_B = 1      # source groups per program (uniform kernel): a group's few spikes per program
-_BLOCK_S = 512    # segments per insertion tile: ~one tile per spike (PD14: ~450 segments)
+_BLOCK_S = 512    # segments per insertion tile (general kernel): ~one tile per spike (PD14: ~450 segments)
+_ITEMS = 4        # uniform kernel: work items per program step
+_ITEM_SEGS = 128  # uniform kernel: segments per work item
 _N_FLAGS = 3      # run overflow, far future, uniform contract violated
 
 
@@ -76,20 +85,26 @@ def _f32(p):
 
 @triton.jit
 def _ring(ring, n_groups, N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr):
-    """Typed pointers into a Ring buffer, see Ring for the layout."""
+    """Typed pointers into a Ring buffer, see Ring for the layout: per run
+    kind (main, side) the four fields of an entry -- time, source word,
+    first link, link count -- then the per-cell counts; then watermark and
+    flags. Entries are 16-byte records: field f of the entry with record
+    index i (see _rec) is at field_ptr + 4 * i."""
     cells = n_groups * N_SLOTS
     main_time = ring
-    main_src = main_time + cells * MAIN_CAP
-    main_seg = main_src + cells * MAIN_CAP
-    side_time = main_seg + cells * MAIN_CAP
-    side_src = side_time + cells * SIDE_CAP
-    side_seg = side_src + cells * SIDE_CAP
-    main_count = side_seg + cells * SIDE_CAP
+    main_src = ring + 1
+    main_lo = ring + 2
+    main_n = ring + 3
+    side_time = ring + 4 * cells * MAIN_CAP
+    side_src = side_time + 1
+    side_lo = side_time + 2
+    side_n = side_time + 3
+    main_count = side_time + 4 * cells * SIDE_CAP
     side_count = main_count + cells
     watermark = side_count + cells
     return (
-        _f32(main_time), main_src, main_seg, main_count,
-        _f32(side_time), side_src, side_seg, side_count,
+        _f32(main_time), main_src, main_lo, main_n, main_count,
+        _f32(side_time), side_src, side_lo, side_n, side_count,
         _f32(watermark), watermark + 1,
     )
 
@@ -105,8 +120,8 @@ def _plan(plan, n_conns):
         base, base + n_conns,                                  # source n_groups, cap
         base + 2 * n_conns, base + 3 * n_conns,                # topology n_sources, n_segments
         base + 4 * n_conns, base + 5 * n_conns,                # topology n_buckets, n_links
-        base + 6 * n_conns,                                    # last-read run ids [2, n_conns]
-        base + 8 * n_conns,                                    # uniform programs: [conn | first group]
+        base + 6 * n_conns,                                    # topology: most segments of one source
+        base + 7 * n_conns,                                    # last-read run ids [2, n_conns]
     )
 
 
@@ -128,15 +143,25 @@ def _source(em_addr, em_n_groups, em_cap, last_read, c, n_conns, parity):
 
 
 @triton.jit
+def _rec(cell, pos, n_cells):
+    """Record index of entry pos of a cell's run. Runs are cut into cache
+    lines of 4 records and line b of every cell sits next to line b of all
+    the others: the live front of all cells is one dense region (intake's
+    appends and delivery's reads stay in few lines and pages), bursts reach
+    further back. Capacities are multiples of 4."""
+    return ((pos >> 2) * n_cells + cell) * 4 + (pos & 3)
+
+
+@triton.jit
 def _topology(topo_addr, t_n_sources, t_n_segments, t_n_buckets, t_n_links, c):
-    """Connection c's segment offsets, segment (group, bucket) words and
-    bucket mean delays (see naer2/topology_new.py)."""
+    """Connection c's segment offsets, segment link starts, segment (group,
+    bucket) words and bucket mean delays (see naer2/topology_new.py)."""
     buf = tl.load(topo_addr + c).to(tl.pointer_type(tl.int32))
-    seg_offsets, _start, seg_gb, bucket_mean, _target, _attrs = topology_ptrs(
+    seg_offsets, seg_start, seg_gb, bucket_mean, _target, _attrs = topology_ptrs(
         buf, tl.load(t_n_sources + c), tl.load(t_n_segments + c),
         tl.load(t_n_buckets + c), tl.load(t_n_links + c),
     )
-    return seg_offsets, seg_gb, bucket_mean
+    return seg_offsets, seg_start, seg_gb, bucket_mean
 
 
 # ------------------------------------------------------------ insertion
@@ -144,36 +169,42 @@ def _topology(topo_addr, t_n_sources, t_n_segments, t_n_buckets, t_n_links, c):
 
 @triton.jit
 def _insert_main(
-    e, srcword, seg_lo, seg_hi, seg_gb, bucket_mean,
-    main_time, main_src, main_seg, main_count, flags, ring_pos, slot_width,
+    e, srcword, seg_lo, seg_hi, seg_start, seg_gb, bucket_mean,
+    main_time, main_src, main_lo, main_n, main_count, flags, ring_pos, slot_width, n_cells,
     N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, BLOCK_S: tl.constexpr,
 ):
     """Append one entry per segment [seg_lo, seg_hi) of a spike to its
-    group's main run at its arrival slot, BLOCK_S segments at a time."""
+    group's main run at its arrival slot, BLOCK_S segments at a time. The
+    flag atomics only run when a flag is actually raised."""
     for t0 in range(seg_lo, seg_hi, BLOCK_S):
         seg = t0 + tl.arange(0, BLOCK_S)
         m = seg < seg_hi
         gb = tl.load(seg_gb + seg, mask=m, other=0)
+        lo = tl.load(seg_start + seg, mask=m, other=0)       # same round trip as gb
+        n = tl.load(seg_start + seg + 1, mask=m, other=0) - lo
         mean = tl.load(bucket_mean + (gb & 0xFFFF), mask=m, other=0.0)
         k = tl.maximum(tl.floor((e + mean) / slot_width).to(tl.int32), ring_pos)
         far = m & (k - ring_pos >= N_SLOTS)
-        tl.atomic_max(flags + 1, tl.max(far.to(tl.int32), axis=0))
+        if tl.max(far.to(tl.int32), axis=0) > 0:
+            tl.atomic_max(flags + 1, 1)
         w = m & ~far
         cell = ((gb >> 16) & 0xFFFF) * N_SLOTS + k % N_SLOTS
         pos = tl.atomic_add(main_count + cell, 1, mask=w)
         full = w & (pos >= MAIN_CAP)
-        tl.atomic_max(flags, tl.max(full.to(tl.int32), axis=0))
+        if tl.max(full.to(tl.int32), axis=0) > 0:
+            tl.atomic_max(flags, 1)
         w = w & ~full
-        at = cell * MAIN_CAP + pos
-        tl.store(main_time + at, e + tl.zeros_like(mean), mask=w)
-        tl.store(main_src + at, srcword + tl.zeros_like(seg), mask=w)
-        tl.store(main_seg + at, seg, mask=w)
+        at = _rec(cell, pos, n_cells)
+        tl.store(main_time + 4 * at, e + tl.zeros_like(mean), mask=w)
+        tl.store(main_src + 4 * at, srcword + tl.zeros_like(seg), mask=w)
+        tl.store(main_lo + 4 * at, lo, mask=w)
+        tl.store(main_n + 4 * at, n, mask=w)
 
 
 @triton.jit
 def _insert_side(
-    e, srcword, seg_lo, seg_hi, seg_gb, bucket_mean,
-    side_time, side_src, side_seg, side_count, flags, ring_pos, slot_width,
+    e, srcword, seg_lo, seg_hi, seg_start, seg_gb, bucket_mean,
+    side_time, side_src, side_lo, side_n, side_count, flags, ring_pos, slot_width, n_cells,
     N_SLOTS: tl.constexpr, SIDE_CAP: tl.constexpr, BLOCK: tl.constexpr,
 ):
     """Insert one entry per segment of a spike into its group's side run at
@@ -188,7 +219,6 @@ def _insert_side(
             tl.atomic_max(flags + 1, 1)
         else:
             cell = ((gb >> 16) & 0xFFFF) * N_SLOTS + k % N_SLOTS
-            base = cell * SIDE_CAP
             cnt = tl.load(side_count + cell)
             if cnt >= SIDE_CAP:
                 tl.atomic_max(flags, 1)
@@ -196,22 +226,29 @@ def _insert_side(
                 p = cnt
                 for s0 in range(0, cnt, BLOCK):
                     q = s0 + lanes
-                    v = tl.load(side_time + base + q, mask=q < cnt, other=0.0)
+                    v = tl.load(side_time + 4 * _rec(cell, q, n_cells), mask=q < cnt, other=0.0)
                     p = tl.minimum(p, tl.min(tl.where((q < cnt) & (v > e), q, cnt), axis=0))
                 tl.debug_barrier()
                 for s0 in range(0, cnt - p, BLOCK):  # shift [p, cnt) up by one, top first
                     q = cnt - 1 - s0 - lanes
                     qm = q >= p
-                    tv = tl.load(side_time + base + q, mask=qm)
-                    sv = tl.load(side_src + base + q, mask=qm)
-                    gv = tl.load(side_seg + base + q, mask=qm)
-                    tl.store(side_time + base + q + 1, tv, mask=qm)
-                    tl.store(side_src + base + q + 1, sv, mask=qm)
-                    tl.store(side_seg + base + q + 1, gv, mask=qm)
+                    src_at = 4 * _rec(cell, q, n_cells)
+                    dst_at = 4 * _rec(cell, q + 1, n_cells)
+                    tv = tl.load(side_time + src_at, mask=qm)
+                    sv = tl.load(side_src + src_at, mask=qm)
+                    lv = tl.load(side_lo + src_at, mask=qm)
+                    nv = tl.load(side_n + src_at, mask=qm)
+                    tl.store(side_time + dst_at, tv, mask=qm)
+                    tl.store(side_src + dst_at, sv, mask=qm)
+                    tl.store(side_lo + dst_at, lv, mask=qm)
+                    tl.store(side_n + dst_at, nv, mask=qm)
                     tl.debug_barrier()
-                tl.store(side_time + base + p, e)
-                tl.store(side_src + base + p, srcword)
-                tl.store(side_seg + base + p, seg)
+                lo = tl.load(seg_start + seg)
+                at = 4 * _rec(cell, p, n_cells)
+                tl.store(side_time + at, e)
+                tl.store(side_src + at, srcword)
+                tl.store(side_lo + at, lo)
+                tl.store(side_n + at, tl.load(seg_start + seg + 1) - lo)
                 tl.store(side_count + cell, cnt + 1)
         tl.debug_barrier()
 
@@ -251,10 +288,10 @@ def intake_kernel(
     BLOCK: tl.constexpr, BLOCK_G: tl.constexpr, BLOCK_S: tl.constexpr,
 ):
     (em_addr, topo_addr, _ssa, _lta, _ata, em_n_groups, em_cap, t_n_sources, t_n_segments,
-     t_n_buckets, t_n_links, last_read, _progs) = _plan(plan, n_conns)
+     t_n_buckets, t_n_links, _max_segs, last_read) = _plan(plan, n_conns)
     (a_time, a_node, a_conn, a_run, b_time, b_node, b_conn, b_run,
      run_start, run_tmp, window_end) = _scratch(scratch, batch_cap)
-    (main_time, main_src, main_seg, main_count, side_time, side_src, side_seg, side_count,
+    (main_time, main_src, main_lo, main_n, main_count, side_time, side_src, side_lo, side_n, side_count,
      watermark, flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
     lanes = tl.arange(0, BLOCK)
 
@@ -336,82 +373,145 @@ def intake_kernel(
         c = tl.load(a_conn + i)
         to_main = (e >= mark) & (e < tl.load(window_end + c))
         mark = tl.where(to_main, e, mark)
-        seg_offsets, seg_gb, bucket_mean = _topology(
+        seg_offsets, seg_start, seg_gb, bucket_mean = _topology(
             topo_addr, t_n_sources, t_n_segments, t_n_buckets, t_n_links, c
         )
         seg_lo = tl.load(seg_offsets + s)
         seg_hi = tl.load(seg_offsets + s + 1)
         if to_main:
-            _insert_main(e, (c << 24) | s, seg_lo, seg_hi, seg_gb, bucket_mean,
-                         main_time, main_src, main_seg, main_count, flags, ring_pos, slot_width,
-                         N_SLOTS, MAIN_CAP, BLOCK_S)
+            _insert_main(e, (c << 24) | s, seg_lo, seg_hi, seg_start, seg_gb, bucket_mean,
+                         main_time, main_src, main_lo, main_n, main_count, flags, ring_pos, slot_width,
+                         n_groups * N_SLOTS, N_SLOTS, MAIN_CAP, BLOCK_S)
         else:
-            _insert_side(e, (c << 24) | s, seg_lo, seg_hi, seg_gb, bucket_mean,
-                         side_time, side_src, side_seg, side_count, flags, ring_pos, slot_width,
-                         N_SLOTS, SIDE_CAP, BLOCK)
+            _insert_side(e, (c << 24) | s, seg_lo, seg_hi, seg_start, seg_gb, bucket_mean,
+                         side_time, side_src, side_lo, side_n, side_count, flags, ring_pos, slot_width,
+                         n_groups * N_SLOTS, N_SLOTS, SIDE_CAP, BLOCK)
     tl.store(watermark, mark)
 
 
 # ------------------------------------------------------------ uniform kernel
 
 
-INTAKE_TRACE_TAGS = ("start", "source", "spike", "inserted", "end")
+INTAKE_TRACE_TAGS = ("start", "sources", "tile", "end", "spikes", "segments", "appended")  # last 3: TRACE=2
+
+
+@triton.jit
+def _pick(onehot, v):
+    """Per row of onehot [ITEMS, MAX_CONNS] (an item's connection), that
+    connection's value of the per-connection vector v."""
+    return tl.sum(tl.where(onehot, v[None, :], tl.zeros_like(v)[None, :]), axis=1)
 
 
 @triton.jit(do_not_specialize=["n_conns", "n_groups", "ring_pos", "parity"])
 def intake_uniform_kernel(
     plan, ring, n_conns, n_groups, ring_pos, parity, slot_width, trace_ptr,
     N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
-    BLOCK_B: tl.constexpr, BLOCK_S: tl.constexpr,
+    MAX_CONNS: tl.constexpr, ITEMS: tl.constexpr, ITEM_SEGS: tl.constexpr,
     TRACE: tl.constexpr = 0, TRACE_CAP: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
+    n_progs = tl.num_programs(0)
     n_ev = tl.cast(0, tl.int32)
     if TRACE:  # see naer2/trace.py; tags INTAKE_TRACE_TAGS
         trace = trace_begin(trace_ptr, pid, TRACE_CAP)
         n_ev = mark(trace, n_ev, 0, 0, TRACE_CAP)
     (em_addr, topo_addr, _ssa, _lta, _ata, em_n_groups, em_cap, t_n_sources, t_n_segments,
-     t_n_buckets, t_n_links, last_read, progs) = _plan(plan, n_conns)
-    (main_time, main_src, main_seg, main_count, _st, _ss, _sg, _sc,
+     t_n_buckets, t_n_links, max_segs, last_read) = _plan(plan, n_conns)
+    (main_time, main_src, main_lo, main_n, main_count, _st, _ss, _sl, _sn, _sc,
      watermark, flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
 
-    c = tl.load(progs + pid)
-    node_p, time_p, count_p, src_groups, cap, wend, fresh = _source(
-        em_addr, em_n_groups, em_cap, last_read, c, n_conns, parity
-    )
-    if fresh:
-        lanes = tl.arange(0, BLOCK_B)
-        grp = tl.load(progs + tl.num_programs(0) + pid) + lanes
-        cnt = tl.minimum(tl.load(count_p + grp, mask=grp < src_groups, other=0), cap)
-        if TRACE:
-            n_ev = mark(trace, n_ev, 1, pin_s(tl.max(cnt, axis=0)), TRACE_CAP)
-        if tl.max(cnt, axis=0) > 0:
-            seg_offsets, seg_gb, bucket_mean = _topology(
-                topo_addr, t_n_sources, t_n_segments, t_n_buckets, t_n_links, c
-            )
-            wmark = tl.load(watermark)
-            for b in range(BLOCK_B):
-                g_src = tl.sum(tl.where(lanes == b, grp, 0), axis=0)
-                for l in range(tl.sum(tl.where(lanes == b, cnt, 0), axis=0)):
-                    e = tl.load(time_p + g_src * cap + l)
-                    s = tl.load(node_p + g_src * cap + l)
-                    main = (e >= wmark) & (e < wend)
-                    if main:
-                        seg_lo = tl.load(seg_offsets + s)
-                        seg_hi = tl.load(seg_offsets + s + 1)
-                        if TRACE:
-                            seg_hi = pin_s(seg_hi)
-                            n_ev = mark(trace, n_ev, 2, seg_hi - seg_lo, TRACE_CAP)
-                        _insert_main(e, (c << 24) | s, seg_lo, seg_hi,
-                                     seg_gb, bucket_mean, main_time, main_src, main_seg, main_count,
-                                     flags, ring_pos, slot_width, N_SLOTS, MAIN_CAP, BLOCK_S)
-                        tl.atomic_max(watermark, e)
-                        if TRACE:
-                            n_ev = mark(trace, n_ev, 3, seg_hi - seg_lo, TRACE_CAP)
-                    else:
-                        tl.atomic_max(flags + 2, 1)
+    # every program: what each connection's source emitted since this
+    # consumer last read it, as an item count (spikes x segment blocks)
+    cc = tl.arange(0, MAX_CONNS)
+    cm = cc < n_conns
+    src_groups = tl.load(em_n_groups + cc, mask=cm, other=0)
+    cap = tl.load(em_cap + cc, mask=cm, other=0)
+    ebuf = tl.load(em_addr + cc, mask=cm, other=0)
+    _n, _t, _c, run_p, wend_p, sum_count, _sm, _of = emission_ptrs(
+        ebuf.to(tl.pointer_type(tl.int32)), src_groups, cap)
+    run_id = tl.load(run_p, mask=cm, other=0)
+    fresh = cm & (run_id != tl.load(last_read + parity * n_conns + cc, mask=cm, other=0))
+    tl.store(last_read + (1 - parity) * n_conns + cc, run_id, mask=cm)  # idempotent across programs
+    n_spikes = tl.where(fresh, tl.minimum(tl.load(sum_count + run_id % 2, mask=fresh, other=0), src_groups * cap), 0)
+    blocks = (tl.load(max_segs + cc, mask=cm, other=0) + ITEM_SEGS - 1) // ITEM_SEGS
+    items = n_spikes * blocks
+    first = tl.cumsum(items, axis=0) - items
+    total = tl.sum(items, axis=0)
+    wend = tl.load(wend_p, mask=cm, other=0.0)
+    tbuf = tl.load(topo_addr + cc, mask=cm, other=0)
+    t_src = tl.load(t_n_sources + cc, mask=cm, other=0)
+    t_seg = tl.load(t_n_segments + cc, mask=cm, other=0)
+    t_bkt = tl.load(t_n_buckets + cc, mask=cm, other=0)
+    t_lnk = tl.load(t_n_links + cc, mask=cm, other=0)
+    wmark = tl.load(watermark)
     if TRACE:
-        n_ev = mark(trace, n_ev, 4, 0, TRACE_CAP)
+        n_ev = mark(trace, n_ev, 1, pin_s(total), TRACE_CAP)
+
+    e_max = tl.cast(float("-inf"), tl.float32)
+    violated = tl.cast(0, tl.int32)
+    li = tl.arange(0, ITEM_SEGS)
+    for t0 in range(pid * ITEMS, total, n_progs * ITEMS):
+        t = t0 + tl.arange(0, ITEMS)
+        tv = t < total
+        c = tl.maximum(tl.sum(((first[None, :] <= t[:, None]) & cm[None, :]).to(tl.int32), axis=1) - 1, 0)
+        oh = cc[None, :] == c[:, None]
+        blk = tl.maximum(_pick(oh, blocks), 1)
+        local = t - _pick(oh, first)
+        i = local // blk   # the spike within its source's flat list
+        j = local % blk    # the segment block within that spike
+        flat_node, flat_time = emission_flat_ptrs(
+            _pick(oh, ebuf).to(tl.pointer_type(tl.int32)), _pick(oh, src_groups), _pick(oh, cap))
+        s = tl.load(flat_node + i, mask=tv, other=0)
+        e = tl.load(flat_time + i, mask=tv, other=0.0)
+        if TRACE >= 2:
+            s = pin(s)
+            n_ev = mark(trace, n_ev, 4, 0, TRACE_CAP)
+        main = tv & (e >= wmark) & (e < _pick(oh, wend))
+        violated = tl.maximum(violated, tl.max((tv & ~main).to(tl.int32), axis=0))
+        seg_offsets, seg_start, seg_gb, bucket_mean, _tg, _at = topology_ptrs(
+            _pick(oh, tbuf).to(tl.pointer_type(tl.int32)), _pick(oh, t_src), _pick(oh, t_seg),
+            _pick(oh, t_bkt), _pick(oh, t_lnk))
+        seg_lo = tl.load(seg_offsets + s, mask=main, other=0) + j * ITEM_SEGS
+        seg_hi = tl.minimum(tl.load(seg_offsets + s + 1, mask=main, other=0), seg_lo + ITEM_SEGS)
+        seg = seg_lo[:, None] + li[None, :]
+        m = main[:, None] & (seg < seg_hi[:, None])
+        gb = tl.load(seg_gb[:, None] + seg, mask=m, other=0)
+        lo = tl.load(seg_start[:, None] + seg, mask=m, other=0)       # same round trip as gb
+        n = tl.load(seg_start[:, None] + seg + 1, mask=m, other=0) - lo
+        mean = tl.load(bucket_mean[:, None] + (gb & 0xFFFF), mask=m, other=0.0)
+        if TRACE >= 2:
+            mean = pin(mean)
+            n = pin(n)
+            n_ev = mark(trace, n_ev, 5, 0, TRACE_CAP)
+        k = tl.maximum(tl.floor((e[:, None] + mean) / slot_width).to(tl.int32), ring_pos)
+        far = m & (k - ring_pos >= N_SLOTS)
+        if tl.max(tl.max(far.to(tl.int32), axis=1), axis=0) > 0:
+            tl.atomic_max(flags + 1, 1)
+        w = m & ~far
+        cell = ((gb >> 16) & 0xFFFF) * N_SLOTS + k % N_SLOTS
+        pos = tl.atomic_add(main_count + cell, 1, mask=w)
+        full = w & (pos >= MAIN_CAP)
+        if tl.max(tl.max(full.to(tl.int32), axis=1), axis=0) > 0:
+            tl.atomic_max(flags, 1)
+        w = w & ~full
+        at = _rec(cell, pos, n_groups * N_SLOTS)
+        if TRACE >= 2:
+            at = pin(at)
+            n_ev = mark(trace, n_ev, 6, 0, TRACE_CAP)
+        tl.store(main_time + 4 * at, e[:, None] + tl.zeros_like(mean), mask=w)
+        tl.store(main_src + 4 * at, ((c << 24) | s)[:, None] + tl.zeros_like(seg), mask=w)
+        tl.store(main_lo + 4 * at, lo, mask=w)
+        tl.store(main_n + 4 * at, n, mask=w)
+        e_max = tl.maximum(e_max, tl.max(tl.where(main, e, float("-inf")), axis=0))
+        if TRACE:
+            n_ev = mark(trace, n_ev, 2, tl.sum(tl.sum(m.to(tl.int32), axis=1), axis=0), TRACE_CAP)
+    # once per program, and only when needed
+    if violated > 0:
+        tl.atomic_max(flags + 2, 1)
+    if e_max > float("-inf"):
+        tl.atomic_max(watermark, e_max)
+    if TRACE:
+        n_ev = mark(trace, n_ev, 3, 0, TRACE_CAP)
         trace_end(trace, n_ev)
 
 
@@ -421,22 +521,25 @@ def intake_uniform_kernel(
 class Ring:
     """One consumer's rings of arrival slots, one ring per target group
     (see the module docstring), as one int32 buffer: per (group, slot) cell
-    a main run (time, (conn << 24) | source, segment; MAIN_CAP each) and a
-    side run (SIDE_CAP each), then main counts, side counts, the watermark
-    (float32) and the flags. Cell of (group g, slot k): g * n_slots +
-    k % n_slots."""
+    a main run of MAIN_CAP entries and a side run of SIDE_CAP, each entry
+    one 16-byte record (time, (conn << 24) | source, first link, link
+    count), interleaved by cache line across cells (see _rec); then main
+    counts, side counts, the watermark (float32) and the flags. Cell of
+    (group g, slot k): g * n_slots + k % n_slots. main / side: the four
+    fields as copies in run order, entry pos of cell c at c * cap + pos
+    (for inspection and tests)."""
 
     def __init__(self, n_groups: int, n_slots: int, slot_width: float, device,
                  main_cap: int = DEFAULT_MAIN_CAP, side_cap: int = DEFAULT_SIDE_CAP):
         self.n_groups, self.n_slots, self.slot_width = n_groups, n_slots, slot_width
+        if main_cap % 4 or side_cap % 4:
+            raise ValueError("run capacities must be multiples of 4 (entries are interleaved by cache line)")
         self.main_cap, self.side_cap = main_cap, side_cap
         cells = n_groups * n_slots
         m, s = cells * main_cap, cells * side_cap
-        self.buf = torch.zeros(3 * m + 3 * s + 2 * cells + 1 + _N_FLAGS, device=device, dtype=torch.int32)
-        self.main = (self.buf[:m].view(torch.float32), self.buf[m:2 * m], self.buf[2 * m:3 * m])
-        o = 3 * m
-        self.side = (self.buf[o:o + s].view(torch.float32), self.buf[o + s:o + 2 * s], self.buf[o + 2 * s:o + 3 * s])
-        o += 3 * s
+        self.buf = torch.zeros(4 * m + 4 * s + 2 * cells + 1 + _N_FLAGS, device=device, dtype=torch.int32)
+        self._records = (self.buf[:4 * m].view(m, 4), self.buf[4 * m:4 * m + 4 * s].view(s, 4))
+        o = 4 * m + 4 * s
         self.main_count = self.buf[o:o + cells]
         self.side_count = self.buf[o + cells:o + 2 * cells]
         self.watermark = self.buf[o + 2 * cells:o + 2 * cells + 1].view(torch.float32)
@@ -446,6 +549,22 @@ class Ring:
 
     def cell(self, group: int, slot: int) -> int:
         return group * self.n_slots + slot % self.n_slots
+
+    def _fields(self, rec: torch.Tensor, cap: int):
+        cells = self.n_groups * self.n_slots
+        cell = torch.arange(cells, device=rec.device).repeat_interleave(cap)
+        pos = torch.arange(cap, device=rec.device).repeat(cells)
+        r = rec[((pos >> 2) * cells + cell) * 4 + (pos & 3)]  # see _rec
+        return r.view(torch.float32)[:, 0], r[:, 1], r[:, 2], r[:, 3]
+
+    @property
+    def main(self):
+        """(time, source word, first link, link count) of the main runs, run order."""
+        return self._fields(self._records[0], self.main_cap)
+
+    @property
+    def side(self):
+        return self._fields(self._records[1], self.side_cap)
 
     def check(self) -> None:
         overflow, far, uniform = self.flags.tolist()
@@ -471,13 +590,15 @@ class IntakePlan:
     TopologyNew address and the addresses of that topology's seg_start,
     link_target and attribute arrays (int64 each; the update kernel's
     delivery walk reads links through these), the source's group count and cap,
-    the topology's source, segment, bucket and link counts, the last-read
-    run ids (double-buffered) and the uniform kernel's program table
-    (connection, first source group). Emission buffers and topologies must
-    stay allocated (they do: one per population / connection, for good).
-    run() copies nothing: it launches with scalars only."""
+    the topology's source, segment, bucket and link counts and its most
+    segments of one source, and the last-read run ids (double-buffered).
+    Emission buffers and topologies must stay allocated (they do: one per
+    population / connection, for good). run() copies nothing: it launches
+    with scalars only. n_progs: the uniform kernel's (persistent) grid,
+    default 4 programs per compute unit."""
 
-    def __init__(self, ring: Ring, emissions: list[EmissionBuffer], topologies: list[TopologyNew]):
+    def __init__(self, ring: Ring, emissions: list[EmissionBuffer], topologies: list[TopologyNew],
+                 n_progs: int | None = None):
         device = ring.buf.device
         n = len(emissions)
         if n > 256:
@@ -489,10 +610,12 @@ class IntakePlan:
                 raise ValueError("every incoming topology must use the consumer's group layout")
         self.ring, self.n_conns, self.parity = ring, n, 0
         self.emissions, self.topologies = emissions, topologies
-        progs = [(c, g0) for c, em in enumerate(emissions) for g0 in range(0, em.n_groups, _BLOCK_B)]
-        self.n_progs = max(len(progs), 1)
+        if n_progs is None:
+            n_progs = 4 * torch.cuda.get_device_properties(device).multi_processor_count if device.type == "cuda" else 16
+        self.n_progs = n_progs
+        self.items, self.item_segs = _ITEMS, _ITEM_SEGS  # uniform kernel: items per step, segments per item
 
-        plan = torch.zeros(18 * n + 2 * self.n_progs, dtype=torch.int32)
+        plan = torch.zeros(19 * n, dtype=torch.int32)
         links = [t.link_addresses() for t in topologies]
         plan[: 10 * n].view(torch.int64)[:] = torch.tensor(
             [em.buf.data_ptr() for em in emissions] + [t.buf.data_ptr() for t in topologies]
@@ -503,11 +626,9 @@ class IntakePlan:
             [em.n_groups for em in emissions], [em.cap for em in emissions],
             [t.n_sources for t in topologies], [t.n_segments for t in topologies],
             [t.n_buckets for t in topologies], [t.n_links for t in topologies],
+            [int(t.seg_offsets.diff().max()) if t.n_sources else 0 for t in topologies],
         )):
             plan[(10 + i) * n:(11 + i) * n] = torch.tensor(values, dtype=torch.int32)
-        table = plan[18 * n:]
-        table[: len(progs)] = torch.tensor([c for c, _ in progs], dtype=torch.int32)
-        table[self.n_progs:self.n_progs + len(progs)] = torch.tensor([g for _, g in progs], dtype=torch.int32)
         self.plan = plan.to(device)
 
         self.batch_cap = sum(em.n_groups * em.cap for em in emissions) + 1
@@ -516,17 +637,19 @@ class IntakePlan:
     def run(self, uniform_time: bool = False, num_warps: int = 4, trace=None) -> None:
         """trace: a naer2.trace.Trace over n_progs programs (uniform kernel only)."""
         ring = self.ring
-        consts = dict(N_SLOTS=ring.n_slots, MAIN_CAP=ring.main_cap, SIDE_CAP=ring.side_cap, BLOCK_S=_BLOCK_S,
-                      num_warps=num_warps)
+        consts = dict(N_SLOTS=ring.n_slots, MAIN_CAP=ring.main_cap, SIDE_CAP=ring.side_cap, num_warps=num_warps)
         if uniform_time:
             intake_uniform_kernel[(self.n_progs,)](
                 self.plan, ring.buf, self.n_conns, ring.n_groups, ring.ring_pos, self.parity,
-                ring.slot_width, trace.buf if trace is not None else ring.buf, BLOCK_B=_BLOCK_B,
-                TRACE=int(trace is not None), TRACE_CAP=trace.cap if trace is not None else 1, **consts,
+                ring.slot_width, trace.buf if trace is not None else ring.buf,
+                MAX_CONNS=triton.next_power_of_2(max(self.n_conns, 1)), ITEMS=self.items, ITEM_SEGS=self.item_segs,
+                TRACE=trace.level if trace is not None else 0, TRACE_CAP=trace.cap if trace is not None else 1,
+                **consts,
             )
         else:
             intake_kernel[(1,)](
                 self.plan, self.scratch, ring.buf, self.n_conns, ring.n_groups, self.batch_cap,
-                ring.ring_pos, self.parity, ring.slot_width, BLOCK=_BLOCK, BLOCK_G=_BLOCK_G, **consts,
+                ring.ring_pos, self.parity, ring.slot_width, BLOCK=_BLOCK, BLOCK_G=_BLOCK_G, BLOCK_S=_BLOCK_S,
+                **consts,
             )
         self.parity ^= 1

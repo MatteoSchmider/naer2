@@ -18,6 +18,16 @@ update kernel and intake both reach through `emission_ptrs`:
                             earliest e (float32); the run with parity p
                             resets parity 1 - p for the next run
   overflow [1]              a group emitted more than cap spikes
+  flat    [2, n_groups * cap]  the run's spikes once more, as one flat list
+                            (node, then e as float32): a group with n spikes
+                            writes them at [base, base + n), base = what its
+                            summary-count atomic returned -- so the list's
+                            length is the summary count, there are no gaps,
+                            and it costs no extra atomic. Order across
+                            groups is arbitrary (fine for uniform emission
+                            times; the per-group sorted runs above stay for
+                            the general intake). Intake indexes spike i of a
+                            source directly.
 """
 
 import math
@@ -42,6 +52,13 @@ def emission_ptrs(buf, n_groups, cap):
     )
 
 
+@triton.jit
+def emission_flat_ptrs(buf, n_groups, cap):
+    """The flat spike list of an emission buffer: node, time."""
+    flat = buf + 2 * n_groups * cap + n_groups + 7
+    return flat, (flat + n_groups * cap).to(tl.pointer_type(tl.float32))
+
+
 class EmissionBuffer:
     """See the module docstring. Views: node, time, count, state, overflow;
     cap, n_groups."""
@@ -49,7 +66,7 @@ class EmissionBuffer:
     def __init__(self, n_groups: int, cap: int, device):
         self.n_groups, self.cap = n_groups, cap
         s = n_groups * cap
-        self.buf = torch.zeros(2 * s + n_groups + 2 + 4 + 1, device=device, dtype=torch.int32)
+        self.buf = torch.zeros(4 * s + n_groups + 2 + 4 + 1, device=device, dtype=torch.int32)
         self.node = self.buf[:s]
         self.time = self.buf[s:2 * s].view(torch.float32)
         self.count = self.buf[2 * s:2 * s + n_groups]
@@ -57,7 +74,10 @@ class EmissionBuffer:
         self._sum_count = self.buf[2 * s + n_groups + 2:2 * s + n_groups + 4]
         self._sum_min = self.buf[2 * s + n_groups + 4:2 * s + n_groups + 6].view(torch.float32)
         self._sum_min.fill_(math.inf)
-        self.overflow = self.buf[2 * s + n_groups + 6:]
+        self.overflow = self.buf[2 * s + n_groups + 6:2 * s + n_groups + 7]
+        o = 2 * s + n_groups + 7
+        self.flat_node = self.buf[o:o + s]
+        self.flat_time = self.buf[o + s:o + 2 * s].view(torch.float32)
 
     @property
     def run_id(self) -> int:

@@ -1,6 +1,6 @@
 """Compile the green-field update kernel for a small consumer and summarize
 its ISA: registers, LDS, and per loop body the instruction mix (what one
-iteration costs). args: G [backend triton|gluon] [walk] [unroll]"""
+iteration costs). args: G [backend triton|gluon] [unroll]"""
 import math
 import os
 import re
@@ -14,11 +14,10 @@ from test.test_intake_gpu import _topology
 
 G = int(sys.argv[1])
 backend = sys.argv[2] if len(sys.argv) > 2 else "triton"
-walk = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-unroll = int(sys.argv[4]) if len(sys.argv) > 4 else 8
+unroll = int(sys.argv[3]) if len(sys.argv) > 3 else 8
 T.BACKEND = backend
 a, c = T.Pop(2 * G, group_size=G), T.Pop(2 * G, group_size=G)
-c.walk, c.unroll = walk, unroll
+c.unroll = unroll
 c.connect([a], [_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1, weight=True)], n_slots=8)
 c.run(1.0, 1.1, torch.full((2 * G,), math.inf))
 torch.cuda.synchronize()
@@ -28,7 +27,7 @@ else:
     kernel = T.update_kernel
 k = [k for cache in kernel.device_caches.values() for k in cache[0].values()][-1]
 asm = k.asm["amdgcn"]
-print(f"{backend} G={G} walk={walk} U={unroll}: vgpr {k.n_regs}, spills {k.n_spills}, LDS bytes {k.metadata.shared}")
+print(f"{backend} G={G} U={unroll}: vgpr {k.n_regs}, spills {k.n_spills}, LDS bytes {k.metadata.shared}")
 lines = [l.split(";")[0].strip() for l in asm.split("\n")]
 labels = {l[:-1]: i for i, l in enumerate(lines) if re.match(r"^\.LBB\w+:$", l)}
 print("   loop head        instrs barrier  ds  loads waitcnt valu")

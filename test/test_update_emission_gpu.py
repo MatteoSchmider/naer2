@@ -40,8 +40,8 @@ import torch
 import triton
 import triton.language as tl
 
-from naer2.emission import EmissionBuffer, emission_ptrs
-from naer2.intake import IntakePlan, Ring, _plan, _ring
+from naer2.emission import EmissionBuffer, emission_flat_ptrs, emission_ptrs
+from naer2.intake import IntakePlan, Ring, _plan, _rec, _ring
 from naer2.spike_gather import _from_ordered_u32, _to_ordered_u32
 from naer2.topology import Topology
 from naer2.topology_new import TopologyNew, topology_ptrs
@@ -55,6 +55,16 @@ pytestmark = pytest.mark.skipif(
 DEVICE = "cuda:0"
 GROUP_SIZE = 32
 BACKEND = "triton"  # Pop's update kernel; test_update_gluon_gpu.py reruns the uniform tests on "gluon"
+# delivery walk defaults per backend: entries per chunk (the Triton
+# kernel's entry search keeps 32), link stream length, links per memory /
+# LDS round trip, Gluon walk loop unrolled. Gluon's from tools/walk_sweep.py
+# (PD14, G=256, 780M): chunk 64 / stream 128 / U 8 with the walk as a loop
+# beat chunk 32 by 17% (kernels alone) and 11% (concurrent); larger chunks
+# or U cost more in registers (occupancy) than they save.
+WALK = {
+    "triton": dict(entry_block=32, stream=64, unroll=8, unroll_walk=False),
+    "gluon": dict(entry_block=64, stream=128, unroll=8, unroll_walk=False, prefetch=False),
+}
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -78,50 +88,6 @@ TRACE_TAGS = ("start", "state", "slot", "fetched", "staged", "entry", "tail", "d
 (T_START, T_STATE, T_SLOT, T_FETCHED, T_STAGED, T_ENTRY, T_TAIL, T_DELIVERED, T_SENT,
  T_END) = (tl.constexpr(i) for i in range(len(TRACE_TAGS)))
 _realtime, _pin, _pin_s, _mark = realtime, pin, pin_s, mark
-
-
-@triton.jit
-def _receive(tgt, w, m, k, e, c, src, pid, current, received, n_received, mask,
-             log_ptr, log_e, log_cap, GROUP_SIZE: tl.constexpr, LOG: tl.constexpr):
-    """Deliver one entry's links (tgt: target within the group, w: weight,
-    m: valid) to the group: per target summed weight (a multapse sums) by a
-    one-hot compare in registers, then the receive -- PD14's current +=
-    weight, plus the stand-in's received sum, link count and log."""
-    lane = tl.arange(0, GROUP_SIZE)
-    hit = (lane[:, None] == tgt[None, :]) & m[None, :]
-    edge_weight = tl.sum(tl.where(hit, w[None, :], 0.0), axis=1)
-    hits = tl.sum(hit.to(tl.int32), axis=1)
-    is_target = (hits > 0) & mask
-    current = tl.where(is_target, current + edge_weight, current)  # PD14 receive
-    received = tl.where(is_target, received + edge_weight, received)
-    n_received = n_received + tl.where(mask, hits, 0)
-    if LOG:
-        at = tl.atomic_add(log_ptr + tl.zeros_like(tgt), 1, mask=m)
-        ok = m & (at < log_cap)
-        rec = log_ptr + 1 + 4 * at
-        tl.store(rec, k + tl.zeros_like(tgt), mask=ok)
-        tl.store(rec + 1, c + tl.zeros_like(tgt), mask=ok)
-        tl.store(rec + 2, src + tl.zeros_like(tgt), mask=ok)
-        tl.store(rec + 3, pid * GROUP_SIZE + tgt, mask=ok)
-        tl.store(log_e + at, e + tl.zeros_like(w), mask=ok)
-    return current, received, n_received
-
-
-@triton.jit
-def _walk(lo, hi, link_target_addr, attr_addr, k, e, c, src, pid, current, received, n_received, mask,
-          log_ptr, log_e, log_cap, GROUP_SIZE: tl.constexpr, MAX_L: tl.constexpr, LOG: tl.constexpr):
-    """Deliver links [lo, hi) of connection c, MAX_L at a time, from memory."""
-    ltp = tl.load(link_target_addr + c).to(tl.pointer_type(tl.int16))
-    atp = tl.load(attr_addr + c).to(tl.pointer_type(tl.float32))
-    for l0 in range(lo, hi, MAX_L):
-        lk = l0 + tl.arange(0, MAX_L)
-        lm = lk < hi
-        tgt = tl.load(ltp + lk, mask=lm, other=0).to(tl.int32) & 0xFFFF
-        w = tl.load(atp + lk, mask=lm, other=0.0)
-        current, received, n_received = _receive(
-            tgt, w, lm, k, e, c, src, pid, current, received, n_received, mask,
-            log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
-    return current, received, n_received
 
 
 @triton.jit
@@ -178,8 +144,8 @@ def update_kernel(
     emission, run_id, t_start, t_end, trace_ptr,
     GROUP_SIZE: tl.constexpr, LOCAL_SPIKE_CAP: tl.constexpr, UNIFORM_TIME: tl.constexpr,
     N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
-    ENTRY_BLOCK: tl.constexpr, MAX_L: tl.constexpr, LOG: tl.constexpr,
-    TRACE: tl.constexpr = 0, TRACE_CAP: tl.constexpr = 1, WALK: tl.constexpr = 2,
+    ENTRY_BLOCK: tl.constexpr, LOG: tl.constexpr,
+    TRACE: tl.constexpr = 0, TRACE_CAP: tl.constexpr = 1,
     STREAM: tl.constexpr = 64, U: tl.constexpr = 8,
 ):
     pid = tl.program_id(0)
@@ -205,20 +171,18 @@ def update_kernel(
 
     # delivery: this group's due slots, in slot order; within a slot main
     # and side runs merged by emission time; each entry is one segment, i.e.
-    # a contiguous range of this group's own links, delivered one entry at a
-    # time in emission order
-    (_em_addr, _topo_addr, seg_start_addr, link_target_addr, attr_addr, _eng, _ecap, _tns, _tnseg,
+    # a contiguous range of this group's own links (its ring entry says
+    # which), delivered in emission order, its links in order
+    (_em_addr, _topo_addr, _seg_start_addr, link_target_addr, attr_addr, _eng, _ecap, _tns, _tnseg,
      _tnb, _tnl, _last_read, _progs) = _plan(plan, n_conns)
-    (main_time, main_src, main_seg, main_count, side_time, side_src, side_seg, side_count,
+    (main_time, main_src, main_lo, main_n, main_count, side_time, side_src, side_lo, side_n, side_count,
      _watermark, _flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
     received = tl.load(received_ptr + offs, mask=mask, other=0.0)
     n_received = tl.load(n_received_ptr + offs, mask=mask, other=0)
     log_e = (log_ptr + 4 * log_cap + 1).to(tl.pointer_type(tl.float32))
     ei = tl.arange(0, ENTRY_BLOCK)
-    li = tl.arange(0, MAX_L)
-    buf_hdr = scratch + pid * ENTRY_BLOCK * (4 + 2 * MAX_L)  # this program's delivery buffer
-    buf_link = buf_hdr + 4 * ENTRY_BLOCK
-    buf_stream = buf_link  # WALK 2: the link stream (target, weight, entry) after the headers
+    buf_hdr = scratch + pid * (4 * ENTRY_BLOCK + 3 * STREAM)  # this program's delivery buffer:
+    buf_stream = buf_hdr + 4 * ENTRY_BLOCK                     # chunk headers, then the link stream
     qi = tl.arange(0, STREAM)
     for k in range(k_lo, k_hi + 1):
         time = (k + 0.5) * slot_width  # every delivery of a slot at its centre
@@ -229,194 +193,96 @@ def update_kernel(
             nm = _pin_s(nm)
             n_ev = _mark(trace, n_ev, T_SLOT, nm, TRACE_CAP)
         if ns == 0:
-            # main run only (always, for uniform emissions): prefetch the
-            # headers and first MAX_L links of ENTRY_BLOCK entries in one go
-            # (bandwidth-bound), then deliver them one by one, in order
+            # main run only (always, for uniform emissions), ENTRY_BLOCK
+            # entries per chunk: the chunk's links become one stream in
+            # delivery order (entry, then link -- long segments whole),
+            # gathered one link per lane (bandwidth-bound), then walked U
+            # links per memory round trip, each link a uniform scalar every
+            # lane compares against (the scalar receive)
             for b0 in range(0, nm, ENTRY_BLOCK):
                 em_ = b0 + ei < nm
-                at = cell * MAIN_CAP + b0 + ei
-                ev = tl.load(main_time + at, mask=em_, other=0.0)
-                srcw = tl.load(main_src + at, mask=em_, other=0)
-                seg = tl.load(main_seg + at, mask=em_, other=0)
-                cv = srcw >> 24
-                ss = tl.load(seg_start_addr + cv, mask=em_, other=0).to(tl.pointer_type(tl.int32))
-                lo = tl.load(ss + seg, mask=em_, other=0)
-                hi = tl.load(ss + seg + 1, mask=em_, other=0)
-                ltp = tl.load(link_target_addr + cv, mask=em_, other=0).to(tl.pointer_type(tl.int16))
-                atp = tl.load(attr_addr + cv, mask=em_, other=0).to(tl.pointer_type(tl.float32))
-                if WALK == 2:
-                    # scalar receive: the chunk's links become one stream in
-                    # delivery order (entry, then link -- long segments
-                    # whole), gathered one link per lane (bandwidth-bound),
-                    # then walked U links per memory round trip, each link a
-                    # uniform scalar every lane compares against
-                    n = tl.where(em_, hi - lo, 0)
-                    pos = tl.cumsum(n, axis=0) - n  # stream position of each entry's first link
-                    n_links = tl.sum(n, axis=0)
-                    tl.store(buf_hdr + ei, lo)
-                    tl.store(buf_hdr + ENTRY_BLOCK + ei, pos)
-                    tl.store(buf_hdr + 2 * ENTRY_BLOCK + ei, srcw)
-                    tl.store(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ei), ev)
+                at = _rec(cell, b0 + ei, n_groups * N_SLOTS)
+                ev = tl.load(main_time + 4 * at, mask=em_, other=0.0)  # 16-byte records
+                srcw = tl.load(main_src + 4 * at, mask=em_, other=0)
+                lo = tl.load(main_lo + 4 * at, mask=em_, other=0)
+                n = tl.load(main_n + 4 * at, mask=em_, other=0)
+                pos = tl.cumsum(n, axis=0) - n  # stream position of each entry's first link
+                n_links = tl.sum(n, axis=0)
+                tl.store(buf_hdr + ei, lo)
+                tl.store(buf_hdr + ENTRY_BLOCK + ei, pos)
+                tl.store(buf_hdr + 2 * ENTRY_BLOCK + ei, srcw)
+                tl.store(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ei), ev)
+                tl.debug_barrier()
+                if TRACE:
+                    n_ev = _mark(trace, n_ev, T_FETCHED, n_links, TRACE_CAP)
+                for s0 in range(0, n_links, STREAM):
+                    q = s0 + qi
+                    qv = q < n_links
+                    # entry of stream position q: the last one starting at or before it
+                    ent = tl.sum(((pos[None, :] <= q[:, None]) & em_[None, :]).to(tl.int32), axis=1) - 1
+                    ent = tl.maximum(ent, 0)
+                    lo_q = tl.load(buf_hdr + ent, mask=qv, other=0)
+                    pos_q = tl.load(buf_hdr + ENTRY_BLOCK + ent, mask=qv, other=0)
+                    c_q = tl.load(buf_hdr + 2 * ENTRY_BLOCK + ent, mask=qv, other=0) >> 24
+                    ltp_q = tl.load(link_target_addr + c_q, mask=qv, other=0).to(tl.pointer_type(tl.int16))
+                    atp_q = tl.load(attr_addr + c_q, mask=qv, other=0).to(tl.pointer_type(tl.float32))
+                    l_q = lo_q + q - pos_q
+                    t_q = tl.load(ltp_q + l_q, mask=qv, other=0).to(tl.int32) & 0xFFFF
+                    w_q = tl.load(atp_q + l_q, mask=qv, other=0.0)
+                    tl.store(buf_stream + qi, tl.where(qv, t_q, -1))
+                    tl.store(_f32p(buf_stream + STREAM + qi), w_q)
+                    if LOG:
+                        tl.store(buf_stream + 2 * STREAM + qi, ent)
                     tl.debug_barrier()
                     if TRACE:
-                        n_ev = _mark(trace, n_ev, T_FETCHED, n_links, TRACE_CAP)
-                    for s0 in range(0, n_links, STREAM):
-                        q = s0 + qi
-                        qv = q < n_links
-                        # entry of stream position q: the last one starting at or before it
-                        ent = tl.sum(((pos[None, :] <= q[:, None]) & em_[None, :]).to(tl.int32), axis=1) - 1
-                        ent = tl.maximum(ent, 0)
-                        lo_q = tl.load(buf_hdr + ent, mask=qv, other=0)
-                        pos_q = tl.load(buf_hdr + ENTRY_BLOCK + ent, mask=qv, other=0)
-                        c_q = tl.load(buf_hdr + 2 * ENTRY_BLOCK + ent, mask=qv, other=0) >> 24
-                        ltp_q = tl.load(link_target_addr + c_q, mask=qv, other=0).to(tl.pointer_type(tl.int16))
-                        atp_q = tl.load(attr_addr + c_q, mask=qv, other=0).to(tl.pointer_type(tl.float32))
-                        l_q = lo_q + q - pos_q
-                        t_q = tl.load(ltp_q + l_q, mask=qv, other=0).to(tl.int32) & 0xFFFF
-                        w_q = tl.load(atp_q + l_q, mask=qv, other=0.0)
-                        tl.store(buf_stream + qi, tl.where(qv, t_q, -1))
-                        tl.store(_f32p(buf_stream + STREAM + qi), w_q)
-                        if LOG:
-                            tl.store(buf_stream + 2 * STREAM + qi, ent)
-                        tl.debug_barrier()
-                        if TRACE:
-                            n_ev = _mark(trace, n_ev, T_STAGED, 0, TRACE_CAP)
-                        nq = tl.minimum(n_links - s0, STREAM)
-                        for u0 in range(0, nq, U):
-                            for u in tl.static_range(U):
-                                ok = u0 + u < nq
-                                t = tl.load(buf_stream + u0 + u, mask=ok, other=-1)
-                                w = tl.load(_f32p(buf_stream + STREAM + u0 + u), mask=ok, other=0.0)
-                                c = tl.cast(0, tl.int32)
-                                src = tl.cast(0, tl.int32)
-                                e = tl.cast(0.0, tl.float32)
-                                if LOG:
-                                    ent_j = tl.load(buf_stream + 2 * STREAM + u0 + u, mask=ok, other=0)
-                                    srcword = tl.load(buf_hdr + 2 * ENTRY_BLOCK + ent_j)
-                                    c = srcword >> 24
-                                    src = srcword & 0xFFFFFF
-                                    e = tl.load(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ent_j))
-                                current, received, n_received = _receive1(
-                                    t, w, k, e, c, src, pid, current, received, n_received, mask,
-                                    log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
-                        if TRACE >= 2:
-                            current = _pin(current)
-                            n_ev = _mark(trace, n_ev, T_ENTRY, nq, TRACE_CAP)
-                        tl.debug_barrier()  # the stream is refilled next
-                else:
-                    m2 = em_[:, None] & (li[None, :] < (hi - lo)[:, None])
-                    tgt2 = tl.load(ltp[:, None] + lo[:, None] + li[None, :], mask=m2, other=0).to(tl.int32) & 0xFFFF
-                    w2 = tl.load(atp[:, None] + lo[:, None] + li[None, :], mask=m2, other=0.0)
-                    if TRACE:
-                        tgt2 = _pin(tgt2)
-                        w2 = _pin(w2)
-                        n_ev = _mark(trace, n_ev, T_FETCHED, tl.sum(m2.to(tl.int32)), TRACE_CAP)
-                    if WALK == 1:
-                        # the chunk stays in registers: each entry's row and
-                        # header word are picked out by a masked reduction, in
-                        # order (exact: everything else summed is zero); an
-                        # invalid link is target -1, which no lane matches
-                        tgt2 = tl.where(m2, tgt2, -1)
-                        nl = tl.where(em_, hi - lo, 0)
-                        for i in range(tl.minimum(nm - b0, ENTRY_BLOCK)):
-                            sel = ei == i
-                            tgt = tl.sum(tl.where(sel[:, None], tgt2, 0), axis=0)
-                            w = tl.sum(tl.where(sel[:, None], w2, 0.0), axis=0)
-                            n_i = tl.sum(tl.where(sel, nl, 0), axis=0)
+                        n_ev = _mark(trace, n_ev, T_STAGED, 0, TRACE_CAP)
+                    nq = tl.minimum(n_links - s0, STREAM)
+                    for u0 in range(0, nq, U):
+                        for u in tl.static_range(U):
+                            ok = u0 + u < nq
+                            t = tl.load(buf_stream + u0 + u, mask=ok, other=-1)
+                            w = tl.load(_f32p(buf_stream + STREAM + u0 + u), mask=ok, other=0.0)
                             c = tl.cast(0, tl.int32)
                             src = tl.cast(0, tl.int32)
                             e = tl.cast(0.0, tl.float32)
                             if LOG:
-                                srcword = tl.sum(tl.where(sel, srcw, 0), axis=0)
+                                ent_j = tl.load(buf_stream + 2 * STREAM + u0 + u, mask=ok, other=0)
+                                srcword = tl.load(buf_hdr + 2 * ENTRY_BLOCK + ent_j)
                                 c = srcword >> 24
                                 src = srcword & 0xFFFFFF
-                                e = tl.sum(tl.where(sel, ev, 0.0), axis=0)
-                            current, received, n_received = _receive(
-                                tgt, w, tgt >= 0, k, e, c, src, pid, current, received, n_received, mask,
+                                e = tl.load(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ent_j))
+                            current, received, n_received = _receive1(
+                                t, w, k, e, c, src, pid, current, received, n_received, mask,
                                 log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
-                            if TRACE >= 2:
-                                current = _pin(current)
-                                n_ev = _mark(trace, n_ev, T_ENTRY, tl.minimum(n_i, MAX_L), TRACE_CAP)
-                            # the rest of a long segment, straight from memory, before the next entry
-                            if n_i > MAX_L:
-                                lo_i = tl.sum(tl.where(sel, lo, 0), axis=0)
-                                srcword_t = tl.sum(tl.where(sel, srcw, 0), axis=0)
-                                current, received, n_received = _walk(
-                                    lo_i + MAX_L, lo_i + n_i, link_target_addr, attr_addr, k,
-                                    tl.sum(tl.where(sel, ev, 0.0), axis=0), srcword_t >> 24, srcword_t & 0xFFFFFF,
-                                    pid, current, received, n_received, mask, log_ptr, log_e, log_cap,
-                                    GROUP_SIZE, MAX_L, LOG)
-                                if TRACE >= 2:
-                                    current = _pin(current)
-                                    n_ev = _mark(trace, n_ev, T_TAIL, n_i - MAX_L, TRACE_CAP)
-                    else:
-                        # into this program's buffer, one coalesced store per field;
-                        # entries then read their own row back with independent loads
-                        row = buf_link + ei[:, None] * MAX_L + li[None, :]
-                        tl.store(row, tgt2)
-                        tl.store(_f32p(row + ENTRY_BLOCK * MAX_L), w2)
-                        tl.store(buf_hdr + ei, lo)
-                        tl.store(buf_hdr + ENTRY_BLOCK + ei, hi)
-                        tl.store(buf_hdr + 2 * ENTRY_BLOCK + ei, srcw)
-                        tl.store(_f32p(buf_hdr + 3 * ENTRY_BLOCK + ei), ev)
-                        tl.debug_barrier()
-                        if TRACE:
-                            n_ev = _mark(trace, n_ev, T_STAGED, 0, TRACE_CAP)
-                        for i in range(tl.minimum(nm - b0, ENTRY_BLOCK)):
-                            lo_i = tl.load(buf_hdr + i)
-                            hi_i = tl.load(buf_hdr + ENTRY_BLOCK + i)
-                            srcword = tl.load(buf_hdr + 2 * ENTRY_BLOCK + i)
-                            e = tl.load(_f32p(buf_hdr + 3 * ENTRY_BLOCK + i))
-                            tgt = tl.load(buf_link + i * MAX_L + li)
-                            w = tl.load(_f32p(buf_link + ENTRY_BLOCK * MAX_L + i * MAX_L + li))
-                            m = li < hi_i - lo_i
-                            c = srcword >> 24
-                            src = srcword & 0xFFFFFF
-                            current, received, n_received = _receive(
-                                tgt, w, m, k, e, c, src, pid, current, received, n_received, mask,
-                                log_ptr, log_e, log_cap, GROUP_SIZE, LOG)
-                            if TRACE >= 2:
-                                current = _pin(current)
-                                n_ev = _mark(trace, n_ev, T_ENTRY, tl.minimum(hi_i - lo_i, MAX_L), TRACE_CAP)
-                            # the rest of a long segment, straight from memory, before the next entry
-                            if hi_i - lo_i > MAX_L:
-                                current, received, n_received = _walk(
-                                    lo_i + MAX_L, hi_i, link_target_addr, attr_addr, k, e, c, src, pid,
-                                    current, received, n_received, mask, log_ptr, log_e, log_cap,
-                                    GROUP_SIZE, MAX_L, LOG)
-                                if TRACE >= 2:
-                                    current = _pin(current)
-                                    n_ev = _mark(trace, n_ev, T_TAIL, hi_i - lo_i - MAX_L, TRACE_CAP)
-                        tl.debug_barrier()  # the buffer is reused by the next chunk
+                    if TRACE >= 2:
+                        current = _pin(current)
+                        n_ev = _mark(trace, n_ev, T_ENTRY, nq, TRACE_CAP)
+                    tl.debug_barrier()  # the stream is refilled next
         else:
             # main and side runs merged by emission time, two cursors
             im = tl.cast(0, tl.int32)
             js = tl.cast(0, tl.int32)
             for _ in range(nm + ns):
-                em = tl.load(main_time + cell * MAIN_CAP + im, mask=im < nm, other=float("inf"))
-                es = tl.load(side_time + cell * SIDE_CAP + js, mask=js < ns, other=float("inf"))
+                at_m = 4 * _rec(cell, im, n_groups * N_SLOTS)
+                at_s = 4 * _rec(cell, js, n_groups * N_SLOTS)
+                em = tl.load(main_time + at_m, mask=im < nm, other=float("inf"))
+                es = tl.load(side_time + at_s, mask=js < ns, other=float("inf"))
                 if (im < nm) & (em <= es):
                     e = em
-                    srcword = tl.load(main_src + cell * MAIN_CAP + im)
-                    seg_i = tl.load(main_seg + cell * MAIN_CAP + im)
+                    srcword = tl.load(main_src + at_m)
+                    lo_i = tl.load(main_lo + at_m)
+                    n_i = tl.load(main_n + at_m)
                     im += 1
                 else:
                     e = es
-                    srcword = tl.load(side_src + cell * SIDE_CAP + js)
-                    seg_i = tl.load(side_seg + cell * SIDE_CAP + js)
+                    srcword = tl.load(side_src + at_s)
+                    lo_i = tl.load(side_lo + at_s)
+                    n_i = tl.load(side_n + at_s)
                     js += 1
-                c = srcword >> 24
-                ss_i = tl.load(seg_start_addr + c).to(tl.pointer_type(tl.int32))
-                if WALK == 2:
-                    current, received, n_received = _walk1(
-                        tl.load(ss_i + seg_i), tl.load(ss_i + seg_i + 1), link_target_addr, attr_addr,
-                        k, e, c, srcword & 0xFFFFFF, pid, current, received, n_received, mask,
-                        log_ptr, log_e, log_cap, GROUP_SIZE, U, LOG)
-                else:
-                    current, received, n_received = _walk(
-                        tl.load(ss_i + seg_i), tl.load(ss_i + seg_i + 1), link_target_addr, attr_addr,
-                        k, e, c, srcword & 0xFFFFFF, pid, current, received, n_received, mask,
-                        log_ptr, log_e, log_cap, GROUP_SIZE, MAX_L, LOG)
+                current, received, n_received = _walk1(
+                    lo_i, lo_i + n_i, link_target_addr, attr_addr,
+                    k, e, srcword >> 24, srcword & 0xFFFFFF, pid, current, received, n_received, mask,
+                    log_ptr, log_e, log_cap, GROUP_SIZE, U, LOG)
         tl.store(main_count + cell, 0)
         tl.store(side_count + cell, 0)
     tl.store(received_ptr + offs, received, mask=mask)
@@ -478,9 +344,13 @@ def update_kernel(
     tl.store(spike_count + pid, n)
 
     # summary for scheduling (per run parity; program 0 resets the other
-    # parity for the next run) and the source state intake reads
+    # parity for the next run) and the source state intake reads; the count
+    # atomic hands this group its place in the flat spike list
     p = run_id % 2
-    tl.atomic_add(sum_count + p, n)
+    base = tl.atomic_add(sum_count + p, n)
+    flat_node, flat_time = emission_flat_ptrs(emission, n_groups, LOCAL_SPIKE_CAP)
+    tl.store(flat_node + base + _local_pos, offs, mask=_fits)
+    tl.store(flat_time + base + _local_pos, e, mask=_fits)
     tl.atomic_min(sum_min + p, tl.min(tl.where(fires & (_local_pos < LOCAL_SPIKE_CAP), e, float("inf")), axis=0))
     if pid == 0:
         tl.store(sum_count + (1 - p), 0)
@@ -514,11 +384,13 @@ class Pop:
         self.n_received = torch.zeros(n, device=DEVICE, dtype=torch.int32)
         self.log_cap = 0
         self.log = torch.zeros(1, device=DEVICE, dtype=torch.int32)
-        self.scratch = torch.zeros(self.n_groups * 32 * (4 + 2 * 16), device=DEVICE, dtype=torch.int32)  # >= 4*32 + 3*STREAM
+        self.scratch = torch.zeros(self.n_groups * 1024, device=DEVICE, dtype=torch.int32)  # >= 4*ENTRY_BLOCK + 3*STREAM
         self.trace_level, self.trace_cap = 0, 1
-        # delivery walk: 2 scalar receive over a link stream (default), 0 one-hot
-        # over a staged chunk, 1 one-hot over a chunk kept in registers (slower)
-        self.walk, self.stream, self.unroll = 2, 64, 8
+        # delivery walk: entries per chunk, link stream length, links per memory round trip
+        walk = WALK[BACKEND]
+        self.entry_block, self.stream, self.unroll = walk["entry_block"], walk["stream"], walk["unroll"]
+        self.unroll_walk = walk["unroll_walk"]  # Gluon: inline every walk group
+        self.prefetch = walk.get("prefetch", False)  # Gluon: pipeline the next chunk's loads under the walk
         # "triton", or "gluon": test/update_gluon.py (LDS stream walk; uniform emission only)
         self.backend = BACKEND
         self.trace = torch.zeros(1, device=DEVICE, dtype=torch.int32)
@@ -578,8 +450,11 @@ class Pop:
                 self.emission.buf, self.run_id, t_start, t_end, self.trace,
                 GROUP_SIZE=self.group_size, LOCAL_SPIKE_CAP=self.emission.cap, UNIFORM_TIME=True,
                 N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap, SIDE_CAP=self.ring.side_cap,
-                ENTRY_BLOCK=32, LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
+                ENTRY_BLOCK=self.entry_block, LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
                 SPT=max(self.group_size // (32 * num_warps), 1), NUM_WARPS=num_warps,
+                SPQ=max(self.stream // (32 * num_warps), 1), SPE=max(self.entry_block // (32 * num_warps), 1),
+                UNROLL_WALK=self.unroll_walk, PREFETCH=self.prefetch,
+                MAX_CONNS=triton.next_power_of_2(max(self.plan.n_conns, 1)),
                 TRACE=int(self.trace_level > 0), TRACE_CAP=self.trace_cap, num_warps=num_warps,
             )
             self.ring.ring_pos = max(k_lo, k_hi + 1)
@@ -592,8 +467,8 @@ class Pop:
             self.emission.buf, self.run_id, t_start, t_end, self.trace,
             GROUP_SIZE=self.group_size, LOCAL_SPIKE_CAP=self.emission.cap, UNIFORM_TIME=uniform,
             N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap, SIDE_CAP=self.ring.side_cap,
-            ENTRY_BLOCK=32, MAX_L=16, LOG=self.log_cap > 0,
-            TRACE=self.trace_level, TRACE_CAP=self.trace_cap, WALK=self.walk, STREAM=self.stream, U=self.unroll,
+            ENTRY_BLOCK=32, LOG=self.log_cap > 0,
+            TRACE=self.trace_level, TRACE_CAP=self.trace_cap, STREAM=self.stream, U=self.unroll,
             num_warps=num_warps,
         )
         self.ring.ring_pos = max(k_lo, k_hi + 1)
@@ -610,6 +485,11 @@ class Pop:
         cap = self.emission.cap
         time, node, count = self.emission.time.tolist(), self.emission.node.tolist(), self.emission.count.tolist()
         return {b: [(time[b * cap + i], node[b * cap + i]) for i in range(c)] for b, c in enumerate(count)}
+
+    def flat(self) -> list[tuple[float, int]]:
+        """The last run's flat spike list: [(time, node)], length = its summary count."""
+        n, _ = self.emission.summary(self.run_id)
+        return list(zip(self.emission.flat_time[:n].tolist(), self.emission.flat_node[:n].tolist()))
 
 
 def _fire_pattern(n, t_start, t_end, p, rng):
@@ -634,6 +514,7 @@ def test_uniform_emission_buffer_state_and_summary():
     assert pop.emission.state[0].item() == 1
     assert pop.emission.state[1:].view(torch.float32).item() == pytest.approx(1.1)
     assert pop.emission.summary(1) == (len(want), pytest.approx(1.0))
+    assert sorted(pop.flat()) == got  # the flat list: the same spikes, no gaps
     assert torch.allclose(pop.last_time, torch.full((200,), 1.1, device=DEVICE))
 
 
@@ -652,6 +533,7 @@ def test_exact_times_with_emission_delays_are_sorted_per_group():
         assert sorted(entries) == want
     fired = [i for i in range(200) if fire[i] < math.inf]
     assert pop.emission.summary(1) == (len(fired), min(e[i] for i in fired))
+    assert sorted(pop.flat()) == sorted((e[i], i) for i in fired)
 
 
 def test_summary_is_per_run():
@@ -661,6 +543,7 @@ def test_summary_is_per_run():
     fire2 = _fire_pattern(100, 1.1, 1.2, 0.1, rng)
     pop.run(1.1, 1.2, fire2)
     assert pop.emission.summary(2) == (int((fire2 < math.inf).sum()), pytest.approx(1.1))
+    assert sorted(n for _, n in pop.flat()) == [i for i in range(100) if fire2[i] < math.inf]  # run 2's only
     pop.run(1.2, 1.3, torch.full((100,), math.inf))
     assert pop.emission.summary(3) == (0, math.inf)
 

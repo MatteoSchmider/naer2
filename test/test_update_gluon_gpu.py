@@ -6,9 +6,17 @@ import pytest
 import test.test_update_emission_gpu as T
 
 
-@pytest.fixture(autouse=True)
-def _gluon(monkeypatch):
+@pytest.fixture(autouse=True, params=[(64, 128, 8, False, False), (64, 128, 8, False, True),
+                                      (32, 32, 8, False, True), (32, 64, 8, True, False), (128, 256, 16, False, False)],
+                ids=["default", "prefetch", "prefetch-small-stream", "chunk32-unrolled", "chunk128"])
+def _gluon(monkeypatch, request):
+    """Every test on the Gluon kernel: its default walk, the pipelined walk
+    (also with a stream shorter than a chunk's links, so chunks overflow into
+    further blocks), small chunks with the walk unrolled, large chunks."""
     monkeypatch.setattr(T, "BACKEND", "gluon")
+    entry_block, stream, unroll, unroll_walk, prefetch = request.param
+    monkeypatch.setitem(T.WALK, "gluon", dict(entry_block=entry_block, stream=stream, unroll=unroll,
+                                              unroll_walk=unroll_walk, prefetch=prefetch))
 
 
 def test_uniform_emission_buffer_state_and_summary():
