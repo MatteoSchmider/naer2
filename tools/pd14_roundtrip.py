@@ -2,7 +2,7 @@
 cortical population's green-field update kernel (delivery + emission), then
 every intake kernel, populations on their own streams (or sequential).
 
-    python tools/pd14_roundtrip.py G [--backend triton|gluon] [--warps-update 4]
+    python tools/pd14_roundtrip.py G [--warps-update 4]
         [--warps-intake 4] [--sequential] [--rounds 50] [--unroll 8]
         [--stream 64] [--rdna2] [--breakdown]
 
@@ -17,7 +17,6 @@ import time
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.dirname(__file__)]
 ap = argparse.ArgumentParser()
 ap.add_argument("G", type=int)
-ap.add_argument("--backend", default="triton", choices=["triton", "gluon"])
 ap.add_argument("--warps-update", type=int, default=4)
 ap.add_argument("--warps-intake", type=int, default=4)
 ap.add_argument("--sequential", action="store_true")
@@ -36,8 +35,8 @@ import torch
 from pd14_setup import PD14
 
 WARMUP, ROUNDS, CONC = 20, args.rounds, not args.sequential
-b = PD14(args.G, args.backend, args.unroll, args.stream, args.warps_update, args.warps_intake,
-         entry_block=args.entry_block)
+b = PD14(args.G, unroll=args.unroll, stream=args.stream, warps_update=args.warps_update,
+         warps_intake=args.warps_intake, entry_block=args.entry_block)
 # fire patterns: a pool of masks reused cyclically, turned into each round's
 # (absolute) fire times up front, so the timed loop launches only the kernels
 masks = [b.fire_mask(r) for r in range(min(WARMUP + 3 * ROUNDS, 200))]
@@ -52,7 +51,7 @@ torch.cuda.synchronize()
 per_round = (time.perf_counter() - t0) / ROUNDS
 b.check()
 p0 = next(iter(b.pops.values()))
-print(f"{torch.cuda.get_device_name(0)}: {args.backend:6s} G={args.G:4d} U={p0.unroll} "
+print(f"{torch.cuda.get_device_name(0)}: G={args.G:4d} U={p0.unroll} "
       f"S={p0.stream} chunk={p0.entry_block} warps update={args.warps_update} intake={args.warps_intake} "
       f"{'streams' if CONC else 'sequential':10s} per round {per_round * 1e3:6.2f} ms  "
       f"(~{b.delivered() / (WARMUP + ROUNDS):,.0f} links delivered/round; {b.links / 1e6:.0f}M links, "

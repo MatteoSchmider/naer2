@@ -2,7 +2,7 @@
 (naer2/trace.py): every program of every update and intake kernel on one
 wall-clock axis.
 
-    python tools/trace_round.py G [--backend gluon|triton] [--rounds 10] [--unroll 8]
+    python tools/trace_round.py G [--rounds 10] [--unroll 8] [--heat N] [--no-counters]
 
 Two modes, each over --rounds rounds after warm-up:
   concurrent  as in production (populations on their own streams): the
@@ -20,7 +20,6 @@ from collections import defaultdict
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.dirname(__file__)]
 ap = argparse.ArgumentParser()
 ap.add_argument("G", type=int)
-ap.add_argument("--backend", default="gluon", choices=["triton", "gluon"])
 ap.add_argument("--rounds", type=int, default=10)
 ap.add_argument("--unroll", type=int, default=None)
 ap.add_argument("--rdna2", action="store_true")
@@ -43,7 +42,7 @@ from pd14_setup import PD14
 
 US = 0.01  # REALTIME tick: 10 ns
 med = st.median
-b = PD14(args.G, args.backend, unroll=args.unroll, stream=args.stream, main_cap=args.main_cap,
+b = PD14(args.G, unroll=args.unroll, stream=args.stream, main_cap=args.main_cap,
          entry_block=args.entry_block, count_received=not args.no_counters)
 _masks = [b.fire_mask(r) for r in range(200)]
 
@@ -58,7 +57,7 @@ r = 0
 for _ in range(20):
     b.round(r, fires[r]); r += 1
 for p in b.pops.values():
-    p.set_trace(1, 1024)
+    p.set_trace(1024)
 itraces = {n: Trace(p.plan.n_progs, 256) for n, p in b.pops.items()}
 for _ in range(3):  # compile the traced kernels
     b.round(r, fires[r], intake_traces=itraces); r += 1
@@ -76,7 +75,7 @@ def ran(progs):
 
 def reset():
     for p in b.pops.values():
-        p.trace.zero_()
+        p.trace.buf.zero_()
     for t in itraces.values():
         t.buf.zero_()
 
@@ -133,7 +132,7 @@ def union(intervals):
 
 
 p0 = next(iter(b.pops.values()))
-print(f"{torch.cuda.get_device_name(0)} {args.backend} G={args.G} U={p0.unroll} "
+print(f"{torch.cuda.get_device_name(0)} G={args.G} U={p0.unroll} "
       f"chunk={p0.entry_block} stream={p0.stream}, "
       f"{args.rounds} rounds per mode\n")
 print("CONCURRENT (production): median over rounds, us")

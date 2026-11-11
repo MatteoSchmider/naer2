@@ -11,7 +11,7 @@ entries per update program per round (what the gather and chunking pay).
 import os
 import sys
 
-sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.dirname(__file__)]
+sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..", ".."), os.path.join(os.path.dirname(__file__), "..")]
 import torch
 
 from naer2.topology_new import TopologyNew

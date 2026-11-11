@@ -8,7 +8,7 @@ import time
 
 import torch
 
-import test.test_update_emission_gpu as T
+from naer2.greenfield import Pop
 from naer2.topology_new import TopologyNew
 from test.networks.PD14.net import build, description
 
@@ -17,17 +17,16 @@ RES = 0.1  # ms: timestep, delay buckets and ring slots
 
 
 class PD14:
-    def __init__(self, G: int, backend="triton", unroll=None, stream=None, warps_update=4, warps_intake=4,
+    def __init__(self, G: int, unroll=None, stream=None, warps_update=4, warps_intake=4,
                  main_cap: int | None = None, entry_block: int | None = None, count_received: bool = True):
-        """unroll / stream / entry_block: None = the backend's walk default (T.WALK)."""
-        T.BACKEND = backend
+        """unroll / stream / entry_block: None = the walk default (naer2.greenfield.WALK)."""
         torch.cuda.set_device(0)
         torch.manual_seed(0)
         self.G, self.warps_update, self.warps_intake = G, warps_update, warps_intake
         names = dict(zip(description["populations"]["size"], description["populations"]["name"]))
         net = build()
         cortical = {p: names[len(p.shape)] for p in net.populations if len(p.shape) in names}
-        self.pops = {name: T.Pop(len(p.shape), group_size=G) for p, name in cortical.items()}
+        self.pops = {name: Pop(len(p.shape), group_size=G) for p, name in cortical.items()}
         for p in self.pops.values():
             p.unroll = unroll or p.unroll
             p.stream = stream or p.stream

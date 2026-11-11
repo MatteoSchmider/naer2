@@ -1,4 +1,4 @@
-"""Delivery-walk configurations of the Gluon update kernel (chunk size,
+"""Delivery-walk configurations of the green-field update kernel (chunk size,
 stream length, links per LDS read), compared fairly:
 one process, one PD14 network, the configurations alternating round by
 round. Per configuration, from the kernels' own stamps (naer2/trace.py):
@@ -21,14 +21,14 @@ if "--rdna2" in sys.argv:
 import torch
 
 from pd14_setup import PD14
-from test.update_gluon import update_kernel_gluon
+from naer2.greenfield import update_kernel
 
 CONFIGS = [  # (entries per chunk, stream, U, stand-in receive counters, waves_per_eu target or 0)
     (64, 128, 8, False, 16), (128, 256, 8, False, 0), (128, 256, 8, False, 12), (128, 256, 8, False, 14),
     (64, 128, 8, False, 12), (64, 128, 8, False, 14),
 ]
 HEAT = 5  # untraced rounds before each measured one: keep the clock up
-b = PD14(G, "gluon")
+b = PD14(G)
 _masks = [b.fire_mask(r) for r in range(200)]
 
 
@@ -42,7 +42,7 @@ r = 0
 for _ in range(20):
     b.round(r, fires[r]); r += 1
 for p in b.pops.values():
-    p.set_trace(1, 1024)
+    p.set_trace(1024)
 
 
 CURRENT = [None]
@@ -82,7 +82,7 @@ def round_alone():
     t = 10.0 + 0.1 * r
     total = 0.0
     for n, p in b.pops.items():
-        p.trace.zero_()
+        p.trace.buf.zero_()
         p.run(t, t + 0.1, fires[r][n], b.zeros[n], uniform=True, num_warps=b.warps_update)
         torch.cuda.synchronize()
         tr = p.traced()
@@ -97,7 +97,7 @@ def round_alone():
 def round_conc():
     global r
     for p in b.pops.values():
-        p.trace.zero_()
+        p.trace.buf.zero_()
     b.update(r, fires[r])
     torch.cuda.synchronize()
     spans = [span(p.traced()) for p in b.pops.values()]
@@ -109,7 +109,7 @@ regs = {}
 for cfg in CONFIGS:  # compile and warm up every configuration
     configure(cfg)
     round_alone(); round_conc()
-    k = [k for cache in update_kernel_gluon.device_caches.values() for k in cache[0].values()][-1]
+    k = [k for cache in update_kernel.device_caches.values() for k in cache[0].values()][-1]
     regs[cfg] = (k.n_regs, k.metadata.shared, k.n_spills)
 res = {cfg: ([], []) for cfg in CONFIGS}
 heat(300)

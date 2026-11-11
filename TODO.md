@@ -1149,6 +1149,70 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    capacities/overflow (`carry.count > cap` is reported but not checked),
    the remaining `tl.sort` users (`merge()`/`combine()`), and host syncs.
 
+1d. **Green-field kernels — state and findings (2026-11-11).** Written by
+   hand outside population.py, tested end to end (`test/test_update_emission_gpu.py`,
+   `test/test_intake_gpu.py`), measured with `tools/` (see tools/README.md).
+   Next step: **fuse intake into the update kernel, one kernel per population
+   and run** (intake then moves to Gluon too).
+   - **Update kernel** (`naer2/greenfield/update.py`, Gluon; `Pop` in
+     `pop.py`): one program per group (G=256 for PD14), neuron state in
+     registers, only what the receive touches live during delivery. Per due
+     slot: main run only -> chunks of 128 ring entries become one link stream
+     (entry found per stream position by histogram + scan, its link
+     addresses by on-chip gathers), staged in LDS, walked 8 links per
+     broadcast LDS read; with side entries -> two-cursor merge by e, links
+     straight from memory. Every link received in order by its target lane
+     (scalar receive). Emission per group sorted by (e, node) (non-uniform:
+     each spike written at its rank), flat spike list placed by the
+     summary-count atomic.
+   - **Intake** (`naer2/intake.py`, Triton): uniform -> 8 persistent
+     programs per CU over (connection, spike, 128-segment block) items read
+     off the sources' flat lists; general -> one program, merge then
+     sequential insert. Ring entries are 16-byte records (e, source word,
+     link range) interleaved by cache line across cells (`_rec`).
+   - **Numbers** (PD14, ~78k links delivered per 0.1 ms round, G=256): GPU
+     work per round ~0.6 ms on the 780M at sustained clock before the last
+     round of changes, estimated ~0.25-0.3 ms now (~0.57 ms measured at 800
+     MHz); ~0.3 ms on the RX 6600 before the last changes. The measured round
+     (~0.85-0.92 ms) is bound by the host issuing 16 launches + stream joins
+     (~0.84 ms).
+   - **Limits any further in-kernel optimization has to respect** (what made
+     the failed ones fail):
+     1. *Registers are the latency budget*: the kernels are chains of
+        dependent memory round trips, hidden by switching resident waves.
+        Holding more state per program (a chunk in registers: 192 VGPRs;
+        prefetching the next chunk: +11-14; U=16) cost more occupancy than it
+        saved. What did work: shortening lifetimes (state loaded after
+        delivery: 108 -> 75 VGPRs). Beyond ~10-12 programs per WGP the kernel
+        no longer cares; forcing 16 (waves_per_eu) spills.
+     2. *No per-link cross-lane traffic*: the one-hot receive and register
+        tile extraction cost 4-8 barriers per entry; the scalar receive and
+        the in-thread walk group need none. Only per-chunk work may
+        communicate (it does: ~25 barriers per stream block, histogram /
+        scans / gathers through LDS).
+     3. *Per-entry costs dominate*: the per-chunk chain is ~60% of update
+        cycles, the walk ~22%, at 1.6 links per segment. Splitting segments
+        finer (per wave: x1.5 entries, +663 MB) multiplies the expensive part.
+     4. *Code size*: an unrolled walk over a 256-link stream was slower; loops.
+     5. *Write locality, not atomics*: intake's appends were bound by
+        scattered writes (records + cache-line interleaving fixed it);
+        returning atomics on shared addresses are cheap.
+     6. *Program count*: persistent programs finding their own work; intake
+        is flat between 4 and 16 per CU, worse beyond (fixed setup per
+        program).
+     7. *The chains are the floor*: update 2-4 chunks per program, each ~2
+        dependent global round trips + barrier; intake ~5 dependent steps per
+        tile, 1-2 tiles on the critical path.
+   - **Tried and dropped** (measured): one-hot receive; chunk kept in
+     registers; next-chunk prefetch under the walk; unrolled walk; per-wave
+     segments (estimated); intake arrival-slot table (the bucket-mean load is
+     an L1 hit, the on-chip gather isn't cheaper); chunked ring runs (sync on
+     append, pointer chasing; interleaving got the locality instead).
+   - **Open**: ring run capacities are still fixed and oversized; the
+     group size should become automatic and device-dependent (see
+     `TopologyNew.locality`); the eGPU's power states make sync-heavy
+     measurements on it unusable.
+
 2. **Get the full PD14 network (`test/networks/PD14/net.py`) actually running in
    main.py**, as the first real-scale proof the whole stack holds together
    rather than developing further pieces in a vacuum against small hand-built

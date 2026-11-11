@@ -10,7 +10,7 @@ slots) limit it.
 import os
 import sys
 
-sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.dirname(__file__)]
+sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..", ".."), os.path.join(os.path.dirname(__file__), "..")]
 if "--rdna2" in sys.argv:
     import rdna2  # noqa: F401
 

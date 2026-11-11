@@ -19,7 +19,7 @@ import os
 import sys
 import time
 
-sys.path[:0] = [os.path.join(os.path.dirname(__file__), ".."), os.path.dirname(__file__)]
+sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..", ".."), os.path.join(os.path.dirname(__file__), "..")]
 if "--rdna2" in sys.argv:
     import rdna2  # noqa: F401
 import torch

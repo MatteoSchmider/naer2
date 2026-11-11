@@ -23,7 +23,7 @@ from naer2.intake import INTAKE_TRACE_TAGS
 from naer2.trace import Trace
 from pd14_setup import PD14
 
-b = PD14(G, "gluon")
+b = PD14(G)
 CUS = torch.cuda.get_device_properties(0).multi_processor_count
 masks = [b.fire_mask(r) for r in range(200)]
 r = 0
