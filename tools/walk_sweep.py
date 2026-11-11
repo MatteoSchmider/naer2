@@ -1,4 +1,5 @@
-"""Delivery-walk configurations of the Gluon update kernel, compared fairly:
+"""Delivery-walk configurations of the Gluon update kernel (chunk size,
+stream length, links per LDS read), compared fairly:
 one process, one PD14 network, the configurations alternating round by
 round. Per configuration, from the kernels' own stamps (naer2/trace.py):
   alone   sum over populations of the update kernel's span, each run alone
@@ -22,10 +23,9 @@ import torch
 from pd14_setup import PD14
 from test.update_gluon import update_kernel_gluon
 
-CONFIGS = [  # (entries per chunk, stream, U, walk loop unrolled, next chunk's loads under the walk)
-    (32, 64, 8, False, False), (32, 64, 8, False, True),
-    (64, 128, 8, False, False), (64, 128, 8, False, True),
-    (128, 256, 8, False, False), (128, 256, 8, False, True),
+CONFIGS = [  # (entries per chunk, stream, U, stand-in receive counters, waves_per_eu target or 0)
+    (64, 128, 8, False, 16), (128, 256, 8, False, 0), (128, 256, 8, False, 12), (128, 256, 8, False, 14),
+    (64, 128, 8, False, 12), (64, 128, 8, False, 14),
 ]
 HEAT = 5  # untraced rounds before each measured one: keep the clock up
 b = PD14(G, "gluon")
@@ -45,9 +45,13 @@ for p in b.pops.values():
     p.set_trace(1, 1024)
 
 
+CURRENT = [None]
+
+
 def configure(cfg):
+    CURRENT[0] = cfg
     for p in b.pops.values():
-        p.entry_block, p.stream, p.unroll, p.unroll_walk, p.prefetch = cfg
+        p.entry_block, p.stream, p.unroll, p.count_received, p.waves_per_eu = cfg
 
 
 def heat(n=HEAT):
@@ -61,6 +65,18 @@ def span(progs):
     return min(q["start"] for q in ps), max(q["end"] for q in ps)
 
 
+def alive(progs):
+    ev = sorted([(q["start"], 1) for q in progs if q["end"] > 0] + [(q["end"], -1) for q in progs if q["end"] > 0])
+    a = m = 0
+    for _, d in ev:
+        a += d
+        m = max(m, a)
+    return m
+
+
+most_alive = {}
+
+
 def round_alone():
     global r
     t = 10.0 + 0.1 * r
@@ -69,8 +85,11 @@ def round_alone():
         p.trace.zero_()
         p.run(t, t + 0.1, fires[r][n], b.zeros[n], uniform=True, num_warps=b.warps_update)
         torch.cuda.synchronize()
-        s, e = span(p.traced())
+        tr = p.traced()
+        s, e = span(tr)
         total += (e - s) * 0.01
+        if n == "E_4":
+            most_alive[CURRENT[0]] = max(most_alive.get(CURRENT[0], 0), alive(tr))
     b.intake(); r += 1
     return total
 
@@ -91,7 +110,7 @@ for cfg in CONFIGS:  # compile and warm up every configuration
     configure(cfg)
     round_alone(); round_conc()
     k = [k for cache in update_kernel_gluon.device_caches.values() for k in cache[0].values()][-1]
-    regs[cfg] = (k.n_regs, k.metadata.shared)
+    regs[cfg] = (k.n_regs, k.metadata.shared, k.n_spills)
 res = {cfg: ([], []) for cfg in CONFIGS}
 heat(300)
 for _ in range(ROUNDS):
@@ -103,9 +122,9 @@ for _ in range(ROUNDS):
         res[cfg][1].append(round_conc())
 b.check()
 print(f"{torch.cuda.get_device_name(0)} G={G}, {ROUNDS} rounds per configuration, interleaved; medians, us")
-print(f"  {'chunk':>5s} {'stream':>6s} {'U':>3s} {'walk':>8s} {'prefetch':>8s} {'alone':>7s} {'conc':>7s} "
-      f"{'VGPRs':>6s} {'LDS':>6s}")
+print(f"  {'chunk':>5s} {'stream':>6s} {'U':>3s} {'counters':>8s} {'waves':>5s} {'alone':>7s} {'conc':>7s} "
+      f"{'VGPRs':>6s} {'spills':>6s} {'E_4 alive':>9s}")
 for cfg in CONFIGS:
     a, c = res[cfg]
-    print(f"  {cfg[0]:5d} {cfg[1]:6d} {cfg[2]:3d} {'unrolled' if cfg[3] else 'loop':>8s} {'yes' if cfg[4] else 'no':>8s} "
-          f"{st.median(a):7.0f} {st.median(c):7.0f} {regs[cfg][0]:6d} {regs[cfg][1]:6d}")
+    print(f"  {cfg[0]:5d} {cfg[1]:6d} {cfg[2]:3d} {'yes' if cfg[3] else 'no':>8s} {cfg[4] or '-':>5} {st.median(a):7.0f} "
+          f"{st.median(c):7.0f} {regs[cfg][0]:6d} {regs[cfg][2]:6d} {most_alive.get(cfg, 0):5d}/86")

@@ -12,21 +12,24 @@ transpiler templates.
                t_start (UNIFORM_TIME, i.e. bare n2.spike()) or its fire time
                + its emission delay
   contract:    naer2/emission.py's EmissionBuffer -- per group sorted by e
-               (once at the source, so intake only merges), the source
-               state (run id, window end), the summary (count, earliest e)
-               for scheduling
+               (once at the source, so intake only merges), the flat spike
+               list (placed by the summary-count atomic), the source state
+               (run id, window end), the summary (count, earliest e) for
+               scheduling
   delivery:    every program walks its own group's due slots k_lo..k_hi of
-               the consumer's rings in slot order, main and side runs merged
-               by emission time with two cursors; each entry is one segment
-               of a connection's TopologyNew (reached through the consumer's
-               IntakePlan buffer), walked as a contiguous link range: per
-               slot, headers and first links of a chunk of entries are
-               prefetched in one bandwidth-bound load, then delivered one
-               entry at a time in emission order; the delivered cells are
-               freed. Stand-in receive: per target the
-               summed weight and the number of links delivered, plus an
+               the consumer's rings in slot order; each ring entry is one
+               segment of a connection's TopologyNew, carrying its link range.
+               Main run only (uniform emission): a chunk of entries becomes
+               one link stream in delivery order (entry, then link), gathered
+               one link per lane, then walked U links per round trip with the
+               scalar receive (every lane compares against the link's target).
+               Main and side runs (any emission times): merged by emission
+               time with two cursors, each entry's links walked straight from
+               memory. Delivered cells are freed. Stand-in receive: per target
+               the summed weight and the number of links delivered, plus an
                optional log of every delivered link (slot, e, connection,
-               source, target) for the order checks.
+               source, target) for the order checks. test/update_gluon.py is
+               the Gluon version of the uniform path (stream in LDS).
 
 The emission output is fed into the real intake kernel and checked against
 test_intake_gpu.py's reference end to end.
@@ -57,13 +60,14 @@ GROUP_SIZE = 32
 BACKEND = "triton"  # Pop's update kernel; test_update_gluon_gpu.py reruns the uniform tests on "gluon"
 # delivery walk defaults per backend: entries per chunk (the Triton
 # kernel's entry search keeps 32), link stream length, links per memory /
-# LDS round trip, Gluon walk loop unrolled. Gluon's from tools/walk_sweep.py
-# (PD14, G=256, 780M): chunk 64 / stream 128 / U 8 with the walk as a loop
-# beat chunk 32 by 17% (kernels alone) and 11% (concurrent); larger chunks
-# or U cost more in registers (occupancy) than they save.
+# LDS round trip. Gluon's from tools/walk_sweep.py (PD14, G=256, 780M):
+# chunk 128 / stream 256 / U 8, since the delivery was cut into helpers and
+# the non-receive state is loaded after it (81 VGPRs at PD14's 8
+# connections); larger U costs more in registers than it saves, and an
+# explicit occupancy target (waves_per_eu) gains <= 3% (spills beyond 12).
 WALK = {
-    "triton": dict(entry_block=32, stream=64, unroll=8, unroll_walk=False),
-    "gluon": dict(entry_block=64, stream=128, unroll=8, unroll_walk=False, prefetch=False),
+    "triton": dict(entry_block=32, stream=64, unroll=8),
+    "gluon": dict(entry_block=128, stream=256, unroll=8),
 }
 
 
@@ -161,10 +165,9 @@ def update_kernel(
      sum_count, sum_min, overflow) = emission_ptrs(emission, n_groups, LOCAL_SPIKE_CAP)
     local_spike_count = tl.cast(0, tl.int32)
 
-    t_ref_end = tl.load(t_ref_end_ptr + offs, mask=mask)
-    potential = tl.load(potential_ptr + offs, mask=mask)
+    # only what the receive touches is live during delivery; the rest of the
+    # state is loaded after it (registers are occupancy)
     current = tl.load(current_ptr + offs, mask=mask)
-    last_time = tl.load(last_time_ptr + offs, mask=mask)
     if TRACE:
         current = _pin(current)
         n_ev = _mark(trace, n_ev, T_STATE, 0, TRACE_CAP)
@@ -292,6 +295,9 @@ def update_kernel(
         n_ev = _mark(trace, n_ev, T_DELIVERED, 0, TRACE_CAP)
 
     # final propagation to the window end (PD14)
+    t_ref_end = tl.load(t_ref_end_ptr + offs, mask=mask)
+    potential = tl.load(potential_ptr + offs, mask=mask)
+    last_time = tl.load(last_time_ptr + offs, mask=mask)
     time = t_end
     dt = time - last_time
     last_time = time
@@ -388,9 +394,9 @@ class Pop:
         self.trace_level, self.trace_cap = 0, 1
         # delivery walk: entries per chunk, link stream length, links per memory round trip
         walk = WALK[BACKEND]
+        self.count_received = True  # Gluon: False compiles the stand-in's receive counters out (benchmarks)
+        self.waves_per_eu = 0  # Gluon: occupancy the register allocator targets (0: its own choice)
         self.entry_block, self.stream, self.unroll = walk["entry_block"], walk["stream"], walk["unroll"]
-        self.unroll_walk = walk["unroll_walk"]  # Gluon: inline every walk group
-        self.prefetch = walk.get("prefetch", False)  # Gluon: pipeline the next chunk's loads under the walk
         # "triton", or "gluon": test/update_gluon.py (LDS stream walk; uniform emission only)
         self.backend = BACKEND
         self.trace = torch.zeros(1, device=DEVICE, dtype=torch.int32)
@@ -453,9 +459,9 @@ class Pop:
                 ENTRY_BLOCK=self.entry_block, LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
                 SPT=max(self.group_size // (32 * num_warps), 1), NUM_WARPS=num_warps,
                 SPQ=max(self.stream // (32 * num_warps), 1), SPE=max(self.entry_block // (32 * num_warps), 1),
-                UNROLL_WALK=self.unroll_walk, PREFETCH=self.prefetch,
-                MAX_CONNS=triton.next_power_of_2(max(self.plan.n_conns, 1)),
+                MAX_CONNS=triton.next_power_of_2(max(self.plan.n_conns, 1)), COUNT=self.count_received,
                 TRACE=int(self.trace_level > 0), TRACE_CAP=self.trace_cap, num_warps=num_warps,
+                waves_per_eu=self.waves_per_eu,
             )
             self.ring.ring_pos = max(k_lo, k_hi + 1)
             return
@@ -620,7 +626,7 @@ def test_deliveries_arrive_in_their_run_in_slot_then_emission_order(uniform, lon
     a, b, consumer = Pop(150), Pop(90), Pop(96)
     topologies = [  # per-link delays (A -> C) and one homogeneous delay (B -> C)
         _topology(a.n, 96, GROUP_SIZE, delay="random", k=24, seed=10, weight=True),
-        # long_segments: ~30 links per (source, group), past the 16 prefetched
+        # long_segments: ~30 links per (source, group), several U-link walk steps per entry
         _topology(b.n, 96, GROUP_SIZE, delay=0.2, k=90 if long_segments else 24, seed=11, weight=True),
     ]
     consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000)
@@ -707,7 +713,7 @@ def test_tracing_changes_nothing_and_stamps_every_entry(level):
             assert prog["end"] >= prog["start"] > 0
             cycles = [c for _, _, c in prog["events"]]
             assert cycles == sorted(cycles)
-            if level == 2:  # stream walk: every link gathered at prefetch is walked
+            if level == 2:  # stream walk: every link gathered into the stream is walked
                 fetched = sum(aux for tag, aux, _ in prog["events"] if tag == "fetched")
                 walked = sum(aux for tag, aux, _ in prog["events"] if tag == "entry")
                 assert walked == fetched

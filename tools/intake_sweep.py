@@ -1,4 +1,5 @@
-"""Uniform intake configurations compared fairly: one process, one PD14
+"""Uniform intake configurations (programs, tile shape) compared fairly:
+one process, one PD14
 network, configurations alternating round by round, the clock kept up by
 untraced rounds in between. Per configuration, from the kernels' stamps:
   alone   sum over consumers of the intake kernel's span, each run alone
@@ -38,7 +39,7 @@ def heat(n):
         b.round(r, fire(r)); r += 1
 
 
-SHAPES = [(1, 128), (2, 128), (4, 128), (2, 64), (4, 64), (1, 256), (2, 256)]  # (items per step, segments per item)
+SHAPES = [(1, 128), (2, 128), (4, 128), (1, 64), (2, 64), (1, 256)]  # (items per step, segments per item)
 PROGS = [CUS * k for k in (2, 4, 8, 16, 32)]
 CONFIGS = [(p, i, s) for p in PROGS for i, s in SHAPES]
 traces = {n: Trace(max(PROGS), 64) for n in b.pops}

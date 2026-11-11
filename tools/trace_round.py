@@ -29,6 +29,7 @@ ap.add_argument("--heat", type=int, default=0,
                 help="untraced rounds before each mode, and HEAT // 20 between measured rounds, so power "
                      "management keeps the clock up (short bursty runs stay at the lowest DPM level)")
 ap.add_argument("--entry-block", type=int, default=None)
+ap.add_argument("--no-counters", action="store_true", help="compile the stand-in receive counters out (PD14's kernel)")
 ap.add_argument("--stream", type=int, default=None)
 args = ap.parse_args()
 if args.rdna2:
@@ -43,7 +44,7 @@ from pd14_setup import PD14
 US = 0.01  # REALTIME tick: 10 ns
 med = st.median
 b = PD14(args.G, args.backend, unroll=args.unroll, stream=args.stream, main_cap=args.main_cap,
-         entry_block=args.entry_block)
+         entry_block=args.entry_block, count_received=not args.no_counters)
 _masks = [b.fire_mask(r) for r in range(200)]
 
 

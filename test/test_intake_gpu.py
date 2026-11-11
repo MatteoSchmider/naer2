@@ -362,3 +362,4 @@ def test_uniform_intake_tracing_changes_nothing():
 def test_run_capacity_must_be_a_multiple_of_4():
     with pytest.raises(ValueError, match="multiples of 4"):
         Ring(1, 8, 0.1, DEVICE, main_cap=6)
+

@@ -18,7 +18,7 @@ RES = 0.1  # ms: timestep, delay buckets and ring slots
 
 class PD14:
     def __init__(self, G: int, backend="triton", unroll=None, stream=None, warps_update=4, warps_intake=4,
-                 main_cap: int | None = None, entry_block: int | None = None):
+                 main_cap: int | None = None, entry_block: int | None = None, count_received: bool = True):
         """unroll / stream / entry_block: None = the backend's walk default (T.WALK)."""
         T.BACKEND = backend
         torch.cuda.set_device(0)
@@ -32,6 +32,7 @@ class PD14:
             p.unroll = unroll or p.unroll
             p.stream = stream or p.stream
             p.entry_block = entry_block or p.entry_block
+            p.count_received = count_received  # False: PD14's receive only (no stand-in counters)
         t0 = time.time()
         self.links = self.segments = 0
         for p, name in cortical.items():

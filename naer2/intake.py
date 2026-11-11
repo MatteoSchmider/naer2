@@ -70,8 +70,13 @@ DEFAULT_SIDE_CAP = 512
 _BLOCK = 128      # vector width of the general kernel
 _BLOCK_G = 1024   # source groups per gather chunk (general kernel)
 _BLOCK_S = 512    # segments per insertion tile (general kernel): ~one tile per spike (PD14: ~450 segments)
-_ITEMS = 4        # uniform kernel: work items per program step
+_ITEMS = 1        # uniform kernel: work items per program step
 _ITEM_SEGS = 128  # uniform kernel: segments per work item
+_PROGS_PER_CU = 8  # uniform kernel: persistent programs per compute unit (torch's count; WGPs on RDNA)
+# tools/intake_sweep.py (PD14, G=256, 780M): 8 per CU x (1 x 128) beat 4 x (4 x 128) by 10% alone, 13%
+# concurrent; 2..32 per CU and tiles of 64..256 segments are within ~10% of it, beyond 16 per CU clearly
+# worse (every program reads all sources). A per-program (connection, bucket) arrival-slot table instead
+# of the bucket-mean load was slower: the load is an L1 hit, the on-chip gather is not cheaper.
 _N_FLAGS = 3      # run overflow, far future, uniform contract violated
 
 
@@ -498,7 +503,7 @@ def intake_uniform_kernel(
         if TRACE >= 2:
             at = pin(at)
             n_ev = mark(trace, n_ev, 6, 0, TRACE_CAP)
-        tl.store(main_time + 4 * at, e[:, None] + tl.zeros_like(mean), mask=w)
+        tl.store(main_time + 4 * at, e[:, None] + tl.zeros_like(lo).to(tl.float32), mask=w)
         tl.store(main_src + 4 * at, ((c << 24) | s)[:, None] + tl.zeros_like(seg), mask=w)
         tl.store(main_lo + 4 * at, lo, mask=w)
         tl.store(main_n + 4 * at, n, mask=w)
@@ -595,7 +600,7 @@ class IntakePlan:
     Emission buffers and topologies must stay allocated (they do: one per
     population / connection, for good). run() copies nothing: it launches
     with scalars only. n_progs: the uniform kernel's (persistent) grid,
-    default 4 programs per compute unit."""
+    default 8 programs per compute unit."""
 
     def __init__(self, ring: Ring, emissions: list[EmissionBuffer], topologies: list[TopologyNew],
                  n_progs: int | None = None):
@@ -611,7 +616,8 @@ class IntakePlan:
         self.ring, self.n_conns, self.parity = ring, n, 0
         self.emissions, self.topologies = emissions, topologies
         if n_progs is None:
-            n_progs = 4 * torch.cuda.get_device_properties(device).multi_processor_count if device.type == "cuda" else 16
+            n_progs = (_PROGS_PER_CU * torch.cuda.get_device_properties(device).multi_processor_count
+                       if device.type == "cuda" else 16)
         self.n_progs = n_progs
         self.items, self.item_segs = _ITEMS, _ITEM_SEGS  # uniform kernel: items per step, segments per item
 
