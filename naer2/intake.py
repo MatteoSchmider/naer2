@@ -243,6 +243,7 @@ def _insert_side(
                     sv = tl.load(side_src + src_at, mask=qm)
                     lv = tl.load(side_lo + src_at, mask=qm)
                     nv = tl.load(side_n + src_at, mask=qm)
+                    tl.debug_barrier()  # every warp has read its block before any overwrites it
                     tl.store(side_time + dst_at, tv, mask=qm)
                     tl.store(side_src + dst_at, sv, mask=qm)
                     tl.store(side_lo + dst_at, lv, mask=qm)

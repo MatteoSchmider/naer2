@@ -30,6 +30,8 @@ ap.add_argument("--heat", type=int, default=0,
 ap.add_argument("--entry-block", type=int, default=None)
 ap.add_argument("--no-counters", action="store_true", help="compile the stand-in receive counters out (PD14's kernel)")
 ap.add_argument("--stream", type=int, default=None)
+ap.add_argument("--fused", action="store_true", help="one fused kernel per population (pull intake)")
+ap.add_argument("--level", type=int, default=1, help="trace level (fused: 2 also stamps inside the pull)")
 args = ap.parse_args()
 if args.rdna2:
     import rdna2  # noqa: F401
@@ -43,7 +45,7 @@ from pd14_setup import PD14
 US = 0.01  # REALTIME tick: 10 ns
 med = st.median
 b = PD14(args.G, unroll=args.unroll, stream=args.stream, main_cap=args.main_cap,
-         entry_block=args.entry_block, count_received=not args.no_counters)
+         entry_block=args.entry_block, count_received=not args.no_counters, fused=args.fused)
 _masks = [b.fire_mask(r) for r in range(200)]
 
 
@@ -57,8 +59,8 @@ r = 0
 for _ in range(20):
     b.round(r, fires[r]); r += 1
 for p in b.pops.values():
-    p.set_trace(1024)
-itraces = {n: Trace(p.plan.n_progs, 256) for n, p in b.pops.items()}
+    p.set_trace(1024, **(dict(level=args.level) if args.fused else {}))
+itraces = {} if args.fused else {n: Trace(p.plan.n_progs, 256) for n, p in b.pops.items()}
 for _ in range(3):  # compile the traced kernels
     b.round(r, fires[r], intake_traces=itraces); r += 1
 torch.cuda.synchronize()
@@ -107,9 +109,10 @@ for _ in range(args.rounds):
     reset()
     t = 10.0 + 0.1 * r
     for n, p in b.pops.items():
-        p.run(t, t + 0.1, fires[r][n], b.zeros[n], uniform=True, num_warps=b.warps_update)
+        p.run(t, t + 0.1, fires[r][n], b.zeros[n], uniform=True, num_warps=b.warps_update,
+              **(dict(round_id=r) if args.fused else {}))
         torch.cuda.synchronize()
-    for n, p in b.pops.items():
+    for n, p in b.pops.items() if not args.fused else ():
         p.plan.run(True, num_warps=b.warps_intake, trace=itraces[n])
         torch.cuda.synchronize()
     r += 1
@@ -132,8 +135,8 @@ def union(intervals):
 
 
 p0 = next(iter(b.pops.values()))
-print(f"{torch.cuda.get_device_name(0)} G={args.G} U={p0.unroll} "
-      f"chunk={p0.entry_block} stream={p0.stream}, "
+print(f"{torch.cuda.get_device_name(0)} {'fused' if args.fused else 'split'} G={args.G} U={p0.unroll} "
+      f"chunk={getattr(p0, 'entry_block', '-')} stream={p0.stream}, "
       f"{args.rounds} rounds per mode\n")
 print("CONCURRENT (production): median over rounds, us")
 rows = defaultdict(list)
@@ -144,9 +147,11 @@ for rd in timeline:
     itk = [(q["start"], q["end"]) for (kind, _), progs in rd.items() if kind == "intake" for q in ran(progs)]
     rows["round span (first program start -> last end)"].append((t1 - t0) * US)
     rows["  GPU busy (union of all programs)"].append(union(allp) * US)
-    rows["  update phase window"].append((max(e for _, e in upd) - min(s for s, _ in upd)) * US)
-    rows["  gap update end -> first intake start"].append((min(s for s, _ in itk) - max(e for _, e in upd)) * US)
-    rows["  intake phase window"].append((max(e for _, e in itk) - min(s for s, _ in itk)) * US)
+    rows["  update phase window" if itk else "  fused kernels window"].append(
+        (max(e for _, e in upd) - min(s for s, _ in upd)) * US)
+    if itk:
+        rows["  gap update end -> first intake start"].append((min(s for s, _ in itk) - max(e for _, e in upd)) * US)
+        rows["  intake phase window"].append((max(e for _, e in itk) - min(s for s, _ in itk)) * US)
 for k, v in rows.items():
     print(f"  {k:48s} {med(v):8.1f}")
 
@@ -156,7 +161,20 @@ def phases(events, kind):
     for (a, _, ca), (bb, _, cb) in zip(events, events[1:]):
         if kind == "update":
             key = {("start", "state"): "load state", ("state", "slot"): "to first slot",
+                   ("start", "pulled"): "pull intake", ("pulled", "state"): "load state",
+                   ("start", "runs"): "pull: fresh runs", ("runs", "spikes"): "pull: spike loads",
+                   ("appended", "spikes"): "pull: spike loads", ("spikes", "found"): "pull: segment lookup",
+                   ("found", "appended"): "pull: append", ("appended", "pulled"): "pull: e-group barrier",
+                   ("runs", "pulled"): "pull: no spikes",
+                   # TRACE 3: the append's chain, per tile
+                   ("found", "a:segments"): "append: segment words", ("a:stored", "a:segments"): "append: segment words",
+                   ("a:segments", "a:mean"): "append: bucket mean", ("a:mean", "a:claimed"): "append: claim (LDS)",
+                   ("a:claimed", "a:targets"): "append: link targets", ("a:stored", "a:targets"): "append: link targets",
+                   ("a:targets", "a:stored"): "append: store records", ("a:stored", "appended"): "append: tile end",
+                   ("a:claimed", "appended"): "append: no links", ("found", "appended"): "append: nothing to append",
                    ("slot", "headers"): "entry headers", ("headers", "streamed"): "gather -> LDS",
+                   ("slot", "streamed"): "records -> LDS (first block)",  # the fused kernel: no headers
+                   ("walked", "streamed"): "records -> LDS (next blocks)",
                    ("streamed", "walked"): "walk", ("delivered", "sent"): "propagate + send",
                    ("sent", "end"): "summary + state"}.get((a, bb))
             if key is None:

@@ -7,11 +7,12 @@ kernels (`naer2/greenfield`, `naer2/intake.py`). All run on the default GPU;
 
 | tool | what it does |
 |---|---|
-| `pd14_setup.py` | the shared PD14 benchmark: the 8 cortical populations as green-field `Pop`s with their `TopologyNew` connections (0.1 ms buckets), PD14-like firing, one round = every update kernel, then every intake kernel |
+| `pd14_setup.py` | the shared PD14 benchmark: the 8 cortical populations as green-field `Pop`s with their `TopologyNew` connections (0.1 ms buckets), PD14-like firing, one round = every update kernel, then every intake kernel; `fused=True` (`--fused` in the tools below): `FusedPop`s, one fused kernel per population and round |
 | `pd14_roundtrip.py G` | wall clock per round, populations on their own streams; `--breakdown`: host issue time and each phase alone |
 | `trace_round.py G` | every program of every kernel on one wall-clock axis, from the kernels' own stamps (`naer2/trace.py`): the round's timeline (concurrent) and per kernel its span, programs alive and phases (isolated); `--heat N` keeps the clock up, `--no-counters` compiles the stand-in receive counters out (PD14's kernel) |
 | `walk_sweep.py G` | update-kernel walk configurations compared fairly: one process, one network, configurations interleaved round by round |
 | `intake_sweep.py G` | the same for the uniform intake's program count and tile shape |
+| `fused_sweep.py G` | the fused kernel's pull-intake variants (runs batched by emission time or one by one; segments through the group directory or by binary search), interleaved; also the directories' memory |
 | `kernel_isa.py G` | compiles the update kernel and summarizes its ISA: VGPRs, spills, LDS, per loop the instruction mix and the highest VGPR touched |
 | `rdna2.py` | lets Triton 3.9 compile for RDNA2 (lowers as gfx1100, codegen as gfx1030) |
 
@@ -37,4 +38,7 @@ One-off investigations, kept for what they established:
 | `atomic_bench.py` | returning `atomic_add` is fast on shared addresses (~2,300/us on 860 addresses, they stay in L2) and slow only when spread over ~1M addresses (~370/us): intake was never atomic-bound |
 | `store_bench.py` | intake's appends are bound by write locality: 4 field arrays ~76-95 us per 512-append tile, 16-byte records ~66, records interleaved by cache line across cells ~21 (capacity-independent); delivery reads stay within noise across layouts -- hence the ring's record layout and `_rec` |
 | `occupancy_lds.py` | LDS is 128 KB per WGP on both GPUs, at most 16 programs of 4 warps per WGP; up to 8 KB per program never limits occupancy |
+| `latency_chase.py` | one dependent load on the 780M (pointer chase, clock kept up): ~40 ns within 16 KB, ~70 ns at 256 KB, 207-222 ns at 2-16 MB, ~285 ns from DRAM; an LDS gather step ~33 ns |
+| `launch_cost.py` | Gluon and Triton launch alike; the JIT's dispatch costs ~2.5-3 us per tensor argument (the AMD backend specializes each one every launch): ~52 us for the fused kernel's signature against ~5 us for the launcher alone -- hence `FusedPop`'s cached direct launch (~8 us) |
+| `stream_sync_cost.py` | an event record or wait ~0.6 us with events made once, torch's `wait_stream` ~5 us (a new event per call), `with torch.cuda.stream` ~5 us: a round's fan-out/fan-in over 8 streams ~15 us through pre-made events against ~83 us with `wait_stream` |
 | `wave_segments.py` | splitting segments per wave (each wave walks only its own neurons' links) would cost PD14 x1.5 ring entries and chunks, +663 MB of segment metadata, to save part of the walk -- a net loss while per-entry costs dominate |

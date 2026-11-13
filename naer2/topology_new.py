@@ -48,6 +48,14 @@ def topology_ptrs(buf, n_sources, n_segments, n_buckets, n_links):
     )
 
 
+@triton.jit
+def directory_ptrs(buf, n_sources, n_pairs):
+    """Typed pointers into a TopologyNew.directory() buffer: dir_offsets,
+    dir_first, words ([n_sources, W, 2]: bitmap word, earlier count)."""
+    dir_first = buf + n_sources + 1
+    return buf, dir_first, dir_first + n_pairs + 1
+
+
 class TopologyNew:
     """See the module docstring.
 
@@ -139,6 +147,52 @@ class TopologyNew:
         for i, (name, values) in enumerate(attrs.items()):
             self.attrs[name] = attr_block[i]
             self.write(name, values)
+
+    def directory(self) -> tuple[torch.Tensor, int, int]:
+        """Per source, which groups it reaches and where their segments
+        start -- for pull intake, which needs a source's segments into ONE
+        group (see naer2/greenfield/fused.py). Built once on request, as one
+        int32 buffer (directory_ptrs):
+          dir_offsets [n_sources + 1]  pairs of source s: dir_offsets[s] : dir_offsets[s + 1]
+          dir_first   [n_pairs + 1]    first segment of each (source, group) pair, in segment
+                                       order; a pair's segments end where the next pair's start
+          words       [n_sources, W, 2] per source and 32-group word: its bitmap of reached
+                                       groups, and how many reached groups the earlier words hold
+        A spike of source s finds group g's segments in three dependent
+        steps: word (s, g // 32) and dir_offsets[s] -> dir_first at
+        dir_offsets[s] + earlier count + popcount of the lower bits ->
+        the segments; a clear bit means no segments in g. Memory: one word
+        per (source, reached group) pair plus 2 * ceil(n_groups / 32) per
+        source. Returns (buffer, n_pairs, W)."""
+        if getattr(self, "_directory", None) is None:
+            dev = self.buf.device
+            counts = self.seg_offsets.diff().to(torch.int64)
+            seg_source = torch.repeat_interleave(torch.arange(self.n_sources, device=dev), counts)
+            seg_group = ((self.seg_gb >> 16) & 0xFFFF).to(torch.int64)
+            key = seg_source * self.n_groups + seg_group
+            first = torch.ones(self.n_segments, device=dev, dtype=torch.bool)
+            first[1:] = key[1:] != key[:-1]
+            pair_seg = first.nonzero().flatten()
+            n_pairs = len(pair_seg)
+            pair_source, pair_group = seg_source[pair_seg], seg_group[pair_seg]
+            W = -(-self.n_groups // 32)
+            bits = torch.zeros(self.n_sources * W, device=dev, dtype=torch.int64)
+            word = pair_source * W + pair_group // 32
+            bits.index_add_(0, word, torch.ones_like(word) << (pair_group % 32))  # distinct bits: sum = or
+            per_word = torch.bincount(word, minlength=self.n_sources * W).view(self.n_sources, W)
+            prefix = per_word.cumsum(1) - per_word
+            buf = torch.zeros((self.n_sources + 1) + (n_pairs + 1) + 2 * self.n_sources * W, device=dev,
+                              dtype=torch.int32)
+            buf[: self.n_sources + 1] = torch.searchsorted(pair_source, torch.arange(self.n_sources + 1, device=dev))
+            o = self.n_sources + 1
+            buf[o:o + n_pairs] = pair_seg.to(torch.int32)
+            buf[o + n_pairs] = self.n_segments
+            o += n_pairs + 1
+            words = buf[o:].view(self.n_sources, W, 2)
+            words[:, :, 0] = (((bits + 2**31) % 2**32) - 2**31).to(torch.int32).view(self.n_sources, W)
+            words[:, :, 1] = prefix.to(torch.int32)
+            self._directory = (buf, n_pairs, W)
+        return self._directory
 
     def link_addresses(self) -> tuple[int, int, int]:
         """Device addresses of seg_start, link_target and the attribute block

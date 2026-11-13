@@ -95,3 +95,30 @@ def test_locality_is_links_per_segment():
     topo = Topology(torch.tensor([0, 8]), torch.arange(8))
     assert TopologyNew(topo, 8, 8, "cpu").locality() == 8.0
     assert TopologyNew(topo, 8, 1, "cpu").locality() == 1.0
+
+
+@pytest.mark.parametrize("group_size", [4, 8, 64])
+def test_group_directory_finds_every_source_group_range(group_size):
+    """directory(): for every (source, group), bit set iff the source has
+    segments in the group, and the pair's first / next-pair's first segment
+    bracket exactly those segments (the lookup the pull intake does)."""
+    torch.manual_seed(3)
+    topo = _random_topology(40, 300, 12, seed=3)
+    delay = torch.rand(len(topo)) * 0.5 + 0.1
+    t = TopologyNew(topo, 300, group_size, "cpu", delay=delay, resolution=0.1)
+    buf, n_pairs, W = t.directory()
+    offs, first = buf[:t.n_sources + 1].tolist(), buf[t.n_sources + 1:t.n_sources + 2 + n_pairs].tolist()
+    words = buf[t.n_sources + 2 + n_pairs:].view(t.n_sources, W, 2).tolist()
+    by_pair = {}
+    for s, g, _b, lo, hi in t.segments():
+        by_pair.setdefault((s, g), []).append((lo, hi))
+    seg_index = {(lo, hi): i for i, (_s, _g, _b, lo, hi) in enumerate(t.segments())}
+    for s in range(t.n_sources):
+        for g in range(t.n_groups):
+            bits, earlier = words[s][g // 32]
+            has = (bits >> (g % 32)) & 1
+            assert bool(has) == ((s, g) in by_pair), (s, g)
+            if has:
+                pair = offs[s] + earlier + bin(bits & ((1 << (g % 32)) - 1) & 0xFFFFFFFF).count("1")
+                segs = [seg_index[x] for x in by_pair[(s, g)]]
+                assert (first[pair], first[pair + 1]) == (min(segs), max(segs) + 1), (s, g)
