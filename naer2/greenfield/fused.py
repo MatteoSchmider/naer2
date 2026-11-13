@@ -13,7 +13,7 @@ Per program (group g):
      g's segments among the source's (sorted by (group, bucket)) through
      the topology's group directory (or two interleaved binary searches),
      every link of them one 16-byte record (e, source word, link index,
-     target) in its slot's run of g's ring (naer2/intake.py). Uniform
+     target) in its slot's run of g's ring (naer2/greenfield/ring.py). Uniform
      emission: all fresh runs of one emission time as one stream of spike
      blocks (each spike's run and its connection's pointers from read-only
      LDS tables), a block of spikes x a block of their segments at a time,
@@ -21,10 +21,12 @@ Per program (group g):
      a per-group watermark: main run if e >= the watermark and not
      emission-delayed, else sorted insertion into the side run -- correct
      in any spike order (the baseline; slow).
-  2. delivery: the due slots of g's ring, as naer2/greenfield/update.py
-     but straight from the link records: STREAM records at a time, each one
-     128-bit load, its fields staged flat in LDS and walked (side-run merge
-     where needed).
+  2. delivery: the due slots of g's ring in slot order, straight from the
+     link records: STREAM records at a time, each one 128-bit load, its
+     fields staged flat in LDS, walked U links per broadcast LDS read, every
+     link received in order by its target lane (the scalar receive: lanes
+     compare against the link's target, no cross-lane traffic); a slot with
+     side records merges main and side runs by e with two cursors.
   3. propagation, stand-in send, emission into the history (flat list per
      run, no per-group sort: consumers order what they need themselves).
 
@@ -46,13 +48,11 @@ from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from naer2.intake import Ring, _rec, _ring
 from naer2.topology_new import TopologyNew, directory_ptrs, topology_ptrs
 from naer2.trace import Trace, mark, pin, pin_s, trace_begin, trace_end
 
 from .history import EmissionHistory, history_ptrs, history_tag
-from .pop import WALK
-from .update import _receive, _walk
+from .ring import Ring, _rec, _ring
 
 FUSED_TRACE_TAGS = ("start", "state", "pulled", "slot", "headers", "streamed", "walked", "delivered", "sent", "end",
                     "runs", "spikes", "found", "appended",  # TRACE >= 2: inside the pull
@@ -60,6 +60,10 @@ FUSED_TRACE_TAGS = ("start", "state", "pulled", "slot", "headers", "streamed", "
                     # inside the append, per tile
 PULL = dict(batch=True, directory=True)  # FusedPop defaults, see FusedPop.__init__; tools/fused_sweep.py: directory
 # and batching ~30% (PD14, G=256, 780M)
+# delivery walk: links staged in LDS per stream block, links per broadcast LDS read (tools/walk_sweep.py on
+# the split kernels, PD14, G=256, 780M: larger U costs more in registers than it saves; an explicit
+# occupancy target (waves_per_eu) gains <= 3% and spills beyond 12 waves)
+WALK = dict(stream=256, unroll=8)
 SPK = gl.constexpr(32)   # spikes per pull block (uniform)
 MSEG = gl.constexpr(4)   # segments per pull column block (uniform): a spike reaches a group with ~2-3 (PD14)
 
@@ -340,6 +344,61 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
     return n_ev
 
 
+# ------------------------------------------------- delivery
+
+
+@gluon.jit
+def _receive(t, w, srcword, e, current, received, n_received, lane, mask, k, pid,
+             log_ptr, log_e, log_cap, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr):
+    """ONE link: t its target within the group (uniform over the program,
+    -1 for none), w its weight. Every lane compares against t and the
+    target lane runs the receive. A multapse's weights arrive one link at a
+    time, in link order."""
+    hit = (lane == t) & mask
+    current = gl.where(hit, current + w, current)  # PD14 receive
+    if COUNT:  # the stand-in's bookkeeping (tests), not PD14
+        received = gl.where(hit, received + w, received)
+        n_received = n_received + hit.to(gl.int32)
+    if LOG:
+        if t >= 0:
+            at_log = gl.atomic_add(log_ptr, 1)
+            if at_log < log_cap:
+                rec = log_ptr + 1 + 4 * at_log
+                gl.store(rec, k)
+                gl.store(rec + 1, srcword >> 24)
+                gl.store(rec + 2, srcword & 0xFFFFFF)
+                gl.store(rec + 3, pid * GROUP_SIZE + t)
+                gl.store(log_e + at_log, e)
+    return current, received, n_received
+
+
+@gluon.jit
+def _walk(r_tgt, r_w, r_src, r_e, nq, current, received, n_received, lane, mask, ui, k, pid,
+          log_ptr, log_e, log_cap, GROUP_SIZE: gl.constexpr, U: gl.constexpr, LU: gl.constexpr,
+          LOG: gl.constexpr, COUNT: gl.constexpr):
+    """The staged stream block's nq links, U per broadcast LDS read,
+    received one by one by their target lanes."""
+    for g in range(0, (nq + U - 1) // U):
+        tg = r_tgt.index(g).load(LU)
+        wg = r_w.index(g).load(LU)
+        if LOG:
+            sg = r_src.index(g).load(LU)
+            eg = r_e.index(g).load(LU)
+        for u in gl.static_range(U):
+            t = gl.sum(gl.where(ui == u, tg, 0), axis=0)    # in-thread: a register select
+            w = gl.sum(gl.where(ui == u, wg, 0.0), axis=0)
+            if LOG:
+                srcword = gl.sum(gl.where(ui == u, sg, 0), axis=0)
+                e = gl.sum(gl.where(ui == u, eg, 0.0), axis=0)
+            else:
+                srcword = 0
+                e = 0.0
+            current, received, n_received = _receive(
+                t, w, srcword, e, current, received, n_received, lane, mask, k, pid,
+                log_ptr, log_e, log_cap, GROUP_SIZE, LOG, COUNT)
+    return current, received, n_received
+
+
 @gluon.jit
 def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, STREAM: gl.constexpr,
                    NUM_WARPS: gl.constexpr, LOG: gl.constexpr):
@@ -427,7 +486,7 @@ def fused_kernel(
     gl.static_assert(GROUP_SIZE % U == 0, "GROUP_SIZE must be a multiple of U")
     # (connection, source history slot) pairs, 2**LOG_CJ; K: own history depth, SK: the sources'
     MAX_CJ: gl.constexpr = MAX_CONNS * KP
-    # delivery layouts (naer2/greenfield/update.py)
+    # delivery layouts: neurons over lanes and warps, the U links of a walk group whole in every thread
     LT: gl.constexpr = gl.BlockedLayout([SPT, U], [32, 1], [NUM_WARPS, 1], [1, 0])
     LN: gl.constexpr = gl.SliceLayout(1, LT)
     LU: gl.constexpr = gl.SliceLayout(0, LT)
@@ -711,7 +770,7 @@ def fused_kernel(
     if TRACE:
         n_ev = mark(trace, n_ev, 2, total, TRACE_CAP)
 
-    # ---- 2. delivery (naer2/greenfield/update.py)
+    # ---- 2. delivery
     current = gl.load(current_ptr + offs, mask=mask)
     if TRACE:
         current = pin(current)

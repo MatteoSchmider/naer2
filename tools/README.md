@@ -1,19 +1,19 @@
 # tools
 
-Benchmarks and diagnostics for the spike-management redesign's green-field
-kernels (`naer2/greenfield`, `naer2/intake.py`). All run on the default GPU;
-`--rdna2` (where offered) loads the shim for the RX 6600 eGPU, run with
-`HSA_OVERRIDE_GFX_VERSION_2=10.3.0 HIP_VISIBLE_DEVICES=1`.
+Benchmarks and diagnostics for the spike-management redesign's fused kernel
+(`naer2/greenfield`). All run on the default GPU; `--rdna2` (where offered)
+loads the shim for the RX 6600 eGPU, run with
+`HSA_OVERRIDE_GFX_VERSION_2=10.3.0 HIP_VISIBLE_DEVICES=1`. The split update
+and intake kernels before them, with `walk_sweep.py` and `intake_sweep.py`,
+are in git history (commit `caea455`).
 
 | tool | what it does |
 |---|---|
-| `pd14_setup.py` | the shared PD14 benchmark: the 8 cortical populations as green-field `Pop`s with their `TopologyNew` connections (0.1 ms buckets), PD14-like firing, one round = every update kernel, then every intake kernel; `fused=True` (`--fused` in the tools below): `FusedPop`s, one fused kernel per population and round |
-| `pd14_roundtrip.py G` | wall clock per round, populations on their own streams; `--breakdown`: host issue time and each phase alone |
-| `trace_round.py G` | every program of every kernel on one wall-clock axis, from the kernels' own stamps (`naer2/trace.py`): the round's timeline (concurrent) and per kernel its span, programs alive and phases (isolated); `--heat N` keeps the clock up, `--no-counters` compiles the stand-in receive counters out (PD14's kernel) |
-| `walk_sweep.py G` | update-kernel walk configurations compared fairly: one process, one network, configurations interleaved round by round |
-| `intake_sweep.py G` | the same for the uniform intake's program count and tile shape |
+| `pd14_setup.py` | the shared PD14 benchmark: the 8 cortical populations as `FusedPop`s with their `TopologyNew` connections (0.1 ms buckets), PD14-like firing; one round = one fused kernel per population, each on its own stream (pre-made events through a hub) |
+| `pd14_roundtrip.py G` | wall clock per round, populations on their own streams (`--sequential`: on one); `--breakdown`: host issue time (queue filling, GPU idle) and the round alone |
+| `trace_round.py G` | every program of every population's kernel on one wall-clock axis, from the kernels' own stamps (`naer2/trace.py`): the round's span and GPU busy time (concurrent) and per population its span, programs alive and phases (isolated); `--level 2/3` split the pull intake further, `--heat N` keeps the clock up, `--no-counters` compiles the stand-in receive counters out (PD14's kernel) |
 | `fused_sweep.py G` | the fused kernel's pull-intake variants (runs batched by emission time or one by one; segments through the group directory or by binary search), interleaved; also the directories' memory |
-| `kernel_isa.py G` | compiles the update kernel and summarizes its ISA: VGPRs, spills, LDS, per loop the instruction mix and the highest VGPR touched |
+| `kernel_isa.py G` | compiles the fused kernel and summarizes its ISA: VGPRs, spills, LDS, per loop the instruction mix and the highest VGPR touched |
 | `rdna2.py` | lets Triton 3.9 compile for RDNA2 (lowers as gfx1100, codegen as gfx1030) |
 
 ## Measuring on these GPUs

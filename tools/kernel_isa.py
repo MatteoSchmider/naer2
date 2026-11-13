@@ -1,10 +1,10 @@
-"""Compile the green-field update kernel for a small consumer and summarize
-its ISA: registers, spills, LDS, and per loop body the instruction mix and
-the highest VGPR it touches (where register pressure peaks).
+"""Compile the fused kernel (naer2/greenfield/fused.py) for a small consumer
+and summarize its ISA: registers, spills, LDS, and per loop body the
+instruction mix and the highest VGPR it touches (where register pressure
+peaks).
 
-    python tools/kernel_isa.py G [unroll] [counters 1|0] [entry_block stream]
-    env: N_CONNS (incoming connections, default 1), WAVES (waves_per_eu target),
-         FUSED=1 (the fused kernel, naer2/greenfield/fused.py)
+    python tools/kernel_isa.py G [unroll] [counters 1|0] [stream]
+    env: N_CONNS (incoming connections, default 1), WAVES (waves_per_eu target)
 """
 import math
 import os
@@ -14,33 +14,28 @@ import sys
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..")]
 import torch
 
-from naer2.greenfield import Pop, update_kernel
-from naer2.greenfield.fused import FusedPop, fused_kernel
-from test.test_intake_gpu import _topology
+from naer2.greenfield import FusedPop, fused_kernel
+from test.topologies import random_topology
 
 G = int(sys.argv[1])
 unroll = int(sys.argv[2]) if len(sys.argv) > 2 else None
 count = (sys.argv[3] != "0") if len(sys.argv) > 3 else True
-chunk = [int(x) for x in sys.argv[4:6]] if len(sys.argv) > 5 else None
+stream = int(sys.argv[4]) if len(sys.argv) > 4 else None
 N_CONNS = int(os.environ.get("N_CONNS", "1"))
 WAVES = int(os.environ.get("WAVES", "0"))
-FUSED = os.environ.get("FUSED", "0") == "1"
-make = FusedPop if FUSED else Pop
-a, c = make(2 * G, group_size=G), make(2 * G, group_size=G)
+a, c = FusedPop(2 * G, group_size=G), FusedPop(2 * G, group_size=G)
 c.unroll = unroll or c.unroll
 c.count_received = count
 c.waves_per_eu = WAVES
-if chunk:
-    c.entry_block, c.stream = chunk
-c.connect([a] * N_CONNS, [_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(N_CONNS)],
+c.stream = stream or c.stream
+c.connect([a] * N_CONNS, [random_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(N_CONNS)],
           n_slots=8)
 c.run(1.0, 1.1, torch.full((2 * G,), math.inf))
 torch.cuda.synchronize()
-kernel = fused_kernel if FUSED else update_kernel
-k = [k for cache in kernel.device_caches.values() for k in cache[0].values()][-1]
+k = [k for cache in fused_kernel.device_caches.values() for k in cache[0].values()][-1]
 asm = k.asm["amdgcn"]
-print(f"{'fused' if FUSED else 'update'} G={G} conns={N_CONNS} waves_per_eu={WAVES} U={c.unroll} counters={int(count)} "
-      f"chunk/stream={getattr(c, 'entry_block', '-')}/{c.stream}: vgpr {k.n_regs}, spills {k.n_spills}, LDS bytes {k.metadata.shared}")
+print(f"fused G={G} conns={N_CONNS} waves_per_eu={WAVES} U={c.unroll} counters={int(count)} "
+      f"stream={c.stream}: vgpr {k.n_regs}, spills {k.n_spills}, LDS bytes {k.metadata.shared}")
 lines = [l.split(";")[0].strip() for l in asm.split("\n")]
 labels = {l[:-1]: i for i, l in enumerate(lines) if re.match(r"^\.LBB\w+:$", l)}
 print("   loop head        instrs barrier  ds  loads waitcnt valu  max-vgpr")

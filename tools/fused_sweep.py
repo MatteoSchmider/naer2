@@ -30,7 +30,7 @@ NAMES = {(True, True): "batch+dir", (True, False): "batch+search", (False, True)
          (False, False): "per run+search"}
 HEAT = 5
 t0 = time.time()
-b = PD14(G, fused=True, count_received=False)
+b = PD14(G, count_received=False)
 build_s = time.time() - t0
 dir_mb = sum(t.directory()[0].numel() * 4 for p in b.pops.values() for t in p.plan.topologies) / 2**20
 seg_mb = sum(t.buf.numel() * 4 for p in b.pops.values() for t in p.plan.topologies) / 2**20
@@ -74,7 +74,7 @@ def measure(concurrent):
         p.trace.buf.zero_()
     f = fire(r)
     if concurrent:
-        b.update(r, f)
+        b.round(r, f)
         torch.cuda.synchronize()
         spans = [span(p.traced()) for p in b.pops.values()]
         out = (max(e for _, e in spans) - min(s for s, _ in spans)) * 0.01

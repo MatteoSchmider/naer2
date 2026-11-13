@@ -109,12 +109,12 @@ y = torch.zeros(1, device="cuda")
 torch_us = per_launch(lambda: y.add_(1))
 
 # the real thing: a small consumer with 8 incoming connections, no spikes
-from naer2.greenfield.fused import FusedPop, fused_kernel  # noqa: E402
-from test.test_intake_gpu import _topology  # noqa: E402
+from naer2.greenfield import FusedPop  # noqa: E402
+from test.topologies import random_topology  # noqa: E402
 
 G = 256
 a, c = FusedPop(2 * G, group_size=G), FusedPop(2 * G, group_size=G)
-c.connect([a] * 8, [_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(8)], n_slots=8)
+c.connect([a] * 8, [random_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(8)], n_slots=8)
 c.count_received = False
 fire = torch.full((2 * G,), math.inf, device="cuda")
 zeros = torch.zeros(2 * G, device="cuda")

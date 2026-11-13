@@ -16,7 +16,7 @@ import torch
 import naer2.greenfield.fused as fused
 from naer2.greenfield.fused import FusedPop
 from naer2.topology_new import TopologyNew
-from test.test_intake_gpu import _topology
+from test.topologies import random_topology as _topology
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a real GPU (CUDA/ROCm) to launch the kernel"
@@ -31,10 +31,10 @@ def _device():
     torch.cuda.set_device(0)
 
 
-@pytest.fixture(autouse=True, params=[(128, 256, 8), (32, 32, 8)], ids=["default", "small-stream"])
+@pytest.fixture(autouse=True, params=[(256, 8), (32, 8)], ids=["default", "small-stream"])
 def _walk(monkeypatch, request):
-    entry_block, stream, unroll = request.param
-    monkeypatch.setattr(fused, "WALK", dict(entry_block=entry_block, stream=stream, unroll=unroll))
+    stream, unroll = request.param
+    monkeypatch.setattr(fused, "WALK", dict(stream=stream, unroll=unroll))
 
 
 @pytest.fixture(autouse=True, params=[(True, True), (True, False), (False, True), (False, False)],
