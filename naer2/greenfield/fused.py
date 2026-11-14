@@ -14,7 +14,7 @@ Per program (group g):
      the topology's group directory (or two interleaved binary searches),
      every link of them one 16-byte record (e, source word, link index,
      target) in its slot's run of g's ring (naer2/greenfield/ring.py). Uniform
-     emission: all fresh runs of one emission time as one stream of spike
+     sources: all fresh runs of one emission time as one stream of spike
      blocks (each spike's run and its connection's pointers from read-only
      LDS tables), a block of spikes x a block of their segments at a time,
      the link loop four links per step. Otherwise sequential per entry with
@@ -36,6 +36,22 @@ programs read the same values); entries arriving before the ring position
 go to its first undelivered slot (late), at or past N_SLOTS ahead are far
 future (flag 1), full runs flag 0, uniform violations flag 2, a consumer
 falling behind its sources' history raises the overrun flag.
+
+Integration into the library (TODO.md, 1e): `# INTEGRATE <KIND>: <rule>`
+comments mark every point where this hand-written kernel meets the
+library's hooks and scheduler --
+  HOOK(<callback>)        where a transpiled hook (update, receive, send,
+                          edge forward / backward) goes, and what it sees
+  NODE / EDGE / SOURCE(<callbacks>)
+                          a node, per-link or source attribute: which
+                          callbacks it comes from decides where it is
+                          loaded, held and stored
+  HOST                    what the scheduler / Population provides
+  CONFIG                  per-population constants and capacities
+  DEV                     what only tests and tools use (compiled out)
+  LIMITATION / GAP        a known limitation to keep documented when
+                          porting / a missing piece that is solvable later
+  D-n                     decision n in TODO.md 1e
 """
 
 import contextlib
@@ -64,8 +80,8 @@ PULL = dict(batch=True, directory=True)  # FusedPop defaults, see FusedPop.__ini
 # the split kernels, PD14, G=256, 780M: larger U costs more in registers than it saves; an explicit
 # occupancy target (waves_per_eu) gains <= 3% and spills beyond 12 waves)
 WALK = dict(stream=256, unroll=8)
-SPK = gl.constexpr(32)   # spikes per pull block (uniform)
-MSEG = gl.constexpr(4)   # segments per pull column block (uniform): a spike reaches a group with ~2-3 (PD14)
+SPK = gl.constexpr(32)   # spikes per pull block (uniform sources)
+MSEG = gl.constexpr(4)   # segments per pull column block (uniform sources): a spike reaches a group with ~2-3 (PD14)
 
 
 # ------------------------------------------------- the plan
@@ -86,6 +102,13 @@ def _fused_plan(plan, n_conns):
     )
 
 
+# INTEGRATE HOST: built by Population from its incoming Connections: per connection its source Population's
+#   EmissionHistory and its Fabric's TopologyNew (Fabric.topology + delay at the consumer's slot resolution,
+#   the finest among its incoming connections, D-12). Connections numbered grouped by receive VARIANT (D-6):
+#   the connection id in every record's source word then selects the variant by compile-time comparisons
+# INTEGRATE EDGE(receive, forward): attr_addr points at each connection's per-link attribute BLOCK -- every edge
+#   tensor attr its receive (edge.x) or forward (self.x) references, contiguous per link (link l's attrs at
+#   block + l * n_attrs; TopologyNew's [n_attrs, n_links] becomes [n_links, n_attrs]), D-7
 class FusedPlan:
     """A consumer's incoming connections, built once into one int32 buffer:
     per connection its source's EmissionHistory and its TopologyNew
@@ -271,7 +294,7 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
                   N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, LP2: gl.constexpr, LM: gl.constexpr,
                   SPK: gl.constexpr, MSEG: gl.constexpr,
                   TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, NUM_WARPS: gl.constexpr):
-    """A block of spikes (uniform emission): every segment [a, b) of the
+    """A block of spikes (uniform sources): every segment [a, b) of the
     ones going to the main runs claims a range of its slot's run in group
     g's ring -- the per-slot link counts live in LDS (s_cnt), the program
     being the run's only writer -- and writes one record per link there, in
@@ -355,8 +378,16 @@ def _receive(t, w, srcword, e, current, received, n_received, lane, mask, k, pid
     target lane runs the receive. A multapse's weights arrive one link at a
     time, in link order."""
     hit = (lane == t) & mask
+    # INTEGRATE HOOK(receive): the transpiled receive goes here, rooted at `hit` (MaskAliasTransformer's
+    #   is_target: the one target lane); edge.x -> the link's staged value of x (here w); time = the link's
+    #   arrival, e + its bucket's mean delay (D-1); the code chosen by the link's receive variant, a scalar
+    #   (warp-uniform) branch on its connection id (D-6). PD14's receive is the line below
+    # INTEGRATE HOOK(send): send runs here too, after every delivery, rooted at `hit` (D-2) -- and once more after
+    #   update. Its n2.spike() (and receive's) can fire any number of times per neuron and run (D-3): each
+    #   spike appended to the program's emission buffer (see the emission below), its time the expression's
+    # INTEGRATE GAP: source.x is unsupported for now (D-10)
     current = gl.where(hit, current + w, current)  # PD14 receive
-    if COUNT:  # the stand-in's bookkeeping (tests), not PD14
+    if COUNT:  # INTEGRATE DEV: the stand-in's bookkeeping (tests), not PD14
         received = gl.where(hit, received + w, received)
         n_received = n_received + hit.to(gl.int32)
     if LOG:
@@ -378,6 +409,11 @@ def _walk(r_tgt, r_w, r_src, r_e, nq, current, received, n_received, lane, mask,
           LOG: gl.constexpr, COUNT: gl.constexpr):
     """The staged stream block's nq links, U per broadcast LDS read,
     received one by one by their target lanes."""
+    # INTEGRATE EDGE(receive): one broadcast LDS read and one register select per staged attr slot (here: w);
+    #   up to the most attrs any variant's receive reads (D-7)
+    # INTEGRATE HOOK(receive): per link, its variant from srcword >> 24 (D-6) and its arrival time (D-1) are
+    #   selected alongside -- a variant is the same for all links of one source spike through one connection,
+    #   but links of different spikes and connections interleave here, so the choice is made per link
     for g in range(0, (nq + U - 1) // U):
         tg = r_tgt.index(g).load(LU)
         wg = r_w.index(g).load(LU)
@@ -421,8 +457,22 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, S
     l = gl.convert_layout(l, LRQ)
     srcw = gl.convert_layout(srcw, LRQ)
     t = gl.convert_layout(t, LRQ)
+    # INTEGRATE EDGE(receive, forward): the link's attribute block, loaded here by link index l through the
+    #   connection's block pointer (D-7): its variant's attrs into the stage's attr slots; here: the weight
     atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
     w = gl.load(atp + l, mask=qv, other=0.0)
+    # INTEGRATE HOOK(forward): the transpiled edge forward goes here, on link lanes (one record per lane, rooted
+    #   at qv -- the old template's lane_mask="_lk_valid"), its assigned attrs stored back at l before staging,
+    #   so receive sees the updated values as in the no-delay template. The variant differs per LANE here
+    #   (unlike in the walk): each variant present in the block runs masked to its lanes (D-6); time = the
+    #   link's arrival (D-1)
+    # INTEGRATE LIMITATION (D-8): keep this as a comment when porting -- one link twice in one stream block (its
+    #   source spiking in two runs taken in together) is read by both lanes before either stores: the later
+    #   lane works on a stale value, and the last store wins, overwriting the changes of every forward call on
+    #   that link in the block but the last
+    # INTEGRATE GAP (D-9): forward's destination.x (the target neuron's state) isn't wired up -- the target is
+    #   known here (t) and its state is in scope in the walk; connecting the two is left for later
+    # INTEGRATE GAP (D-10): source.x unsupported for now
     s_tgt.store(gl.where(qv, t, -1))
     s_w.store(w)
     if LOG:
@@ -439,6 +489,9 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
     """A slot with side entries: its main and side runs of link records
     merged by emission time with two cursors (main first on ties), each
     link received in order."""
+    # INTEGRATE HOOK(forward), HOOK(receive), HOOK(send), EDGE: as in _stage_records and _walk, one link at a
+    #   time (forward strictly sequential here: no D-8 limitation); the main/side merge by the records' time
+    #   word -- the arrival once the record carries it (D-1)
     im = gl.to_tensor(0)
     js = gl.to_tensor(0)
     for _ in range(nm + ns):
@@ -468,12 +521,19 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
 @gluon.jit(do_not_specialize=["n_neurons", "n_conns", "k_lo", "k_hi", "run_id", "round_id", "parity", "log_cap",
                               "hist_cap"])
 def fused_kernel(
+    # INTEGRATE NODE: one <attr>_ptr per dynamic node attr (KernelBuilder's naming) in place of PD14's four,
+    #   each loaded where its callbacks first need it, stored once at the end (the NODE markers below)
+    # INTEGRATE HOST: k_lo, k_hi, slot_width, round_id, parity, run_id, t_start, t_end come from the scheduler
+    #   (Population._execute_update_kernel's window, Network.step's round), see FusedPop.run
+    # INTEGRATE DEV: received_ptr, n_received_ptr, log_ptr, log_cap (stand-in receive bookkeeping), trace_ptr
+    # INTEGRATE HOOK(send): fire_time_ptr, emit_delay_ptr are the stand-in send's inputs, gone with the real send
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr, n_neurons,
     plan, n_conns, ring, wmark_ptr, oflags, k_lo, k_hi, slot_width, round_id, parity,  # intake + delivery
     received_ptr, n_received_ptr, log_ptr, log_cap,          # stand-in receive, delivery log
     fire_time_ptr, emit_delay_ptr,                           # stand-in send
     history, hist_cap, run_id, t_start, t_end, trace_ptr,
-    GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_TIME: gl.constexpr,
+    GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr,
+    UNIFORM_SOURCES: gl.constexpr, UNIFORM_EMISSION: gl.constexpr,
     N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr,
     LOG: gl.constexpr,
     STREAM: gl.constexpr, U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr,
@@ -484,6 +544,10 @@ def fused_kernel(
 ):
     gl.static_assert(STREAM % U == 0, "STREAM must be a multiple of U")
     gl.static_assert(GROUP_SIZE % U == 0, "GROUP_SIZE must be a multiple of U")
+    # INTEGRATE CONFIG: GROUP_SIZE, N_SLOTS, MAIN_CAP, SIDE_CAP, STREAM, U, BATCH, DIR per population (ring.py,
+    #   PULL, WALK); UNIFORM_EMISSION: every n2.spike() in this population's hooks is bare (from the AST);
+    #   UNIFORM_SOURCES: every source's is (the batched pull) -- D-5
+    # INTEGRATE DEV: COUNT, LOG, TRACE, TRACE_CAP
     # (connection, source history slot) pairs, 2**LOG_CJ; K: own history depth, SK: the sources'
     MAX_CJ: gl.constexpr = MAX_CONNS * KP
     # delivery layouts: neurons over lanes and warps, the U links of a walk group whole in every thread
@@ -520,6 +584,8 @@ def fused_kernel(
     n_cells = n_groups * N_SLOTS
 
     # ---- 1. pull intake: what the sources emitted since this consumer last read them
+    # INTEGRATE: no user code in the pull -- it only moves (e, source, link, target) records into the ring;
+    #   every hook runs at delivery, in delivery order (strict per-link order)
     ci = gl.arange(0, MAX_CONNS, layout=LV)
     cv = ci < n_conns
     hbuf_c = gl.load(hist_addr + ci, mask=cv, other=0)
@@ -538,7 +604,7 @@ def fused_kernel(
     if gl.max((cv & (oldest_c < 2147483647) & (oldest_c > last_c + 1)).to(gl.int32), axis=0) > 0:
         gl.atomic_max(oflags, 1)  # a run fell out of the history before this consumer read it
     # per (connection, slot): the fresh runs, taken in in order of their
-    # (earliest) emission time -- under uniform emission a run's spikes
+    # (earliest) emission time -- under uniform sources a run's spikes
     # share one e but runs differ, and main runs must grow in e
     cj = gl.arange(0, MAX_CJ, layout=LV)
     c_of = cj // KP
@@ -567,7 +633,7 @@ def fused_kernel(
     node_addr = hbuf + 4 * (8 * SK + j_of * hcap).to(gl.int64)
     time_addr = node_addr + 4 * (SK * hcap).to(gl.int64)
     wmark = gl.load(wmark_ptr + pid)
-    if UNIFORM_TIME and BATCH:
+    if UNIFORM_SOURCES and BATCH:
         # per (connection, slot) pair, everything a spike's decode needs, as read-only LDS tables: a
         # spike looks its pair's values up directly (no barriers, no layout conversions per block)
         tb_j = gl.load(topo_addr + c_of, mask=vj, other=0).to(gl.pointer_type(gl.int32))
@@ -593,7 +659,7 @@ def fused_kernel(
         tab_dwords = _table(j_dwords.to(gl.int64), SM)
         tab_W = _table(gl.load(dwords_p + c_of, mask=vj, other=0), SM)
         tab_first = gl.allocate_shared_memory(gl.int32, [MAX_CJ], SM)  # per e-group: each pair's first spike
-    if UNIFORM_TIME:
+    if UNIFORM_SOURCES:
         # this group's per-slot link counts, in LDS for the pull's appends (it is their only writer)
         sl = gl.arange(0, NSP, layout=LV)
         s_cnt = gl.allocate_shared_memory(gl.int32, [NSP], SM)
@@ -605,7 +671,7 @@ def fused_kernel(
     if TRACE >= 2:
         n_runs = pin_s(n_runs)
         n_ev = mark(trace, n_ev, 10, n_runs, TRACE_CAP)
-    if UNIFORM_TIME and BATCH:
+    if UNIFORM_SOURCES and BATCH:
         # all fresh runs sharing an emission time as ONE stream of spikes
         # (normally every source's run of the previous round), in blocks
         # spanning runs and connections; e-groups in order of e
@@ -642,6 +708,8 @@ def fused_kernel(
                         s = pin(s)
                         e = pin(e)
                         n_ev = mark(trace, n_ev, 11, gl.sum(tv.to(gl.int32), axis=0), TRACE_CAP)
+                    # INTEGRATE GAP (D-10): source.x unsupported for now; taken at emission, it would be read off
+                    #   the history here, next to the spike's node and e, and travel with its records
                     wend_t = tab_wend.gather(cj_t, 0)
                     c_t = cj_t // KP
                     seg_start = tab_start.gather(cj_t, 0).to(gl.pointer_type(gl.int32))
@@ -702,7 +770,7 @@ def fused_kernel(
             node_p = naddr.to(gl.pointer_type(gl.int32))
             time_p = taddr.to(gl.pointer_type(gl.float32))
             total += n_r
-            if UNIFORM_TIME:
+            if UNIFORM_SOURCES:
                 e_max = gl.to_tensor(float("-inf"))
                 for t0 in range(0, n_r, SPK):
                     # a block of the run's spikes: each one's segments into this group
@@ -760,7 +828,7 @@ def fused_kernel(
                                     _side_insert(side_time, side_src, side_lo, side_n, side_count, flags, cell,
                                                  n_cells, e, srcw, l, tgt, SIDE_CAP, LV, BLK)
                             wmark = gl.where(to_main, gl.maximum(wmark, e), wmark)
-    if UNIFORM_TIME:
+    if UNIFORM_SOURCES:
         if violated > 0:
             gl.atomic_max(flags + 2, 1)
         gl.barrier()
@@ -771,11 +839,14 @@ def fused_kernel(
         n_ev = mark(trace, n_ev, 2, total, TRACE_CAP)
 
     # ---- 2. delivery
+    # INTEGRATE NODE(receive): load here exactly the node attrs the receive hooks read or write (PD14: current),
+    #   held in registers through the walk; attrs only update/send touch are loaded after delivery (registers
+    #   here are occupancy, TODO.md 1d)
     current = gl.load(current_ptr + offs, mask=mask)
     if TRACE:
         current = pin(current)
         n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
-    if COUNT:
+    if COUNT:  # INTEGRATE DEV
         received = gl.load(received_ptr + offs, mask=mask, other=0.0)
         n_received = gl.load(n_received_ptr + offs, mask=mask, other=0)
     else:
@@ -784,6 +855,8 @@ def fused_kernel(
     log_e = (log_ptr + 4 * log_cap + 1).to(gl.pointer_type(gl.float32))
     # the stream block's fields, staged flat (the walk reads them as [STREAM // U, U]), and the
     # connections' attribute pointers (weights by link index), a read-only table
+    # INTEGRATE EDGE(receive): one block pointer per connection; one LDS stage buffer per attr slot -- the most
+    #   attrs any variant's receive reads (here: the weight), D-7
     cq = gl.arange(0, MAX_CONNS, layout=LV)
     s_atp = gl.allocate_shared_memory(gl.int64, [MAX_CONNS], SM)
     s_atp.store(gl.load(attr_addr + cq, mask=cq < n_conns, other=0))
@@ -800,6 +873,12 @@ def fused_kernel(
     r_src = s_src.reinterpret(gl.int32, [STREAM // U, U], SM)
     r_e = s_e.reinterpret(gl.float32, [STREAM // U, U], SM)
     gl.barrier()
+    # INTEGRATE HOOK(receive): every delivery's time is its link's arrival, e + its bucket's mean delay (D-1): the
+    #   pull knows the mean when it appends, so the record's time word carries the arrival (the main/side
+    #   decision on e is made by then)
+    # INTEGRATE LIMITATION (D-1): a slot's records are in emission order, not arrival order -- links of different
+    #   buckets in one slot can reach a target out of arrival order by less than one slot width (a receive-side
+    #   integrator sees time step back)
     for k in range(k_lo, k_hi + 1):
         cell = pid * N_SLOTS + k % N_SLOTS
         nm = gl.minimum(gl.load(main_count + cell), MAIN_CAP)
@@ -828,13 +907,17 @@ def fused_kernel(
                 log_ptr, log_e, log_cap, GROUP_SIZE, LOG, COUNT)
         gl.store(main_count + cell, 0)
         gl.store(side_count + cell, 0)
-    if COUNT:
+    if COUNT:  # INTEGRATE DEV
         gl.store(received_ptr + offs, received, mask=mask)
         gl.store(n_received_ptr + offs, n_received, mask=mask)
     if TRACE:
         n_ev = mark(trace, n_ev, 7, 0, TRACE_CAP)
 
     # ---- 3. propagation (PD14), stand-in send, emission into the history
+    # INTEGRATE NODE(update, send): load here the node attrs only update/send touch (PD14: t_ref_end,
+    #   potential, last_time); what receive touched is still live
+    # INTEGRATE HOOK(update): the transpiled update goes here, time = t_end (the old templates' `time = t`);
+    #   PD14's propagation below; then send once more (after every delivery too, D-2)
     t_ref_end = gl.load(t_ref_end_ptr + offs, mask=mask)
     potential = gl.load(potential_ptr + offs, mask=mask)
     last_time = gl.load(last_time_ptr + offs, mask=mask)
@@ -849,9 +932,14 @@ def fused_kernel(
     potential = gl.where(~_m0 & mask, -38.30576 + P_V * (potential - -38.30576) + P_VI * current, potential)
     current = P_I * current
 
+    # INTEGRATE HOOK(send): the transpiled send goes here (PD14: threshold, reset, refractory end) in place of the
+    #   stand-in fire times. n2.spike() lowers to an append to the program's emission buffer -- in delivery
+    #   (receive, send after every delivery, D-2) and here alike, any number per neuron and run (D-3) -- which
+    #   the emission below flushes into the history with one count atomic. Bare n2.spike() emits at the window's
+    #   START, t_start (D-4; the old lowering used t, the end)
     fire = gl.load(fire_time_ptr + offs, mask=mask, other=float("inf"))
     fires = mask & (fire >= t_start) & (fire < t_end)
-    if UNIFORM_TIME:
+    if UNIFORM_EMISSION:
         e = gl.zeros_like(fire) + t_start
     else:
         e = fire + gl.load(emit_delay_ptr + offs, mask=mask, other=0.0)
@@ -860,6 +948,7 @@ def fused_kernel(
     n_emit = gl.sum(_n_fire, axis=0)
     potential = gl.where(fires, -65.0, potential)
     t_ref_end = gl.where(fires, time + 2.0, t_ref_end)
+    # INTEGRATE NODE: every node attr any hook assigns, stored once, here
     gl.store(t_ref_end_ptr + offs, t_ref_end, mask=mask)
     gl.store(potential_ptr + offs, potential, mask=mask)
     gl.store(current_ptr + offs, current, mask=mask)
@@ -867,6 +956,10 @@ def fused_kernel(
     if TRACE:
         n_ev = mark(trace, n_ev, 8, 0, TRACE_CAP)
 
+    # INTEGRATE HOOK(backward): out of scope -- needs this run's spikes at every incoming link of each firing
+    #   target (a reverse topology), D-11
+    # INTEGRATE CONFIG: the history's cap is no longer one spike per neuron (D-3); a run's spikes beyond it raise
+    #   the overflow flag
     slot = run_id % K
     (h_tag, h_count, h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, slot, K, hist_cap)
     base = gl.atomic_add(h_count, n_emit)  # this program's place in the run's flat list
@@ -915,6 +1008,11 @@ def _direct_launch(kernel, n_programs, consts):
     return launch
 
 
+# INTEGRATE HOST: FusedPop's job becomes Population's -- its dynamic attrs as the state tensors, the
+#   EmissionHistory, and ring + watermarks + FusedPlan built once the network's connections are fixed;
+#   run() is called from Population._execute_update_kernel with that run's window (t_start, t_end,
+#   deliver_until), on the stream Network keeps for the population, round_id = Network.step's round;
+#   _direct_launch's cache keyed by everything that selects the compiled variant (the transpiled source too)
 class FusedPop:
     """A green-field population on the fused kernel: PD14-like state, its
     EmissionHistory, and with connect() its rings, per-group watermarks and
@@ -927,14 +1025,14 @@ class FusedPop:
         self.current = torch.zeros(n, device=device)
         self.t_ref_end = torch.zeros(n, device=device)
         self.last_time = torch.zeros(n, device=device)
-        self.history = EmissionHistory(n, depth, device)
+        self.history = EmissionHistory(n, depth, device)  # INTEGRATE CONFIG: depth from the scheduler (history.py)
         self.run_id = 0
-        self.received = torch.zeros(n, device=device)
+        self.received = torch.zeros(n, device=device)  # INTEGRATE DEV: received, n_received, log, trace
         self.n_received = torch.zeros(n, device=device, dtype=torch.int32)
         self.stream, self.unroll = WALK["stream"], WALK["unroll"]
         self.count_received = True
         self.waves_per_eu = 0
-        # pull intake (uniform emission): all fresh runs of one emission time as one spike stream
+        # pull intake (uniform sources): all fresh runs of one emission time as one spike stream
         # (else run by run), segments found through the group directory (else binary search)
         self.batch, self.use_directory = PULL["batch"], PULL["directory"]
         self.trace = None
@@ -954,12 +1052,17 @@ class FusedPop:
         self._launchers = {}  # new buffers (their sizes are part of the AMD backend's specialization)
 
     def run(self, t_start, t_end, fire_time, emit_delay=None, uniform=True, deliver_until=None, round_id=None,
-            num_warps=4, stream=None):
+            num_warps=4, stream=None, uniform_emission=None, uniform_sources=None):
         """One run over [t_start, t_end) in round `round_id` (default: the
         run id): take in what the sources emitted in earlier rounds, deliver
         every ring slot that ends by `deliver_until` (default t_end), emit.
+        uniform_emission: this run's spikes all at t_start (the stand-in
+        send ignores fire times within the window); uniform_sources: every
+        source's runs are (the batched pull); both default to `uniform`.
         stream: a torch.cuda.Stream to launch on (default: the current one;
         passing it saves switching the current stream, ~5 us)."""
+        uniform_emission = uniform if uniform_emission is None else uniform_emission
+        uniform_sources = uniform if uniform_sources is None else uniform_sources
         self.run_id += 1
         w = self.ring.slot_width
         k_lo = self.ring.ring_pos
@@ -977,7 +1080,8 @@ class FusedPop:
             self.trace.buf if self.trace is not None else self.log,
         )
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
-        key = (uniform, num_warps, self.waves_per_eu, self.count_received, self.batch, self.use_directory,
+        key = (uniform_emission, uniform_sources, num_warps, self.waves_per_eu, self.count_received, self.batch,
+               self.use_directory,
                self.stream, self.unroll, self.log_cap > 0, fire_time.dtype, emit_delay.dtype)
         launch = self._launchers.get(key)
         aligned = not (fire_time.data_ptr() | emit_delay.data_ptr()) & 15  # the specialization every call meets
@@ -987,7 +1091,7 @@ class FusedPop:
         p2 = triton.next_power_of_2
         consts = dict(
             GROUP_SIZE=self.group_size, K=self.history.K, SK=self.plan.K, KP=p2(self.plan.K),
-            UNIFORM_TIME=uniform,
+            UNIFORM_SOURCES=uniform_sources, UNIFORM_EMISSION=uniform_emission,
             N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap, SIDE_CAP=self.ring.side_cap,
             LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
             SPT=max(self.group_size // lanes, 1), NUM_WARPS=num_warps,

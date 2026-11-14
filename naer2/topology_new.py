@@ -25,6 +25,12 @@ Everything is linear in sources, segments and links -- nothing dense over
 kept separately, for reading and writing attributes in canonical order.
 """
 
+# INTEGRATE HOST: one TopologyNew per Connection, built from its Fabric (topology, per-link delay, and every
+#   edge tensor attr receive or forward references as `attrs`) at the consumer's group size and slot
+#   resolution (D-12); it replaces Topology.blocked and Fabric.bind_device's blocked order -- the device
+#   copy of a plastic attr lives here, in simulation order, `perm` giving canonical order for user access
+# INTEGRATE EDGE(receive, forward): attrs become one block per link -- link l's attrs contiguous,
+#   [n_links, n_attrs] instead of [n_attrs, n_links] -- so one pointer per connection reaches them all (D-7)
 import torch
 import triton
 import triton.language as tl

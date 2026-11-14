@@ -26,6 +26,11 @@ import torch
 import triton
 import triton.language as tl
 
+# INTEGRATE CONFIG: one ring per consumer population; n_slots covers its longest incoming delay (+ emission
+#   delay) at one slot width -- the finest resolution any of its incoming connections requires (D-12; the
+#   coarser connections could be optimized later); capacities per population, below
+# INTEGRATE HOOK(receive): a record's time word carries the link's arrival, e + its bucket's mean delay, once
+#   the pull writes it (D-1)
 # TODO: run capacities are fixed constants for now; a burst (e.g. PD14's
 # 902-spike thalamic volley) lands in every slot of its delay range at once.
 # They should become population-specific and adjust themselves on overflow.

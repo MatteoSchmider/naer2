@@ -1213,6 +1213,109 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      `TopologyNew.locality`); the eGPU's power states make sync-heavy
      measurements on it unusable.
 
+1e. **Integrating the fused kernel — markers and decisions (2026-11-14).**
+   The split update + intake kernels are gone (in git history at `caea455`);
+   what is left to integrate is `naer2/greenfield/` (`fused.py`, `history.py`,
+   `ring.py`), `naer2/topology_new.py` and `naer2/trace.py`. Every point where
+   the hand-written kernel meets the library carries a marker,
+   `# INTEGRATE <KIND>: <rule>` (`grep -rn "INTEGRATE" naer2`):
+   - `HOOK(<callback>)` — where a transpiled hook goes and what it sees:
+     receive per link in the walk (rooted at the target lane), send after
+     every delivery and once more after update, update after delivery
+     (`time = t_end`), edge forward per link on link lanes while staging
+     (before receive sees the values), backward out of scope.
+   - `NODE` / `EDGE` / `SOURCE(<callbacks>)` — which callbacks an attribute
+     comes from decides where it lives: node attrs receive (or the
+     per-delivery send) touches are loaded before delivery and held through
+     the walk; attrs only update/send touch are loaded after delivery; every
+     assigned attr is stored once at the end. Edge attrs receive or forward
+     reference are loaded per link by link index while staging; forward's
+     assigned ones are stored back there.
+   - `HOST` — what Population / Network.step provide (window, round, stream,
+     plan, histories); `CONFIG` — per-population constants and capacities;
+     `DEV` — tests and tools only (stand-in counters, delivery log, trace).
+   - `LIMITATION` / `GAP` — a known limitation to keep documented in the
+     ported code / a missing piece, solvable later.
+   - `D-n` — the decisions below.
+
+   Old templates as the reference (`no_delay_update_kernel.py`,
+   `per_link_delay_update_kernel.py`): all node attrs loaded at the start and
+   stored at the end; per link tile edge forward on link lanes -> its stores
+   -> densify -> receive (target lanes) -> send after every delivery; then
+   `time = t`, update, send once more. The per-link-delay variant delivers
+   diagonal k at time (k + 1) * w and disallows edge callbacks.
+
+   **Decisions** (judged together, 2026-11-14):
+   - **D-1 receive's `time` is the link's arrival, e + its bucket's mean
+     delay** — use all the emission resolution there is; NEST-like
+     quantized behaviour is still one line in the node's send (quantize the
+     emission time). The pull knows the mean when it appends, so the
+     record's time word carries the arrival (the main/side decision on e is
+     made by then; the side-run merge then merges by arrival).
+     *Limitation:* a slot's records are in emission order, not arrival
+     order, so links of different buckets in one slot can reach a target
+     out of arrival order by less than one slot width — a receive-side
+     integrator (e.g. `lif_ed`, which drops dt < 0) sees time step back.
+   - **D-2 send runs after every delivery** (rooted at the target lane), and
+     once more after update — the accuracy event-driven models need.
+   - **D-3 any number of spikes per neuron and run** (n2.spike() in receive,
+     in the per-delivery send, at several send sites) — required to keep
+     long-timestep, sparsely active event-driven populations accurate.
+     n2.spike() appends to the program's emission buffer, flushed into the
+     history with one count atomic; the history's cap is sized per
+     population, a run beyond it raises the overflow flag.
+   - **D-4 bare n2.spike() emits at the window's start, t_start** (a
+     convention; the old lowering used t, the window end).
+   - **D-5 two flags:** `UNIFORM_EMISSION` (this population's own spikes,
+     every n2.spike() in its hooks bare) and `UNIFORM_SOURCES` (all its
+     sources', the batched pull). Done in `fused.py`: `run(...,
+     uniform_emission=, uniform_sources=)`, both defaulting to `uniform`.
+   - **D-6 per-connection receive code, selected per source spike.** A
+     connection's target port picks the node's receive hook and its edge
+     type the edge attrs and forward, so the code is fixed per connection
+     and therefore for every link of a source spike that arrives through
+     it. What is selected is a small VARIANT index: connections with the
+     same (receive hook, edge type) share one (PD14: one variant for all
+     8). The connection id is in every record's source word; numbering the
+     plan's connections grouped by variant makes the variant test
+     compile-time comparisons on it (c < B1, c < B2, ...), no table. In the
+     walk a link is uniform over the program's lanes, so the test is a
+     scalar branch — no divergence, only the taken variant executes; the
+     costs are code size (every variant's receive and per-delivery send in
+     the walk body, unrolled U times) and registers (every node attr any
+     variant touches stays live through the walk). Although the variant is
+     a property of the spike (constant over a segment's contiguous records
+     in a slot's run), segments are ~1.6 links in PD14 and the pull
+     interleaves spikes of all connections, so the branch is taken per
+     link. Forward is different: it runs on link lanes while staging, where
+     the variant varies per LANE — each variant present in a block runs
+     masked to its lanes (cost ~ the sum over the variants present).
+   - **D-7 per-link attrs as one block per link:** link l's attrs contiguous
+     (`TopologyNew`'s [n_attrs, n_links] becomes [n_links, n_attrs]), the
+     plan's per-connection pointer pointing at the block; the stage loads a
+     link's variant's attrs into attr slots (the most any variant's receive
+     reads), the walk selects them per link.
+   - **D-8 limitation, documented when porting:** one link twice in one
+     stream block (its source spiking in two runs taken in together) is read
+     by both lanes before either stores — the later works on a stale value,
+     and the last store overwrites the changes of every forward call on that
+     link in the block but the last. Should practically never happen; the
+     ported code must spell it out.
+   - **D-9 gap:** forward's `destination.x` (the target neuron's state) isn't
+     wired up — solvable, since the link's target is known while staging and
+     its state is in scope in the walk; connecting the two comes later.
+   - **D-10 `source.x` unsupported for now.** Reading the source's state at
+     delivery (the old template's way) gives a later value than at emission
+     in the pull model; a real solution (e.g. carried with the spike) comes
+     later. Edge hooks writing `source.x` / `destination.x` stay unsupported.
+   - **D-11 edge backward out of scope for now** (needs a reverse topology).
+   - **D-12 one slot width per consumer: the finest resolution its incoming
+     connections require**; the coarser-resolution case may be optimized
+     later.
+   - **D-13 event-driven scheduling keeps reading the source's summary
+     (count, earliest e) from the history header on the host** — a sync per
+     run, fine for now.
+
 2. **Get the full PD14 network (`test/networks/PD14/net.py`) actually running in
    main.py**, as the first real-scale proof the whole stack holds together
    rather than developing further pieces in a vacuum against small hand-built
