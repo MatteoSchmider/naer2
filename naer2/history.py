@@ -64,7 +64,7 @@ class EmissionHistory:
 
     def __init__(self, n_neurons: int, depth: int = 3, device="cuda", cap: int | None = None):
         if depth < 3:
-            raise ValueError("an emission history needs at least 3 run slots (see naer2/greenfield/history.py)")
+            raise ValueError("an emission history needs at least 3 run slots (see naer2/history.py)")
         self.K, self.cap = depth, cap or n_neurons
         K, c = self.K, self.cap
         self.buf = torch.zeros(HDR_WORDS * K + 2 * K * c + 1, device=device, dtype=torch.int32)

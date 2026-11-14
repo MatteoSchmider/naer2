@@ -1210,13 +1210,15 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      append, pointer chasing; interleaving got the locality instead).
    - **Open**: ring run capacities are still fixed and oversized; the
      group size should become automatic and device-dependent (see
-     `TopologyNew.locality`); the eGPU's power states make sync-heavy
+     `SimulationTopology.locality`); the eGPU's power states make sync-heavy
      measurements on it unusable.
 
 1e. **Integrating the fused kernel — markers and decisions (2026-11-14).**
    The split update + intake kernels are gone (in git history at `caea455`);
-   what is left to integrate is `naer2/greenfield/` (`fused.py`, `history.py`,
-   `ring.py`), `naer2/topology_new.py` and `naer2/trace.py`. Every point where
+   what is left to integrate is `naer2/greenfield/fused.py` (the kernel and
+   `FusedPop`) and, already moved into the library (2026-11-15),
+   `naer2/history.py`, `naer2/ring.py`, `SimulationTopology` in
+   `naer2/topology.py`, plus `naer2/trace.py`. Every point where
    the hand-written kernel meets the library carries a marker,
    `# INTEGRATE <KIND>: <rule>` (`grep -rn "INTEGRATE" naer2`):
    - `HOOK(<callback>)` — where a transpiled hook goes and what it sees:
@@ -1291,7 +1293,7 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      the variant varies per LANE — each variant present in a block runs
      masked to its lanes (cost ~ the sum over the variants present).
    - **D-7 per-link attrs as one block per link:** link l's attrs contiguous
-     (`TopologyNew`'s [n_attrs, n_links] becomes [n_links, n_attrs]), the
+     (`SimulationTopology`'s [n_attrs, n_links] becomes [n_links, n_attrs]), the
      plan's per-connection pointer pointing at the block; the stage loads a
      link's variant's attrs into attr slots (the most any variant's receive
      reads), the walk selects them per link.

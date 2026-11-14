@@ -15,7 +15,7 @@ import torch
 
 import naer2.greenfield.fused as fused
 from naer2.greenfield.fused import FusedPop
-from naer2.topology_new import TopologyNew
+from naer2.topology import SimulationTopology
 from test.topologies import random_topology as _topology
 
 pytestmark = pytest.mark.skipif(
@@ -96,7 +96,7 @@ def test_history_keeps_recent_runs_only():
 # ------------------------------------------------------------ delivery
 
 
-def _expected_deliveries(topo: TopologyNew, c: int, spikes, ring_pos: int, slot_width: float):
+def _expected_deliveries(topo: SimulationTopology, c: int, spikes, ring_pos: int, slot_width: float):
     """Per spike (e, source) of connection c taken in at ring position
     ring_pos: every link it delivers, as (slot, e, connection, source,
     target, weight)."""

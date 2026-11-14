@@ -1,6 +1,6 @@
 """The PD14 spike-management benchmark setup shared by the tools: the 8
 cortical populations as FusedPops (naer2/greenfield/fused.py) with their
-TopologyNew connections (0.1ms delay buckets), firing at PD14-like rates;
+SimulationTopology connections (0.1ms delay buckets), firing at PD14-like rates;
 one round = one fused kernel per population, every population on its own
 stream."""
 
@@ -10,7 +10,7 @@ import time
 import torch
 
 from naer2.greenfield import FusedPop
-from naer2.topology_new import TopologyNew
+from naer2.topology import SimulationTopology
 from test.networks.PD14.net import build, description
 
 RATE = dict(E_23=0.0, I_23=2.2, E_4=5.0, I_4=6.0, E_5=8.5, I_5=8.5, E_6=1.7, I_6=7.6)  # Hz
@@ -36,8 +36,8 @@ class PD14:
         self.links = self.segments = 0
         for p, name in cortical.items():
             conns = [c for c in p.incoming if c._source in cortical]
-            topos = [TopologyNew(c.fabric.topology, len(p.shape), G, "cuda", delay=c.fabric.delay, resolution=RES,
-                                 attrs={"weight": c.fabric.weight}) for c in conns]
+            topos = [SimulationTopology(c.fabric.topology, len(p.shape), G, "cuda", delay=c.fabric.delay,
+                                        resolution=RES, attrs={"weight": c.fabric.weight}) for c in conns]
             self.links += sum(t.n_links for t in topos)
             self.segments += sum(t.n_segments for t in topos)
             n_slots = int((max(float(t.bucket_mean.max()) for t in topos) + 0.2) / RES) + 2

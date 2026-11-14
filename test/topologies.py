@@ -1,9 +1,9 @@
-"""Random TopologyNew connections for the GPU tests and tools."""
+"""Random SimulationTopology connections for the GPU tests and tools."""
 
 import torch
 
 from naer2.topology import Topology
-from naer2.topology_new import TopologyNew
+from naer2.topology import SimulationTopology
 
 
 def random_topology(n_src, n_tgt, group_size, delay="random", k=6, seed=0, weight=False, device="cuda:0"):
@@ -18,5 +18,5 @@ def random_topology(n_src, n_tgt, group_size, delay="random", k=6, seed=0, weigh
     attrs = {"weight": torch.rand(len(topo), generator=g)} if weight else None
     if delay == "random":
         d = torch.rand(len(topo), generator=g) * 0.5 + 0.1
-        return TopologyNew(topo, n_tgt, group_size, device, delay=d, resolution=0.1, attrs=attrs)
-    return TopologyNew(topo, n_tgt, group_size, device, delay=delay, attrs=attrs)
+        return SimulationTopology(topo, n_tgt, group_size, device, delay=d, resolution=0.1, attrs=attrs)
+    return SimulationTopology(topo, n_tgt, group_size, device, delay=delay, attrs=attrs)

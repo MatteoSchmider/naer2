@@ -1,8 +1,8 @@
-"""naer2/greenfield/ring.py's host side: the layout constraints a Ring enforces."""
+"""naer2/ring.py's host side: the layout constraints a Ring enforces."""
 
 import pytest
 
-from naer2.greenfield.ring import Ring
+from naer2.ring import Ring
 
 
 def test_run_capacity_must_be_a_multiple_of_4():

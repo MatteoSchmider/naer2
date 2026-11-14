@@ -9,7 +9,7 @@ are in git history (commit `caea455`).
 
 | tool | what it does |
 |---|---|
-| `pd14_setup.py` | the shared PD14 benchmark: the 8 cortical populations as `FusedPop`s with their `TopologyNew` connections (0.1 ms buckets), PD14-like firing; one round = one fused kernel per population, each on its own stream (pre-made events through a hub) |
+| `pd14_setup.py` | the shared PD14 benchmark: the 8 cortical populations as `FusedPop`s with their `SimulationTopology` connections (0.1 ms buckets), PD14-like firing; one round = one fused kernel per population, each on its own stream (pre-made events through a hub) |
 | `pd14_roundtrip.py G` | wall clock per round, populations on their own streams (`--sequential`: on one); `--breakdown`: host issue time (queue filling, GPU idle) and the round alone |
 | `trace_round.py G` | every program of every population's kernel on one wall-clock axis, from the kernels' own stamps (`naer2/trace.py`): the round's span and GPU busy time (concurrent) and per population its span, programs alive and phases (isolated); `--level 2/3` split the pull intake further, `--heat N` keeps the clock up, `--no-counters` compiles the stand-in receive counters out (PD14's kernel) |
 | `fused_sweep.py G` | the fused kernel's pull-intake variants (runs batched by emission time or one by one; segments through the group directory or by binary search), interleaved; also the directories' memory |

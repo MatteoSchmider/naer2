@@ -8,12 +8,12 @@ delivery).
 
 Per program (group g):
   1. pull intake: for every incoming connection, the runs of its source
-     since this consumer last read it (naer2/greenfield/history.py: slots
+     since this consumer last read it (naer2/history.py: slots
      tagged with an earlier round, run id past the last-read id); per spike
      g's segments among the source's (sorted by (group, bucket)) through
      the topology's group directory (or two interleaved binary searches),
      every link of them one 16-byte record (e, source word, link index,
-     target) in its slot's run of g's ring (naer2/greenfield/ring.py). Uniform
+     target) in its slot's run of g's ring (naer2/ring.py). Uniform
      sources: all fresh runs of one emission time as one stream of spike
      blocks (each spike's run and its connection's pointers from read-only
      LDS tables), a block of spikes x a block of their segments at a time,
@@ -64,11 +64,10 @@ from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from naer2.topology_new import TopologyNew, directory_ptrs, topology_ptrs
+from naer2.history import EmissionHistory, history_ptrs, history_tag
+from naer2.ring import Ring, _rec, _ring
+from naer2.topology import SimulationTopology, directory_ptrs, topology_ptrs
 from naer2.trace import Trace, mark, pin, pin_s, trace_begin, trace_end
-
-from .history import EmissionHistory, history_ptrs, history_tag
-from .ring import Ring, _rec, _ring
 
 FUSED_TRACE_TAGS = ("start", "state", "pulled", "slot", "headers", "streamed", "walked", "delivered", "sent", "end",
                     "runs", "spikes", "found", "appended",  # TRACE >= 2: inside the pull
@@ -103,22 +102,23 @@ def _fused_plan(plan, n_conns):
 
 
 # INTEGRATE HOST: built by Population from its incoming Connections: per connection its source Population's
-#   EmissionHistory and its Fabric's TopologyNew (Fabric.topology + delay at the consumer's slot resolution,
-#   the finest among its incoming connections, D-12). Connections numbered grouped by receive VARIANT (D-6):
-#   the connection id in every record's source word then selects the variant by compile-time comparisons
+#   EmissionHistory and its Fabric's SimulationTopology (Fabric.topology + delay at the consumer's slot
+#   resolution, the finest among its incoming connections, D-12). Connections numbered grouped by receive
+#   VARIANT (D-6): the connection id in every record's source word then selects the variant by compile-time
+#   comparisons
 # INTEGRATE EDGE(receive, forward): attr_addr points at each connection's per-link attribute BLOCK -- every edge
 #   tensor attr its receive (edge.x) or forward (self.x) references, contiguous per link (link l's attrs at
-#   block + l * n_attrs; TopologyNew's [n_attrs, n_links] becomes [n_links, n_attrs]), D-7
+#   block + l * n_attrs; SimulationTopology's [n_attrs, n_links] becomes [n_links, n_attrs]), D-7
 class FusedPlan:
     """A consumer's incoming connections, built once into one int32 buffer:
-    per connection its source's EmissionHistory and its TopologyNew
+    per connection its source's EmissionHistory and its SimulationTopology
     addresses (+ the topology's link_target and attribute arrays, which the
     delivery walk reads, and its group directory), the history's cap, the
     topology's source, segment, bucket and link counts, its most segments of
     one source, the directory's pair count and words per source, and the
     last-read run ids (double-buffered by the consumer's run parity)."""
 
-    def __init__(self, histories: list[EmissionHistory], topologies: list[TopologyNew], n_groups: int, device):
+    def __init__(self, histories: list[EmissionHistory], topologies: list[SimulationTopology], n_groups: int, device):
         n = len(histories)
         if n > 256:
             raise ValueError("a consumer can take at most 256 incoming connections (8-bit connection id)")

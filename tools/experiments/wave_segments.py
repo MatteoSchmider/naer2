@@ -1,7 +1,7 @@
 """What splitting each group's segments per wave would cost, in PD14
 numbers: a group of G neurons walked by G / 32 waves, each wave walking
 only the links into its own 32 neurons, needs segments (source, 32-neuron
-subgroup, bucket) -- exactly the segments TopologyNew builds at group size
+subgroup, bucket) -- exactly the segments SimulationTopology builds at group size
 32 (the ring cell stays per G-group). Compared against plain G-groups:
 segment metadata memory, ring entries per round (firing-weighted), and
 entries per update program per round (what the gather and chunking pay).
@@ -14,7 +14,7 @@ import sys
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..", ".."), os.path.join(os.path.dirname(__file__), "..")]
 import torch
 
-from naer2.topology_new import TopologyNew
+from naer2.topology import SimulationTopology
 from pd14_setup import RATE, RES
 from test.networks.PD14.net import build, description
 
@@ -31,8 +31,8 @@ for p, name in cortical.items():
             continue
         src = cortical[c._source]
         kw = dict(delay=c.fabric.delay, resolution=RES)
-        tg = TopologyNew(c.fabric.topology, len(p.shape), G, "cuda", **kw)
-        tw = TopologyNew(c.fabric.topology, len(p.shape), 32, "cuda", **kw)
+        tg = SimulationTopology(c.fabric.topology, len(p.shape), G, "cuda", **kw)
+        tw = SimulationTopology(c.fabric.topology, len(p.shape), 32, "cuda", **kw)
         spikes = len(c._source.shape) * RATE[src] * RES * 1e-3  # spikes of the source per 0.1 ms round
         ent_g = spikes * tg.n_segments / max(tg.n_sources, 1)  # ring entries per round
         ent_w = spikes * tw.n_segments / max(tw.n_sources, 1)
