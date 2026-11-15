@@ -3,8 +3,8 @@ The fused kernel's template: one launch per population and run -- intake,
 delivery, update, send and emission in one Gluon kernel, one program per
 group. This module is the FIXED part, written by hand and optimized (TODO.md
 1d); the hooks come in from outside: a kernel entry (generated from a
-population's hooks, or written by hand -- naer2/greenfield/fused.py, the
-reference) calls
+population's hooks, naer2/transpiler/templates/fused_template.py, or
+written by hand -- test/fused_reference.py, the reference) calls
 
   _pull(...)                  phase 1, no user code at all
   _deliver(state, RECEIVE)    phase 2, RECEIVE(state, hit, time, w, srcword)
@@ -82,7 +82,7 @@ FUSED_TRACE_TAGS = ("start", "state", "pulled", "slot", "headers", "streamed", "
                     "runs", "spikes", "found", "appended",  # TRACE >= 2: inside the pull
                     "a:segments", "a:mean", "a:claimed", "a:targets", "a:stored")  # TRACE >= 3:
                     # inside the append, per tile
-PULL = dict(batch=True, directory=True)  # FusedPop defaults, see FusedPop.__init__; tools/fused_sweep.py: directory
+PULL = dict(batch=True, directory=True)  # PopulationRuntime defaults (naer2/runtime.py); tools/fused_sweep.py: directory
 # and batching ~30% (PD14, G=256, 780M)
 # delivery walk: links staged in LDS per stream block, links per broadcast LDS read (tools/walk_sweep.py on
 # the split kernels, PD14, G=256, 780M: larger U costs more in registers than it saves; an explicit

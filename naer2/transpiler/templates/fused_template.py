@@ -1,8 +1,8 @@
 """
 Generates a population's fused kernel from its hooks: the entry and the
 receive function around the fixed template (naer2/transpiler/templates/
-fused.py), in exactly the shape of the hand-written reference (naer2/
-greenfield/fused.py) -- see TODO.md 1e for the decisions (D-n) it follows.
+fused.py), in exactly the shape of the hand-written reference (test/
+fused_reference.py) -- see TODO.md 1e for the decisions (D-n) it follows.
 
   entry    one <attr>_ptr per dynamic node attr, then the template's fixed
            arguments; _pull; the attrs receive (or a per-delivery send)
@@ -71,11 +71,12 @@ class FusedKernel:
     of them the receive state holds, the per-link attr staged as w, and
     whether its emission is uniform."""
 
-    def __init__(self, source: str, kernel, attrs: list[str], state_attrs: list[str], edge_attr: str | None,
-                 uniform_emission: bool, stage_e: bool):
+    def __init__(self, source: str | None, kernel, attrs: list[str], state_attrs: list[str], edge_attr: str | None,
+                 uniform_emission: bool, stage_e: bool, consts: dict | None = None):
         self.source, self.kernel = source, kernel
         self.attrs, self.state_attrs, self.edge_attr = attrs, state_attrs, edge_attr
         self.uniform_emission, self.stage_e = uniform_emission, stage_e
+        self.consts = dict(consts or {})  # constexprs of the kernel's own, beyond the template's
 
 
 class FusedKernelTemplate:
@@ -122,7 +123,18 @@ class FusedKernelTemplate:
             raise NotImplementedError("incoming connections with different receive code (ports, per-link attrs, "
                                       "edge constants) need per-variant dispatch (TODO.md 1e, D-6)")
         if not self.pop.incoming:
-            return None, None, None
+            # no connections in the DSL (a runtime wired up with topologies directly): the node's default
+            # receive, every edge.<x> it reads a per-link attr
+            hook = self.pop.node.receive.get("receive")
+            if hook is None:
+                return None, None, None
+            if UsedMemberFinder(hook.ast, "source").run():
+                raise NotImplementedError("source.<attr> in receive is unsupported for now (TODO.md 1e, D-10)")
+            used = sorted(UsedMemberFinder(hook.ast, "edge").run())
+            if len(used) > 1:
+                raise NotImplementedError(f"receive reads {len(used)} per-link attrs {used}: one per connection "
+                                          f"for now (TODO.md 1e, D-7)")
+            return hook, None, (used[0] if used else None)
         conn = self.pop.incoming[0]
         hook = self.pop.node.receive.get(conn._target_port or "receive")
         if hook is None:
@@ -157,8 +169,9 @@ class FusedKernelTemplate:
         if hook is not None:
             recv_body += HookTranspiler(hook, ctx, spike_lowering=_SpikeSites("delivery"),
                                         default_spike_time="t_start").emit_for_spike_loop(
-                set(pop.dynamic_attrs), fabric_map=conn._fabric_map, source_map=conn._source_map,
-                edge_static_attrs=conn.fabric.constant_attrs, source_static_attrs={})
+                set(pop.dynamic_attrs), fabric_map=conn._fabric_map if conn else None,
+                source_map=conn._source_map if conn else None,
+                edge_static_attrs=conn.fabric.constant_attrs if conn else {}, source_static_attrs={})
             if send_after_delivery:
                 send_d = HookTranspiler(send, ctx, spike_lowering=_SpikeSites("delivery"),
                                         default_spike_time="t_start").emit()

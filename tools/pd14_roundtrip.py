@@ -51,7 +51,7 @@ torch.cuda.synchronize()
 per_round = (time.perf_counter() - t0) / ROUNDS
 b.check()
 p0 = next(iter(b.pops.values()))
-print(f"{torch.cuda.get_device_name(0)}: fused G={args.G:4d} U={p0.unroll} S={p0.stream} warps={args.warps} "
+print(f"{torch.cuda.get_device_name(0)}: fused G={args.G:4d} U={p0.unroll} S={p0.stream_block} warps={args.warps} "
       f"{'streams' if CONC else 'sequential':10s} per round {per_round * 1e3:6.2f} ms  "
       f"(~{b.delivered() / (WARMUP + ROUNDS):,.0f} links delivered/round; {b.links / 1e6:.0f}M links, "
       f"locality {b.links / b.segments:.2f}, topologies built in {b.build_s:.0f}s)", flush=True)

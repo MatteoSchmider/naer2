@@ -1,7 +1,7 @@
 """
 A consumer's rings of arrival slots: where its fused kernel's pull intake
 puts every link it takes in, and where delivery reads them from (naer2/
-greenfield/fused.py).
+transpiler/templates/fused.py).
 
 One ring per target GROUP (the neurons one program owns). Slot k of a
 group's ring covers arrivals in [k * slot_width, (k + 1) * slot_width) and

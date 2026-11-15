@@ -100,7 +100,8 @@ for _ in range(args.rounds):
     reset()
     t = 10.0 + 0.1 * r
     for n, p in b.pops.items():
-        p.run(t, t + 0.1, fires[r][n], b.zeros[n], uniform=True, num_warps=b.warps, round_id=r)
+        p.state["fire_now"] = fires[r][n]
+        p.run(t, t + 0.1, num_warps=b.warps, round_id=r)
         torch.cuda.synchronize()
     r += 1
     for k, v in collect().items():
@@ -121,7 +122,7 @@ def union(intervals):
 
 
 p0 = next(iter(b.pops.values()))
-print(f"{torch.cuda.get_device_name(0)} fused G={args.G} U={p0.unroll} stream={p0.stream} level={args.level}, "
+print(f"{torch.cuda.get_device_name(0)} fused G={args.G} U={p0.unroll} stream={p0.stream_block} level={args.level}, "
       f"{args.rounds} rounds per mode\n")
 print("CONCURRENT (production): median over rounds, us")
 rows = defaultdict(list)

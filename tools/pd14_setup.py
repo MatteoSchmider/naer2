@@ -1,24 +1,28 @@
 """The PD14 spike-management benchmark setup shared by the tools: PD14's
-populations as FusedPops (naer2/greenfield/fused.py) with their
-SimulationTopology connections (0.1ms delay buckets); one round = one fused
-kernel per population, every population on its own stream.
+populations as PopulationRuntimes (naer2/runtime.py) running kernels
+generated from their hooks (naer2/transpiler/templates/fused_template.py),
+with their SimulationTopology connections (0.1ms delay buckets); one round =
+one fused kernel per population, every population on its own stream.
 
-model="standin" (the benchmarks): the 8 cortical populations, firing on
-command at PD14-like rates (fire_mask / fire_at), their connections among
-each other. model="pd14" (the matching target): the real network -- the 8
-cortical populations as PD14_neuron (each population's own constants,
-V_rest from its K_cortical, initial potentials as build() draws them), the
-thalamic population T as PD14_poisson, and every connection, T's included;
-nothing is commanded. t0: the time of round 0 (T fires in [700, 710] ms)."""
+model="standin" (the benchmarks): the 8 cortical populations as
+PD14_commanded (PD14's update and receive, firing on command at PD14-like
+rates: fire_mask / fire_at), their connections among each other.
+model="pd14" (the matching target): the real network -- the 8 cortical
+populations as PD14_neuron (each population's own constants, V_rest from
+its K_cortical, initial potentials as build() draws them), the thalamic
+population T as PD14_poisson, and every connection, T's included; nothing
+is commanded. t0: the time of round 0 (T fires in [700, 710] ms). Each
+population's kernel is its own (its static attrs are literals in it): the
+first run compiles one per population."""
 
-import math
 import time
 
 import torch
 
-from naer2.greenfield import FusedPop
-from naer2.greenfield.fused import pd14_neuron_params, pd14_poisson_params
+from naer2.runtime import PopulationRuntime
 from naer2.topology import SimulationTopology
+from naer2.transpiler.templates.fused_template import FusedKernelTemplate
+from test.networks.PD14.commanded import PD14_commanded
 from test.networks.PD14.net import build, description
 
 RATE = dict(E_23=0.0, I_23=2.2, E_4=5.0, I_4=6.0, E_5=8.5, I_5=8.5, E_6=1.7, I_6=7.6)  # Hz
@@ -32,7 +36,7 @@ PD14_MAIN_CAP = dict(E_23=7168, I_23=7168, E_4=8192, I_4=11776, E_5=9216, I_5=57
 class PD14:
     def __init__(self, G: int, unroll=None, stream=None, warps=4, main_cap: int | dict | None = None,
                  count_received: bool = True, model: str = "standin", t0: float = 10.0):
-        """unroll / stream: None = the walk default (naer2.greenfield.WALK);
+        """unroll / stream: None = the walk default (naer2.transpiler.templates.fused.WALK);
         main_cap: ring run capacity, one for all or per population (default:
         8 * G for the stand-in, PD14_MAIN_CAP for "pd14")."""
         if model not in ("standin", "pd14"):
@@ -45,21 +49,22 @@ class PD14:
             names[description["T"]["size"]] = "T"
         net = build()
         members = {p: names[len(p.shape)] for p in net.populations if len(p.shape) in names}
-        if model == "standin":
-            self.pops = {name: FusedPop(len(p.shape), group_size=G) for p, name in members.items()}
-        else:
-            self.pops = {}
-            for p, name in members.items():
-                if name == "T":
-                    self.pops[name] = FusedPop(len(p.shape), group_size=G, model="pd14_poisson",
-                                               params=pd14_poisson_params(p.instance))
-                else:
-                    self.pops[name] = FusedPop(len(p.shape), group_size=G, model="pd14_neuron",
-                                               params=pd14_neuron_params(p.instance))
-                    self.pops[name].potential = p.potential.to(device="cuda", dtype=torch.float32).clone()
+        K = dict(zip(description["populations"]["name"], description["populations"]["K_cortical"]))
+        self.pops = {}
+        for p, name in members.items():
+            if model == "standin":
+                pop = PD14_commanded(K_cortical=K[name]) * len(p.shape)
+                state = {a: v for a, v in pop.instance.__dict__.items() if a in pop.dynamic_attrs}
+            else:  # the real populations, with their connections
+                pop = p
+                state = {a: v for a, v in p.instance.__dict__.items() if a in p.dynamic_attrs}
+                if name != "T":
+                    state["potential"] = p.potential.to(dtype=torch.float32)
+            self.pops[name] = PopulationRuntime(FusedKernelTemplate(pop).build(), len(p.shape), group_size=G,
+                                                state=state)
         for p in self.pops.values():
             p.unroll = unroll or p.unroll
-            p.stream = stream or p.stream
+            p.stream_block = stream or p.stream_block
             p.count_received = count_received  # False: PD14's receive only (no stand-in counters)
         t0 = time.time()
         self.links = self.segments = 0
@@ -79,7 +84,6 @@ class PD14:
         torch.cuda.synchronize()
         self.build_s = time.time() - t0
         del net
-        self.zeros = {n: torch.zeros(p.n, device="cuda") for n, p in self.pops.items()}
         self.streams = {n: torch.cuda.Stream() for n in self.pops}
         # a round's dependencies through a hub (the main stream): every population after the previous
         # round, the next round after all of them; events made once (torch's wait_stream makes one per
@@ -94,36 +98,31 @@ class PD14:
                 if n in RATE}
 
     def fire_at(self, mask: dict, r: int) -> dict:
-        """Round r's stand-in fire times from a fire mask (fire times are
-        absolute: a neuron fires iff its time lies in the run's window)."""
-        t = self.t0 + RES * r
-        return {n: torch.where(m, t, math.inf) for n, m in mask.items()}
+        """Round r's commands from a fire mask: a fresh fire_now tensor per
+        population (the send consumes it, so each is used once)."""
+        return {n: m.float() for n, m in mask.items()}
 
     def fire(self, r: int) -> dict:
-        """Round r's stand-in fire times (deterministic per round)."""
-        g = torch.Generator(device="cuda").manual_seed(1000 + r)
-        t = self.t0 + RES * r
-        return {n: torch.where(torch.rand(p.n, device="cuda", generator=g) < RATE[n] * 1e-4,
-                               torch.full((p.n,), t, device="cuda"), torch.full((p.n,), math.inf, device="cuda"))
-                for n, p in self.pops.items() if n in RATE}
+        """Round r's commands (deterministic per round)."""
+        return self.fire_at(self.fire_mask(r), r)
 
     def round(self, r: int, fire: dict | None = None, concurrent=True) -> None:
         """Round r: every population's run, each on its own stream after the
         previous round (concurrent), or one after another on the current one.
-        fire: the stand-in's fire times (model "standin"); None for "pd14"."""
+        fire: the stand-in's commands (model "standin", see fire_at); None for "pd14"."""
         t = self.t0 + RES * r
-        fire = fire or {}
+        for n, f in (fire or {}).items():
+            self.pops[n].state["fire_now"] = f
         if not concurrent:
-            for n, p in self.pops.items():
-                p.run(t, t + RES, fire.get(n), self.zeros[n], uniform=True, num_warps=self.warps, round_id=r)
+            for p in self.pops.values():
+                p.run(t, t + RES, num_warps=self.warps, round_id=r)
             return
         main = torch.cuda.current_stream()
         self.ready.record(main)
         for n, p in self.pops.items():
             s = self.streams[n]
             s.wait_event(self.ready)
-            p.run(t, t + RES, fire.get(n), self.zeros[n], uniform=True, num_warps=self.warps, round_id=r,
-                  stream=s)
+            p.run(t, t + RES, num_warps=self.warps, round_id=r, stream=s)
             self.done[n].record(s)
         for n in self.pops:
             main.wait_event(self.done[n])

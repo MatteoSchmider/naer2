@@ -1,6 +1,7 @@
 """
 Generated fused kernels (naer2/transpiler/templates/fused_template.py)
-against the hand-written reference (naer2/greenfield/fused.py, MODEL):
+against the hand-written reference (test/fused_reference.py), both run by
+naer2/runtime.py:
 PD14_neuron and PD14_poisson built through the DSL, their kernels generated
 from their hooks, run side by side with the reference from the same state
 on the same inputs, run by run: every state tensor and every spike
@@ -18,13 +19,15 @@ import pytest
 import torch
 
 import naer2 as n2
-from naer2.greenfield.fused import FusedPop, pd14_neuron_params, pd14_poisson_params
+from naer2.runtime import PopulationRuntime
 from naer2.topology import SimulationTopology
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.edges import plastic_synapse, static_synapse
+from test.fused_reference import pd14_neuron_reference, pd14_poisson_reference
 from test.networks.PD14.connection import PD14_connection
 from test.networks.PD14.neuron import PD14_neuron
 from test.networks.PD14.poisson import PD14_poisson
+from test.runtimes import command, commanded_runtime
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a real GPU (CUDA/ROCm) to launch the kernel"
@@ -36,6 +39,13 @@ G = 256
 
 def _defaults(population):
     return {a: v for a, v in population.instance.__dict__.items() if a in population.dynamic_attrs}
+
+
+def _runtime(kernel, population, **state):
+    """A runtime of `population`'s size running `kernel`, its state starting at the instance's values (or
+    `state`)."""
+    return PopulationRuntime(kernel, len(population.shape), group_size=G, device=DEVICE,
+                             state={**_defaults(population), **state})
 
 
 def _same_spikes(a, b):
@@ -52,33 +62,30 @@ def test_generated_pd14_neuron_matches_the_reference():
     assert gk.state_attrs == ["current"] and gk.edge_attr == "weight" and gk.uniform_emission
 
     topo = SimulationTopology(conn.fabric.topology, 700, G, DEVICE, delay=0.2, attrs={"weight": conn.fabric.weight})
-    src = FusedPop(300, group_size=G, device=DEVICE)  # the stand-in, firing on command
-    ref = FusedPop(700, group_size=G, device=DEVICE, model="pd14_neuron", params=pd14_neuron_params(dst_pop.instance))
-    gen = FusedPop(700, group_size=G, device=DEVICE, generated=gk, defaults=_defaults(dst_pop))
+    src = commanded_runtime(300, group_size=G, device=DEVICE)  # firing on command
     init = dict(potential=torch.normal(-55.0, 6.0, (700,)), current=torch.rand(700) * 0.5,
                 t_ref_end=1.0 + torch.rand(700) * 0.4, last_time=torch.full((700,), 0.9))
-    for name, x in init.items():
-        setattr(ref, name, x.to(DEVICE))
-        gen.state[name] = x.to(DEVICE)
+    ref = _runtime(pd14_neuron_reference(dst_pop.instance), dst_pop, **init)
+    gen = _runtime(gk, dst_pop, **init)
     for p in (ref, gen):  # ~2.7k links per (group, slot) here: above the default capacity
         p.connect([src], [topo], n_slots=8, main_cap=8192)
     spiked = 0
     for r in range(10):
         t = round(1.0 + 0.1 * r, 6)
-        ref.run(t, t + 0.1, None, round_id=r)
-        gen.run(t, t + 0.1, None, round_id=r)
+        ref.run(t, t + 0.1, round_id=r)
+        gen.run(t, t + 0.1, round_id=r)
         ref.check()
         gen.check()
         delivered = int(gen.n_received.sum()) > 0
         for name in init:
             if delivered:  # summation order of the inputs: the reference's own run-to-run spread
-                assert torch.allclose(getattr(ref, name), gen.state[name], rtol=1e-6, atol=1e-5), (r, name)
+                assert torch.allclose(ref.state[name], gen.state[name], rtol=1e-6, atol=1e-5), (r, name)
             else:
-                assert torch.equal(getattr(ref, name), gen.state[name]), (r, name)
+                assert torch.equal(ref.state[name], gen.state[name]), (r, name)
         assert torch.equal(ref.n_received, gen.n_received), r
         _same_spikes(ref, gen)
         spiked += len(gen.emitted())
-        src.run(t, t + 0.1, torch.where(torch.rand(300) < 0.3, t, math.inf), round_id=r)
+        command(src, t, t + 0.1, torch.where(torch.rand(300) < 0.3, t, math.inf), round_id=r)
     assert spiked > 0 and int(gen.n_received.sum()) > 0
 
 
@@ -86,15 +93,15 @@ def test_generated_pd14_poisson_matches_the_reference():
     T = PD14_poisson(rate=0.12, t_start=700.0, t_stop=701.0) * 902
     gk = FusedKernelTemplate(T).build()
     assert gk.state_attrs == [] and gk.uniform_emission
-    ref = FusedPop(902, group_size=G, device=DEVICE, model="pd14_poisson", params=pd14_poisson_params(T.instance))
-    gen = FusedPop(902, group_size=G, device=DEVICE, generated=gk, defaults=_defaults(T))
-    assert torch.equal(ref.next_spike, gen.state["next_spike"])
+    ref = _runtime(pd14_poisson_reference(T.instance), T)
+    gen = _runtime(gk, T)
+    assert torch.equal(ref.state["next_spike"], gen.state["next_spike"])
     spiked = 0
     for r in range(20):
         t = round(699.5 + 0.1 * r, 6)
-        ref.run(t, t + 0.1, None, round_id=r)
-        gen.run(t, t + 0.1, None, round_id=r)
-        assert torch.equal(ref.next_spike, gen.state["next_spike"]), r
+        ref.run(t, t + 0.1, round_id=r)
+        gen.run(t, t + 0.1, round_id=r)
+        assert torch.equal(ref.state["next_spike"], gen.state["next_spike"]), r
         _same_spikes(ref, gen)
         spiked += len(gen.emitted())
     assert spiked > 902
@@ -249,20 +256,20 @@ def _fires(n, seed):
 
 def _deliver_once(dst_pop, sources, attrs=("weight",)):
     """sources: [(connection, fire mask)]: each source population (a stand-in
-    FusedPop) fires its mask in round 0; the generated consumer runs rounds
+    runtime, test/runtimes.py) fires its mask in round 0; the generated consumer runs rounds
     0..2 (the spikes arrive in round 2). Returns (consumer, topologies)."""
     gk = FusedKernelTemplate(dst_pop).build()
     n = len(dst_pop.shape)
-    gen = FusedPop(n, group_size=G, device=DEVICE, generated=gk, defaults=_defaults(dst_pop))
-    srcs = [FusedPop(len(conn._source.shape), group_size=G, device=DEVICE) for conn, _ in sources]
+    gen = _runtime(gk, dst_pop)
+    srcs = [commanded_runtime(len(conn._source.shape), group_size=G, device=DEVICE) for conn, _ in sources]
     topos = [SimulationTopology(conn.fabric.topology, n, G, DEVICE, delay=0.2,
                                 attrs={a: _link_attr(conn, a) for a in attrs}) for conn, _ in sources]
     gen.connect(srcs, topos, n_slots=8, main_cap=8192)
     for r in range(3):
         t = round(1.0 + 0.1 * r, 6)
-        gen.run(t, t + 0.1, None, round_id=r)
+        gen.run(t, t + 0.1, round_id=r)
         for src, (_, fires) in zip(srcs, sources):
-            src.run(t, t + 0.1, torch.where(fires, t, math.inf) if r == 0 else None, round_id=r)
+            command(src, t, t + 0.1, torch.where(fires, t, math.inf) if r == 0 else None, round_id=r)
     gen.check()
     return gen, topos
 

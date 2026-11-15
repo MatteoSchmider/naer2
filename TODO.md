@@ -1215,10 +1215,12 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
 
 1e. **Integrating the fused kernel — markers and decisions (2026-11-14).**
    The split update + intake kernels are gone (in git history at `caea455`);
-   what is left to integrate is `naer2/greenfield/fused.py` (the kernel and
-   `FusedPop`) and, already moved into the library (2026-11-15),
+   the fused kernel now lives in the library (2026-11-15): the template
+   (`naer2/transpiler/templates/fused.py`), its generator
+   (`fused_template.py`), the runtime (`naer2/runtime.py`),
    `naer2/history.py`, `naer2/ring.py`, `SimulationTopology` in
-   `naer2/topology.py`, plus `naer2/trace.py`. Every point where
+   `naer2/topology.py`, `naer2/trace.py`; `naer2/greenfield` is retired
+   (the hand-written reference is `test/fused_reference.py`). Every point where
    the hand-written kernel meets the library carries a marker,
    `# INTEGRATE <KIND>: <rule>` (`grep -rn "INTEGRATE" naer2`):
    - `HOOK(<callback>)` — where a transpiled hook goes and what it sees:
@@ -1246,6 +1248,16 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    -> densify -> receive (target lanes) -> send after every delivery; then
    `time = t`, update, send once more. The per-link-delay variant delivers
    diagonal k at time (k + 1) * w and disallows edge callbacks.
+
+   **Runtime integration, the steps** (2026-11-15): 1. runtime class
+   (`naer2/runtime.py`, FusedPop's host side; `naer2/greenfield` retired,
+   the hand-written reference kept as a test helper) -- done 2026-11-15; 2. the simulation
+   topology on Fabric (per-link attrs live there); 3. Population on the
+   runtime (compile via FusedKernelTemplate, the old gather/merge path
+   removed) -- Network.step's logic unchanged; 4. Network: the new
+   horizon-based scheduling integrated itself (rounds, event hub), free to
+   rewrite parts of 1-3; 5. sizing defaults; 6. the old path's code, tests
+   and the tools; 7. PD14 through Network.step against the harness.
 
    **Progress.** (2026-11-15) Pure moves done; template split done — the
    fixed phases in `naer2/transpiler/templates/fused.py` (`_pull`,
@@ -1320,6 +1332,10 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      every n2.spike() in its hooks bare) and `UNIFORM_SOURCES` (all its
      sources', the batched pull). Done in `fused.py`: `run(...,
      uniform_emission=, uniform_sources=)`, both defaulting to `uniform`.
+     A consumer with mixed sources (some uniform, some not) falls back to
+     the general pull for all of them (decided 2026-11-15). **Open
+     optimization:** a mixed (NON_)UNIFORM_SOURCES path, batching the
+     uniform sources and taking the others through the general pull.
    - **D-6 per-connection receive code, selected per source spike.** A
      connection's target port picks the node's receive hook and its edge
      type the edge attrs and forward, so the code is fixed per connection

@@ -1,6 +1,6 @@
 """
-A population's emission history: what its fused kernel (naer2/greenfield/
-fused.py) writes on every run and what its consumers pull from.
+A population's emission history: what its fused kernel (naer2/transpiler/
+templates/fused.py) writes on every run and what its consumers pull from.
 
 K run slots; run r writes slot r % K. Per slot a header and the run's spikes
 as one flat list:

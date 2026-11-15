@@ -1,5 +1,7 @@
 """
-Tests of the fused green-field kernel (naer2/greenfield/fused.py): emission
+Tests of the fused kernel (naer2/transpiler/templates/fused.py) through its
+runtime (naer2/runtime.py), on generated kernels of the commanded test nodes
+(test/runtimes.py: sources firing on command, consumers counting): emission
 into the K-deep history, pull intake + delivery end to end (every link in
 the run that covers its slot, per group in slot then emission order,
 summing exactly the right weights), the round visibility rule (results
@@ -13,9 +15,9 @@ import random
 import pytest
 import torch
 
-import naer2.greenfield.fused as fused
-from naer2.greenfield.fused import FusedPop
+import naer2.runtime as runtime
 from naer2.topology import SimulationTopology
+from test.runtimes import command, commanded_runtime, no_fire
 from test.topologies import random_topology as _topology
 
 pytestmark = pytest.mark.skipif(
@@ -34,7 +36,7 @@ def _device():
 @pytest.fixture(autouse=True, params=[(256, 8), (32, 8)], ids=["default", "small-stream"])
 def _walk(monkeypatch, request):
     stream, unroll = request.param
-    monkeypatch.setattr(fused, "WALK", dict(stream=stream, unroll=unroll))
+    monkeypatch.setattr(runtime, "WALK", dict(stream=stream, unroll=unroll))
 
 
 @pytest.fixture(autouse=True, params=[(True, True), (True, False), (False, True), (False, False)],
@@ -43,11 +45,11 @@ def _pull(monkeypatch, request):
     """Pull intake: fresh runs batched by emission time or one by one;
     segments through the group directory or by binary search."""
     batch, directory = request.param
-    monkeypatch.setattr(fused, "PULL", dict(batch=batch, directory=directory))
+    monkeypatch.setattr(runtime, "PULL", dict(batch=batch, directory=directory))
 
 
-def Pop(n, depth=3):
-    return FusedPop(n, group_size=GROUP_SIZE, depth=depth, device=DEVICE)
+def Pop(n, depth=3, uniform=True):
+    return commanded_runtime(n, uniform=uniform, group_size=GROUP_SIZE, depth=depth, device=DEVICE)
 
 
 def _fire_pattern(n, t_start, t_end, p, rng):
@@ -61,10 +63,10 @@ def _fire_pattern(n, t_start, t_end, p, rng):
 @pytest.mark.parametrize("uniform", [True, False])
 def test_emission_into_the_history(uniform):
     rng = random.Random(0)
-    pop = Pop(200)
+    pop = Pop(200, uniform=uniform)
     fire = _fire_pattern(200, 1.0, 1.1, 0.4, rng)
     delay = torch.tensor([rng.choice([0.0, 0.03, 0.4]) for _ in range(200)])
-    pop.run(1.0, 1.1, fire, delay, uniform=uniform, round_id=7)
+    command(pop, 1.0, 1.1, fire, delay, round_id=7)
     e = [1.0 if uniform else float(torch.tensor(fire[i].item(), dtype=torch.float32) + torch.tensor(
         delay[i].item(), dtype=torch.float32)) for i in range(200)]
     fired = [i for i in range(200) if fire[i] < math.inf]
@@ -76,7 +78,7 @@ def test_emission_into_the_history(uniform):
     assert int(h[1, 0]) == 1 and pop.history.round_of(1) == 7  # slot 1: run 1, round 7
     assert pop.history.window_end(1) == pytest.approx(1.1)
     assert int(h[2, 0]) == 0 and int(h[2, 2]) == 0  # the next run's slot, cleared ahead
-    assert torch.allclose(pop.last_time, torch.full((200,), 1.1, device=DEVICE))
+    assert not pop.state["fire_now"].any()  # the command consumed
 
 
 def test_history_keeps_recent_runs_only():
@@ -86,7 +88,7 @@ def test_history_keeps_recent_runs_only():
     for r in range(4):
         t = 1.0 + 0.1 * r
         fires.append(_fire_pattern(100, t, t + 0.1, 0.2, rng))
-        pop.run(t, t + 0.1, fires[-1], round_id=r)
+        command(pop, t, t + 0.1, fires[-1], round_id=r)
     assert sorted(n for _, n in pop.history.spikes(4)) == [i for i in range(100) if fires[3][i] < math.inf]
     assert sorted(n for _, n in pop.history.spikes(3)) == [i for i in range(100) if fires[2][i] < math.inf]
     with pytest.raises(KeyError):  # run 2's slot was cleared by run 4 (for run 5)
@@ -143,7 +145,7 @@ def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first):
     (the outcome must not depend on it: C only ever sees earlier rounds).
     Spikes emitted in round r are taken in by C's run in round r + 1."""
     rng = random.Random(5)
-    a, b, consumer = Pop(150), Pop(90), Pop(96)
+    a, b, consumer = Pop(150, uniform=uniform), Pop(90, uniform=uniform), Pop(96)
     topologies = [  # per-link delays (A -> C) and one homogeneous delay (B -> C)
         _topology(a.n, 96, GROUP_SIZE, delay="random", k=24, seed=10, weight=True),
         _topology(b.n, 96, GROUP_SIZE, delay=0.2, k=90 if long_segments else 24, seed=11, weight=True),
@@ -161,14 +163,14 @@ def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first):
         def run_consumer():
             ring_pos = consumer.ring.ring_pos  # where this run's intake lands late arrivals
             before = len(consumer.deliveries())
-            consumer.run(t, t + 0.1, torch.full((96,), math.inf), uniform=uniform, round_id=r)
+            consumer.run(t, t + 0.1, round_id=r)
             delivered_by_run.append(consumer.deliveries()[before:])
             return ring_pos
 
         if consumer_first:
             ring_pos = run_consumer()
         for src in (a, b):
-            src.run(t, t + 0.1, *fires[src], uniform=uniform, round_id=r)
+            command(src, t, t + 0.1, *fires[src], round_id=r)
         if not consumer_first:
             ring_pos = run_consumer()
         consumer.check()
@@ -195,11 +197,11 @@ def test_a_consumer_reading_every_other_round(depth):
     expected, delivered, pending_spikes = [], [], []
     for r in range(8):
         t = round(1.0 + 0.1 * r, 6)
-        src.run(t, t + 0.1, _fire_pattern(src.n, t, t + 0.1, 0.3, rng), round_id=r)
+        command(src, t, t + 0.1, _fire_pattern(src.n, t, t + 0.1, 0.3, rng), round_id=r)
         if r % 2 == 0:
             ring_pos = consumer.ring.ring_pos
             before = len(consumer.deliveries())
-            consumer.run(t, t + 0.2, torch.full((64,), math.inf), round_id=r)
+            consumer.run(t, t + 0.2, round_id=r)
             delivered.append(consumer.deliveries()[before:])
             expected.append(_expected_deliveries(topo, 0, pending_spikes, ring_pos, 0.1))
             pending_spikes = []
@@ -228,10 +230,10 @@ def test_tracing_changes_nothing():
         runs = []
         for r in range(6):
             t = round(1.0 + 0.1 * r, 6)
-            consumer.run(t, t + 0.1, torch.full((96,), math.inf), round_id=r)
+            consumer.run(t, t + 0.1, round_id=r)
             if traced:
                 runs.append(consumer.traced())
-            a.run(t, t + 0.1, _fire_pattern(a.n, t, t + 0.1, 0.3, rng), round_id=r)
+            command(a, t, t + 0.1, _fire_pattern(a.n, t, t + 0.1, 0.3, rng), round_id=r)
         results.append((consumer.n_received.cpu(), consumer.received.cpu(), runs))
     assert torch.equal(results[0][0], results[1][0])
     assert torch.allclose(results[0][1], results[1][1], atol=1e-4)

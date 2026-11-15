@@ -1,7 +1,7 @@
 """
-The fused kernel's hand-written PD14 hooks (naer2/greenfield/fused.py,
-MODEL) against the hooks themselves (test/networks/PD14/neuron.py,
-poisson.py) written out in torch, run by run: the state every hook assigns,
+The fused kernels generated from PD14's hooks (naer2/transpiler/templates/
+fused_template.py, run by naer2/runtime.py) against the hooks themselves
+(test/networks/PD14/neuron.py, poisson.py) written out in torch, run by run: the state every hook assigns,
 which neurons spike and their emission times (bare n2.spike(): the window's
 start, D-4). The references follow the hooks' expressions in their order, in
 float32; exp/log may differ from the GPU's by an ulp, hence the tolerances.
@@ -14,9 +14,11 @@ import torch
 import triton
 import triton.language as tl
 
-from naer2.greenfield.fused import FusedPop, pd14_neuron_params, pd14_poisson_params
+from naer2.runtime import PopulationRuntime
+from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.neuron import PD14_neuron
 from test.networks.PD14.poisson import PD14_poisson
+from test.runtimes import command, commanded_runtime
 from test.topologies import random_topology
 
 pytestmark = pytest.mark.skipif(
@@ -50,13 +52,16 @@ def _neuron_reference(neuron, state, time, received=None):
 
 
 def _state(pop):
-    return dict(potential=pop.potential.clone(), current=pop.current.clone(), t_ref_end=pop.t_ref_end.clone(),
-                last_time=pop.last_time.clone())
+    return {k: pop.state[k].clone() for k in ("potential", "current", "t_ref_end", "last_time")}
+
+
+def _neuron_runtime(neuron, n, **state):
+    return PopulationRuntime(FusedKernelTemplate(neuron * n).build(), n, group_size=G, device=DEVICE, state=state)
 
 
 def _check_run(pop, ref, fires, t_start):
     for k in ("potential", "current", "t_ref_end", "last_time"):
-        assert torch.allclose(getattr(pop, k), ref[k], rtol=1e-5, atol=1e-5), k
+        assert torch.allclose(pop.state[k], ref[k], rtol=1e-5, atol=1e-5), k
     got = sorted(node for _, node in pop.emitted())
     assert got == fires.nonzero().flatten().tolist()
     assert all(e == pytest.approx(t_start) for e, _ in pop.emitted())
@@ -69,16 +74,13 @@ def test_pd14_neuron_matches_its_hooks(K_cortical):
     torch.manual_seed(0)
     neuron = PD14_neuron(K_cortical=K_cortical)
     n = 700
-    pop = FusedPop(n, group_size=G, device=DEVICE, model="pd14_neuron", params=pd14_neuron_params(neuron))
-    pop.potential = torch.normal(-55.0, 6.0, (n,), device=DEVICE)
-    pop.current = torch.rand(n, device=DEVICE) * 0.5
-    pop.t_ref_end = 1.0 + torch.rand(n, device=DEVICE) * 0.4
-    pop.last_time = torch.full((n,), 0.9, device=DEVICE)
+    pop = _neuron_runtime(neuron, n, potential=torch.normal(-55.0, 6.0, (n,)), current=torch.rand(n) * 0.5,
+                          t_ref_end=1.0 + torch.rand(n) * 0.4, last_time=torch.full((n,), 0.9))
     spiked = 0
     for r in range(8):
         t = round(1.0 + 0.1 * r, 6)
         before = _state(pop)
-        pop.run(t, t + 0.1, None, round_id=r)
+        pop.run(t, t + 0.1, round_id=r)
         ref, fires = _neuron_reference(neuron, before, torch.tensor(t + 0.1, dtype=torch.float32).item())
         _check_run(pop, ref, fires, t)
         spiked += int(fires.sum())
@@ -90,20 +92,20 @@ def test_pd14_neuron_integrates_this_runs_deliveries():
     the current with this run's deliveries added (receive before update)."""
     torch.manual_seed(1)
     neuron = PD14_neuron(K_cortical=2000)
-    src = FusedPop(300, group_size=G, device=DEVICE)  # the stand-in, firing on command
-    dst = FusedPop(500, group_size=G, device=DEVICE, model="pd14_neuron", params=pd14_neuron_params(neuron))
-    dst.connect([src], [random_topology(300, 500, G, delay=0.1, k=40, seed=3, weight=True)], n_slots=4)
-    dst.potential = torch.normal(-60.0, 4.0, (500,), device=DEVICE)
+    src = commanded_runtime(300, group_size=G, device=DEVICE)  # firing on command
+    dst = _neuron_runtime(neuron, 500, potential=torch.normal(-60.0, 4.0, (500,)))
+    dst.connect([src], [random_topology(300, 500, G, delay=0.1, k=40, seed=3, weight=True)], n_slots=4,
+                main_cap=8192)
     delivered = 0
     for r in range(6):
         t = round(1.0 + 0.1 * r, 6)
         before, received = _state(dst), dst.received.clone()
-        dst.run(t, t + 0.1, None, round_id=r)
+        dst.run(t, t + 0.1, round_id=r)
         ref, fires = _neuron_reference(neuron, before, torch.tensor(t + 0.1, dtype=torch.float32).item(),
                                        dst.received - received)
         _check_run(dst, ref, fires, t)
         delivered += int(dst.n_received.sum())
-        src.run(t, t + 0.1, torch.where(torch.rand(300) < 0.3, t, math.inf), round_id=r)
+        command(src, t, t + 0.1, torch.where(torch.rand(300) < 0.3, t, math.inf), round_id=r)
     dst.check()
     assert delivered > 0
 
@@ -119,19 +121,20 @@ def test_pd14_poisson_matches_its_hooks():
     as the transpiler lowers it, tl.rand(t bitcast, offs) at the window end."""
     poisson = PD14_poisson(rate=0.12, t_start=700.0, t_stop=701.0)
     n = 902
-    pop = FusedPop(n, group_size=G, device=DEVICE, model="pd14_poisson", params=pd14_poisson_params(poisson))
+    pop = PopulationRuntime(FusedKernelTemplate(poisson * n).build(), n, group_size=G, device=DEVICE,
+                            state=dict(next_spike=poisson.t_start))
     next_spike = torch.full((n,), poisson.t_start, device=DEVICE)
     u = torch.empty(n, device=DEVICE)
     spiked = 0
     for r in range(20):
         t = round(699.5 + 0.1 * r, 6)
-        pop.run(t, t + 0.1, None, round_id=r)
+        pop.run(t, t + 0.1, round_id=r)
         time = torch.tensor(t + 0.1, dtype=torch.float32).item()
         _rand_reference[(triton.cdiv(n, 256),)](u, time, n, 256)
         fires = (poisson.t_start <= time) & (time <= poisson.t_stop) & (next_spike <= time)
         fires = torch.as_tensor(fires, device=DEVICE) & torch.ones(n, dtype=torch.bool, device=DEVICE)
         next_spike = torch.where(fires, next_spike + -torch.log(u) / poisson.rate, next_spike)
-        assert torch.allclose(pop.next_spike, next_spike, rtol=1e-6, atol=1e-4)
+        assert torch.allclose(pop.state["next_spike"], next_spike, rtol=1e-6, atol=1e-4)
         got = sorted(node for _, node in pop.emitted())
         assert got == fires.nonzero().flatten().tolist(), t
         assert all(e == pytest.approx(t) for e, _ in pop.emitted())

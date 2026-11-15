@@ -504,7 +504,7 @@ class SimulationTopology:
     def directory(self) -> tuple[torch.Tensor, int, int]:
         """Per source, which groups it reaches and where their segments
         start -- for pull intake, which needs a source's segments into ONE
-        group (see naer2/greenfield/fused.py). Built once on request, as one
+        group (see naer2/transpiler/templates/fused.py). Built once on request, as one
         int32 buffer (directory_ptrs):
           dir_offsets [n_sources + 1]  pairs of source s: dir_offsets[s] : dir_offsets[s + 1]
           dir_first   [n_pairs + 1]    first segment of each (source, group) pair, in segment

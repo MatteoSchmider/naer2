@@ -2,7 +2,7 @@
 (the fused kernel's ~30 runtime arguments and ~30 constexprs), through the
 JIT's dispatch (bind + specialize + cache key + lookup) vs the compiled
 kernel's launcher directly (the floor: argument packing + hipModuleLaunch);
-torch's own launch for scale; and the real FusedPop.run (small consumer,
+torch's own launch for scale; and a real PopulationRuntime.run (small consumer,
 8 connections). Per launch, CPU microseconds over N back-to-back launches
 (tiny kernels, so the GPU keeps up and the host is what is measured).
 
@@ -109,20 +109,22 @@ y = torch.zeros(1, device="cuda")
 torch_us = per_launch(lambda: y.add_(1))
 
 # the real thing: a small consumer with 8 incoming connections, no spikes
-from naer2.greenfield import FusedPop  # noqa: E402
+from naer2.runtime import PopulationRuntime  # noqa: E402
+from naer2.transpiler.templates.fused_template import FusedKernelTemplate  # noqa: E402
+from test.networks.PD14.commanded import PD14_commanded  # noqa: E402
 from test.topologies import random_topology  # noqa: E402
 
 G = 256
-a, c = FusedPop(2 * G, group_size=G), FusedPop(2 * G, group_size=G)
-c.connect([a] * 8, [random_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(8)], n_slots=8)
+gk = FusedKernelTemplate(PD14_commanded(K_cortical=1900) * (2 * G)).build()
+a, c = PopulationRuntime(gk, 2 * G, group_size=G), PopulationRuntime(gk, 2 * G, group_size=G)
+c.connect([a] * 8, [random_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(8)],
+          n_slots=8)
 c.count_received = False
-fire = torch.full((2 * G,), math.inf, device="cuda")
-zeros = torch.zeros(2 * G, device="cuda")
 t = [1.0]
 
 
 def run_pop():
-    c.run(t[0], t[0] + 0.1, fire, zeros, round_id=c.run_id + 1)
+    c.run(t[0], t[0] + 0.1, round_id=c.run_id + 1)
     t[0] += 0.1
 
 
@@ -134,4 +136,4 @@ print(f"  {'kernel':16s} {'JIT dispatch':>13s} {'launcher only':>14s} {'dispatch
 for name, j, d in rows:
     print(f"  {name:16s} {j:13.1f} {d:14.1f} {j - d:14.1f}")
 print(f"  torch add_ (one tiny op): {torch_us:.1f}")
-print(f"  FusedPop.run (8 connections, whole host path): {pop_us:.1f}")
+print(f"  PopulationRuntime.run (8 connections, whole host path): {pop_us:.1f}")

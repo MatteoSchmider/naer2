@@ -1,12 +1,12 @@
-"""Compile the fused kernel (naer2/greenfield/fused.py) for a small consumer
-and summarize its ISA: registers, spills, LDS, and per loop body the
+"""Compile the fused kernel generated for PD14_commanded (PD14's update and
+receive, send on command: test/networks/PD14/commanded.py) for a small
+consumer and summarize its ISA: registers, spills, LDS, and per loop body the
 instruction mix and the highest VGPR it touches (where register pressure
 peaks).
 
     python tools/kernel_isa.py G [unroll] [counters 1|0] [stream]
     env: N_CONNS (incoming connections, default 1), WAVES (waves_per_eu target)
 """
-import math
 import os
 import re
 import sys
@@ -14,7 +14,9 @@ import sys
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..")]
 import torch
 
-from naer2.greenfield import FusedPop, fused_kernel
+from naer2.runtime import PopulationRuntime
+from naer2.transpiler.templates.fused_template import FusedKernelTemplate
+from test.networks.PD14.commanded import PD14_commanded
 from test.topologies import random_topology
 
 G = int(sys.argv[1])
@@ -23,19 +25,20 @@ count = (sys.argv[3] != "0") if len(sys.argv) > 3 else True
 stream = int(sys.argv[4]) if len(sys.argv) > 4 else None
 N_CONNS = int(os.environ.get("N_CONNS", "1"))
 WAVES = int(os.environ.get("WAVES", "0"))
-a, c = FusedPop(2 * G, group_size=G), FusedPop(2 * G, group_size=G)
+gk = FusedKernelTemplate(PD14_commanded(K_cortical=1900) * (2 * G)).build()
+a, c = PopulationRuntime(gk, 2 * G, group_size=G), PopulationRuntime(gk, 2 * G, group_size=G)
 c.unroll = unroll or c.unroll
 c.count_received = count
 c.waves_per_eu = WAVES
-c.stream = stream or c.stream
+c.stream_block = stream or c.stream_block
 c.connect([a] * N_CONNS, [random_topology(2 * G, 2 * G, G, delay=0.2, k=8, seed=1 + i, weight=True) for i in range(N_CONNS)],
           n_slots=8)
-c.run(1.0, 1.1, torch.full((2 * G,), math.inf))
+c.run(1.0, 1.1)
 torch.cuda.synchronize()
-k = [k for cache in fused_kernel.device_caches.values() for k in cache[0].values()][-1]
+k = [k for cache in gk.kernel.device_caches.values() for k in cache[0].values()][-1]
 asm = k.asm["amdgcn"]
 print(f"fused G={G} conns={N_CONNS} waves_per_eu={WAVES} U={c.unroll} counters={int(count)} "
-      f"stream={c.stream}: vgpr {k.n_regs}, spills {k.n_spills}, LDS bytes {k.metadata.shared}")
+      f"stream={c.stream_block}: vgpr {k.n_regs}, spills {k.n_spills}, LDS bytes {k.metadata.shared}")
 lines = [l.split(";")[0].strip() for l in asm.split("\n")]
 labels = {l[:-1]: i for i, l in enumerate(lines) if re.match(r"^\.LBB\w+:$", l)}
 print("   loop head        instrs barrier  ds  loads waitcnt valu  max-vgpr")

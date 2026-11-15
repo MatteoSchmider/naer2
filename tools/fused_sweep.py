@@ -22,7 +22,6 @@ if "--rdna2" in sys.argv:
 
 import torch
 
-from naer2.greenfield.fused import fused_kernel
 from pd14_setup import PD14
 
 CONFIGS = [(True, True), (True, False)]  # (batch, directory)
@@ -83,7 +82,8 @@ def measure(concurrent):
         out, pulls = 0.0, []
         t = 10.0 + 0.1 * r
         for n, p in b.pops.items():
-            p.run(t, t + 0.1, f[n], b.zeros[n], uniform=True, round_id=r)
+            p.state["fire_now"] = f[n]
+            p.run(t, t + 0.1, round_id=r)
             torch.cuda.synchronize()
             tr = p.traced()
             s, e = span(tr)
@@ -100,7 +100,8 @@ regs = {}
 for cfg in CONFIGS:  # compile every variant
     configure(cfg)
     measure(False); measure(True)
-    k = [k for cache in fused_kernel.device_caches.values() for k in cache[0].values()][-1]
+    jit = next(iter(b.pops.values())).kernel.kernel  # one population's (all compile alike)
+    k = [k for cache in jit.device_caches.values() for k in cache[0].values()][-1]
     regs[cfg] = (k.n_regs, k.n_spills)
 heat(300)
 res = {cfg: ([], [], []) for cfg in CONFIGS}
