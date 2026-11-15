@@ -1252,7 +1252,8 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    **Runtime integration, the steps** (2026-11-15): 1. runtime class
    (`naer2/runtime.py`, FusedPop's host side; `naer2/greenfield` retired,
    the hand-written reference kept as a test helper) -- done 2026-11-15; 2. the simulation
-   topology on Fabric (per-link attrs live there); 3. Population on the
+   topology on Fabric (per-link attrs live there; `Fabric.simulation()`, a
+   placeholder attr where the receive reads none) -- done 2026-11-15; 3. Population on the
    runtime (compile via FusedKernelTemplate, the old gather/merge path
    removed) -- Network.step's logic unchanged; 4. Network: the new
    horizon-based scheduling integrated itself (rounds, event hub), free to

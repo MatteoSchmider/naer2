@@ -20,7 +20,6 @@ import torch
 
 import naer2 as n2
 from naer2.runtime import PopulationRuntime
-from naer2.topology import SimulationTopology
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.edges import plastic_synapse, static_synapse
 from test.fused_reference import pd14_neuron_reference, pd14_poisson_reference
@@ -61,7 +60,8 @@ def test_generated_pd14_neuron_matches_the_reference():
     gk = FusedKernelTemplate(dst_pop).build()
     assert gk.state_attrs == ["current"] and gk.edge_attr == "weight" and gk.uniform_emission
 
-    topo = SimulationTopology(conn.fabric.topology, 700, G, DEVICE, delay=0.2, attrs={"weight": conn.fabric.weight})
+    conn.delay = 0.2
+    topo = conn.fabric.simulation(700, G, DEVICE, attrs=["weight"])
     src = commanded_runtime(300, group_size=G, device=DEVICE)  # firing on command
     init = dict(potential=torch.normal(-55.0, 6.0, (700,)), current=torch.rand(700) * 0.5,
                 t_ref_end=1.0 + torch.rand(700) * 0.4, last_time=torch.full((700,), 0.9))
@@ -254,16 +254,22 @@ def _fires(n, seed):
     return torch.rand(n, generator=torch.Generator().manual_seed(seed)) < 0.3
 
 
-def _deliver_once(dst_pop, sources, attrs=("weight",)):
+def _deliver_once(dst_pop, sources, attrs=None):
     """sources: [(connection, fire mask)]: each source population (a stand-in
     runtime, test/runtimes.py) fires its mask in round 0; the generated consumer runs rounds
-    0..2 (the spikes arrive in round 2). Returns (consumer, topologies)."""
+    0..2 (the spikes arrive in round 2); attrs: the per-link attrs the
+    topologies carry (default: the one the kernel stages). Returns
+    (consumer, topologies)."""
     gk = FusedKernelTemplate(dst_pop).build()
     n = len(dst_pop.shape)
     gen = _runtime(gk, dst_pop)
     srcs = [commanded_runtime(len(conn._source.shape), group_size=G, device=DEVICE) for conn, _ in sources]
-    topos = [SimulationTopology(conn.fabric.topology, n, G, DEVICE, delay=0.2,
-                                attrs={a: _link_attr(conn, a) for a in attrs}) for conn, _ in sources]
+    if attrs is None:
+        attrs = [gk.edge_attr] if gk.edge_attr is not None else []
+    topos = []
+    for conn, _ in sources:
+        conn.delay = 0.2
+        topos.append(conn.fabric.simulation(n, G, DEVICE, attrs=list(attrs)))
     gen.connect(srcs, topos, n_slots=8, main_cap=8192)
     for r in range(3):
         t = round(1.0 + 0.1 * r, 6)
@@ -272,13 +278,6 @@ def _deliver_once(dst_pop, sources, attrs=("weight",)):
             command(src, t, t + 0.1, torch.where(fires, t, math.inf) if r == 0 else None, round_id=r)
     gen.check()
     return gen, topos
-
-
-def _link_attr(conn, name):
-    """A connection's per-link attr in canonical order (a scalar edge attr broadcast; ones where it has none --
-    the template stages one attr per link even for a receive that reads none)."""
-    value = conn.fabric.state.get(name, getattr(conn.fabric.instance, name, 1.0))
-    return torch.as_tensor(value, dtype=torch.float32).expand(len(conn.fabric.topology)).clone()
 
 
 def _expected(conn, fires, n, values):

@@ -4,8 +4,9 @@ from .edges import edge_types
 
 _INTERNAL = frozenset({
     'instance', 'edge', 'dynamic_attrs', 'static_attrs', 'topology', 'state',
-    'perm', 'device_state',
+    'perm', 'device_state', 'sim', '_sim_key',
 })
+PLACEHOLDER = "_no_attr"  # the per-link attr a connection gets when its receive reads none (see simulation())
 
 
 class Fabric:
@@ -40,6 +41,13 @@ class Fabric:
     one (conn.weight = tensor(...) rather than conn.fabric.weight = ...);
     nothing loads such a tensor unless some hook actually references
     edge.<name>, exactly as for a real edge class's unused attrs.
+
+    On the fused kernel's path the connection's SimulationTopology (built
+    once by simulation(), for its consumer) holds the per-link attrs the
+    consumer's kernel reads: from then on they live there only, on the
+    device in simulation order, and fabric.<attr> reads / assigns them in
+    canonical order through its perm. (bind_device / device_state are the
+    old templates' path, until they go.)
     """
 
     def __init__(self, instance=None):
@@ -56,6 +64,8 @@ class Fabric:
         object.__setattr__(self, 'state', {})
         object.__setattr__(self, 'perm', None)
         object.__setattr__(self, 'device_state', {})
+        object.__setattr__(self, 'sim', None)
+        object.__setattr__(self, '_sim_key', None)
 
         dynamic_attrs: dict[str, type] = {}
         if instance is not None:
@@ -88,12 +98,60 @@ class Fabric:
         those names, so it alone isn't enough to tell "needs a load" apart from
         "inline as a literal constant"; this property is the actual answer.
         """
-        return set(self.dynamic_attrs) | set(self.state) | set(self.device_state)
+        sim_attrs = set(self.sim.attrs) - {PLACEHOLDER} if self.sim is not None else set()
+        return set(self.dynamic_attrs) | (set(self.state) - {"delay"}) | set(self.device_state) | sim_attrs
 
     @property
     def constant_attrs(self) -> dict[str, object]:
         """Static attrs with no tensor override — safe to inline as AST literals."""
         return {k: v for k, v in self.static_attrs.items() if k not in self.tensor_attrs}
+
+    # ------------------------------------------------------------------ the simulation topology
+
+    def simulation(self, n_targets: int, group_size: int, device, resolution: float | None = None,
+                   attrs: list[str] = ()):
+        """The connection's SimulationTopology (naer2/topology.py) for its
+        consumer: the canonical topology restructured at the consumer's
+        group size, per-link delays quantized at `resolution` (the finest
+        its consumer needs, TODO.md 1e D-12), carrying `attrs` -- the
+        per-link attrs the consumer's kernel reads, the one it stages first
+        (a scalar edge attr broadcast to every link). With none, one
+        placeholder attr: the kernel's per-link attr load is unconditional.
+        Built once: those attrs then live there only (fabric.<attr> reads
+        and assigns them in canonical order); the same call again returns
+        it, a different one raises (a connection has one consumer)."""
+        from .topology import SimulationTopology
+
+        key = (n_targets, group_size, str(torch.device(device)), resolution, tuple(attrs))
+        if self.sim is not None:
+            if key != self._sim_key:
+                raise ValueError(f"the simulation topology is already built for {self._sim_key}, not {key}")
+            return self.sim
+        if self.topology is None:
+            raise ValueError("the connection has no topology yet")
+        n_links = len(self.topology)
+        delay = self.state.get("delay")
+        if isinstance(delay, torch.Tensor):
+            if resolution is None:
+                raise ValueError("a per-link delay needs the consumer's slot resolution")
+            delay = delay.float()
+        values = {}
+        for name in attrs or [PLACEHOLDER]:
+            if name == PLACEHOLDER:
+                values[name] = torch.zeros(n_links)
+            elif name in self.state:
+                values[name] = torch.as_tensor(self.state[name], dtype=torch.float32).expand(n_links)
+            elif self.instance is not None and name in self.instance.__dict__:
+                values[name] = torch.full((n_links,), float(getattr(self.instance, name)))
+            else:
+                raise ValueError(f"per-link attr '{name}' has no value on {self!r}")
+        sim = SimulationTopology(self.topology, n_targets, group_size, device, delay=delay,
+                                 resolution=resolution if isinstance(delay, torch.Tensor) else None, attrs=values)
+        for name in values:
+            self.state.pop(name, None)  # it lives in the simulation topology from now on
+        object.__setattr__(self, 'sim', sim)
+        object.__setattr__(self, '_sim_key', key)
+        return sim
 
     # ------------------------------------------------------------------ device residency
 
@@ -118,6 +176,13 @@ class Fabric:
     def __setattr__(self, name, value):
         if name in _INTERNAL:
             object.__setattr__(self, name, value)
+        elif self.sim is not None and name in self.sim.attrs and name != PLACEHOLDER:
+            value = torch.as_tensor(value, dtype=torch.float32)
+            if value.shape != (self.sim.n_links,):
+                raise ValueError(f"'{name}' must be a tensor of {self.sim.n_links} links, one per link")
+            self.sim.write(name, value)
+        elif name == "delay" and self.sim is not None:
+            raise ValueError("the delay is fixed once the simulation topology is built (it is its delay buckets)")
         elif name in self.device_state:
             blocked = self.device_state[name]
             blocked.copy_(torch.as_tensor(value).to(blocked.device, blocked.dtype)[self.perm])
@@ -130,6 +195,9 @@ class Fabric:
             device_state = object.__getattribute__(self, 'device_state')
         except AttributeError:
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+        sim = object.__getattribute__(self, 'sim')
+        if sim is not None and name in sim.attrs and name != PLACEHOLDER:
+            return sim.read(name)
         if name in device_state:
             blocked = device_state[name]
             canonical = torch.empty_like(blocked)

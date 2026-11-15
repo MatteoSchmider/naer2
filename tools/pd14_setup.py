@@ -20,7 +20,6 @@ import time
 import torch
 
 from naer2.runtime import PopulationRuntime
-from naer2.topology import SimulationTopology
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.commanded import PD14_commanded
 from test.networks.PD14.net import build, description
@@ -72,8 +71,7 @@ class PD14:
             conns = [c for c in p.incoming if c._source in members]
             if not conns:  # T: no incoming connections
                 continue
-            topos = [SimulationTopology(c.fabric.topology, len(p.shape), G, "cuda", delay=c.fabric.delay,
-                                        resolution=RES, attrs={"weight": c.fabric.weight}) for c in conns]
+            topos = [c.fabric.simulation(len(p.shape), G, "cuda", resolution=RES, attrs=["weight"]) for c in conns]
             self.links += sum(t.n_links for t in topos)
             self.segments += sum(t.n_segments for t in topos)
             n_slots = int((max(float(t.bucket_mean.max()) for t in topos) + 0.2) / RES) + 2
