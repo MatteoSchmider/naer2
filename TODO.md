@@ -1247,6 +1247,47 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    `time = t`, update, send once more. The per-link-delay variant delivers
    diagonal k at time (k + 1) * w and disallows edge callbacks.
 
+   **Progress.** (2026-11-15) Pure moves done; template split done — the
+   fixed phases in `naer2/transpiler/templates/fused.py` (`_pull`,
+   `_deliver(state, RECEIVE)`, `_emit_spikes` / `_emit_close`), the
+   hand-written reference (`greenfield/fused.py`) on top, ISA unchanged.
+   Kernel generation started: `naer2/transpiler/templates/fused_template.py`
+   writes a population's entry and receive from its hooks (HookTranspiler +
+   `GluonTransformer`; spike sites lowered to fire masks + emission times);
+   generated PD14_neuron / PD14_poisson match the reference
+   (`test/test_fused_generated_gpu.py`: same spikes, states bit-identical
+   without deliveries and within the reference's own run-to-run spread with
+   them; same VGPRs, LDS, barriers, loads).
+
+   **Gap tests** — `test/test_fused_generated_gpu.py::test_gap_*`, each
+   failing until its gap is closed, for after the reintegration (the
+   generator raises NotImplementedError naming the decision, or the values
+   are wrong); each checks the closed behaviour end to end against the
+   canonical topology:
+   - `test_gap_spikes_inside_delivery` — D-3: n2.spike() in receive / in a
+     send after every delivery (the program's emission buffer)
+   - `test_gap_receive_variants_per_connection` — D-6: two ports, different
+     receive code per connection
+   - `test_gap_several_per_link_attrs` — D-7: one attr block per link
+   - `test_gap_edge_forward` — HOOK(forward): plastic_synapse's forward on
+     link lanes while staging, persisting in the topology (D-8 limitation
+     documented in the ported code)
+   - `test_gap_edge_forward_destination` — D-9: forward reading
+     destination.x
+   - `test_gap_source_attrs` — D-10: receive reading source.x
+   - `test_gap_receive_time_is_the_arrival` — D-1: the record carries the
+     arrival (e + bucket mean), receive's time is it (today: e)
+   - `test_gap_edge_backward` — D-11: edge backward on every incoming link
+     of a spiking target (a reverse topology; out of scope for now)
+   Also for the runtime: the template's per-link attr load is unconditional
+   (INTEGRATE HOST in `_stage_records`): a connection whose receive reads
+   no attr still needs a valid attr block, or a constexpr skipping the load.
+   *Finding:* delivery order within a slot follows the pull's LDS atomic
+   claims, not deterministic across warps — two runs of the same kernel can
+   sum a neuron's inputs in different orders (last-bit differences in
+   current, which a chaotic network amplifies). Reproducibility would need
+   a deterministic append order.
+
    **Decisions** (judged together, 2026-11-14):
    - **D-1 receive's `time` is the link's arrival, e + its bucket's mean
      delay** — use all the emission resolution there is; NEST-like

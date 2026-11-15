@@ -43,10 +43,15 @@ class HookTranspiler:
     loads per-link state into.
     """
 
-    def __init__(self, hook: Hook, context: TranspilerContext, self_prefix: str = ""):
+    def __init__(self, hook: Hook, context: TranspilerContext, self_prefix: str = "", spike_lowering=None,
+                 default_spike_time: str = "t"):
+        """spike_lowering / default_spike_time: passed to IfTransformer (the
+        fused template lowers n2.spike() its own way)."""
         self.hook = hook
         self.context = context
         self.self_prefix = self_prefix
+        self.spike_lowering = spike_lowering
+        self.default_spike_time = default_spike_time
 
     def emit(self) -> list[ast.stmt]:
         func_copy = copy.deepcopy(self.hook.ast)
@@ -56,7 +61,7 @@ class HookTranspiler:
         # already be lowered.
         transformed = MathLoweringTransformer().visit(transformed)
         transformed = RandomLoweringTransformer().visit(transformed)
-        transformed = IfTransformer().visit(transformed)
+        transformed = IfTransformer(self.spike_lowering, self.default_spike_time).visit(transformed)
         ast.fix_missing_locations(transformed)
         return transformed.body
 

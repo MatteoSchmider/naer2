@@ -42,8 +42,14 @@ class IfTransformer(ast.NodeTransformer):
     Nested ifs and elif chains are handled recursively via _lower_body/_lower_if.
     """
 
-    def __init__(self):
+    def __init__(self, spike_lowering=None, default_spike_time: str = "t"):
+        """spike_lowering: lower n2.spike() with this instead of the local
+        spike buffer write -- called as spike_lowering(mask, time_expr, bare)
+        -> list[ast.stmt] (the fused template collects each site's fire mask
+        and emission time). default_spike_time: a bare n2.spike()'s time."""
         self._counter = 0
+        self.spike_lowering = spike_lowering
+        self.default_spike_time = default_spike_time
 
     def _fresh_mask(self) -> str:
         name = f"_m{self._counter}"
@@ -59,9 +65,9 @@ class IfTransformer(ast.NodeTransformer):
             and node.value.func.attr == "spike"
         )
 
-    @staticmethod
-    def _spike_time_expr(node: ast.Expr) -> str:
-        """The raw source text of n2.spike()'s time argument, or "t" if omitted.
+    def _spike_time_expr(self, node: ast.Expr) -> str:
+        """The raw source text of n2.spike()'s time argument, or the default
+        ("t", the window end; the fused template's: t_start) if omitted.
 
         No validation — whatever expression the user wrote (already resolved by
         SelfAttrTransformer, which ran before IfTransformer) is spliced in
@@ -74,10 +80,13 @@ class IfTransformer(ast.NodeTransformer):
                 return ast.unparse(kw.value)
         if call.args:
             return ast.unparse(call.args[0])
-        return "t"
+        return self.default_spike_time
 
     def _lower_spike(self, node: ast.Expr, mask: str) -> list[ast.stmt]:
         time_expr = self._spike_time_expr(node)
+        if self.spike_lowering is not None:
+            bare = not node.value.args and not node.value.keywords
+            return self.spike_lowering(mask, time_expr, bare)
         return _STMTS(f"""\
 _n_fire = {mask}.to(tl.int32)
 _local_pos = local_spike_count + tl.cumsum(_n_fire, axis=0) - _n_fire

@@ -11,7 +11,8 @@ reference) calls
                               -> state a constexpr gluon.jit function, state
                               the tuple of node attrs receive touches
   (update, send: the entry's own code, then)
-  _emit(fires, e)             the run's spikes into the history
+  _emit_spikes(fires, e)      one n2.spike() site's spikes into the history,
+                              then _emit_close() once (_emit: both, one site)
 
  Intake is PULLED: every program takes in its own group's entries
 itself, so no program depends on another within the launch (a push intake
@@ -229,6 +230,12 @@ def _side_insert(side_time, side_src, side_lo, side_n, side_count, flags, cell, 
 def _rand(seed, offs):
     """random.random() as the transpiler lowers it (RandomLoweringTransformer)."""
     return tl.rand(seed, offs)
+
+
+@triton.jit
+def _randn(seed, offs):
+    """random.gauss / normalvariate's standard normal, as the transpiler lowers it."""
+    return tl.randn(seed, offs)
 
 
 @triton.jit
@@ -486,6 +493,8 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, S
     t = gl.convert_layout(t, LRQ)
     # INTEGRATE EDGE(receive, forward): the link's attribute block, loaded here by link index l through the
     #   connection's block pointer (D-7): its variant's attrs into the stage's attr slots; here: the weight
+    # INTEGRATE HOST: the load is unconditional -- a connection whose receive reads no per-link attr still needs a
+    #   valid attr block (or a constexpr that skips the load), else this reads past its topology
     atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
     w = gl.load(atp + l, mask=qv, other=0.0)
     # INTEGRATE HOOK(forward): the transpiled edge forward goes here, on link lanes (one record per lane, rooted
@@ -930,33 +939,42 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
 
 
 @gluon.jit
-def _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
-          SPT: gl.constexpr, NUM_WARPS: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr):
-    """The run's spikes into the history: fires (which lanes spiked) and e
-    (their emission times), [GROUP_SIZE] in the program's neuron layout;
-    this program's place in the run's flat list from one count atomic;
-    program 0 writes the run's header and clears the next run's slot."""
+def _emit_spikes(fires, e, offs, history, hist_cap, run_id, K: gl.constexpr, SPT: gl.constexpr,
+                 NUM_WARPS: gl.constexpr):
+    """One n2.spike() site's spikes into the history: fires (which lanes
+    spiked) and e (their emission times), [GROUP_SIZE] in the program's
+    neuron layout; their place in the run's flat list from one count
+    atomic. A run can call this any number of times (D-3: several sites, a
+    neuron spiking more than once)."""
     LS: gl.constexpr = gl.BlockedLayout([SPT], [32], [NUM_WARPS], [0])
     _n_fire = fires.to(gl.int32)
     _local_pos = gl.convert_layout(gl.cumsum(gl.convert_layout(_n_fire, LS), axis=0), fires.type.layout) - _n_fire
     n_emit = gl.sum(_n_fire, axis=0)
-    if TRACE:
-        n_ev = mark(trace, n_ev, 8, 0, TRACE_CAP)
-
-    # INTEGRATE HOOK(backward): out of scope -- needs this run's spikes at every incoming link of each firing
-    #   target (a reverse topology), D-11
     # INTEGRATE CONFIG: the history's cap is no longer one spike per neuron (D-3); a run's spikes beyond it raise
     #   the overflow flag
     slot = run_id % K
     (h_tag, h_count, h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, slot, K, hist_cap)
-    base = gl.atomic_add(h_count, n_emit)  # this program's place in the run's flat list
+    base = gl.atomic_add(h_count, n_emit)  # this site's place in the run's flat list
     put = fires & (base + _local_pos < hist_cap)
     if base + n_emit > hist_cap:
         gl.atomic_max(h_overflow, 1)
     gl.store(h_node + base + _local_pos, offs, mask=put)
     gl.store(h_time + base + _local_pos, e, mask=put)
     gl.atomic_min(h_min, gl.min(gl.where(put, e, float("inf")), axis=0))
+
+
+@gluon.jit
+def _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
+                TRACE: gl.constexpr, TRACE_CAP: gl.constexpr):
+    """The run's end: program 0 writes its header (window end, then the tag
+    -- one store, never a new run id with an old round) and clears the next
+    run's slot. Returns n_ev (tracing)."""
+    if TRACE:
+        n_ev = mark(trace, n_ev, 8, 0, TRACE_CAP)
+    # INTEGRATE HOOK(backward): out of scope -- needs this run's spikes at every incoming link of each firing
+    #   target (a reverse topology), D-11
     if pid == 0:
+        (h_tag, _hc, h_wend, _hm, _hn, _ht, _ho) = history_ptrs(history, run_id % K, K, hist_cap)
         gl.store(h_wend, t_end)
         gl.store(h_tag, history_tag(run_id, round_id))  # one store: never a new run id with an old round
         (n_tag, n_count, _nw, n_min, _nn, _nt, _no) = history_ptrs(history, (run_id + 1) % K, K, hist_cap)
@@ -967,3 +985,11 @@ def _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace
         n_ev = mark(trace, n_ev, 9, 0, TRACE_CAP)
         trace_end(trace, n_ev)
     return n_ev
+
+
+@gluon.jit
+def _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
+          SPT: gl.constexpr, NUM_WARPS: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr):
+    """A run with one n2.spike() site: _emit_spikes, then _emit_close."""
+    _emit_spikes(fires, e, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)
+    return _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP)

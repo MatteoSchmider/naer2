@@ -249,15 +249,21 @@ class FusedPop:
     FusedPlan. run() is the whole run, intake included."""
 
     def __init__(self, n: int, group_size: int = 256, depth: int = 3, device="cuda", model: str = "standin",
-                 params: dict | None = None):
+                 params: dict | None = None, generated=None, defaults: dict | None = None):
         """model: the hand-written hooks (MODELS) -- "standin" (PD14's update,
         a send firing at the fire times run() is given), "pd14_neuron" or
         "pd14_poisson"; params: their static attrs (pd14_neuron_params /
         pd14_poisson_params; default: the kernel's, PD14's defaults). State
         starts at the node's defaults: potential at V_reset, next_spike at
-        the Poisson's start."""
+        the Poisson's start. generated: a FusedKernel (naer2/transpiler/
+        templates/fused_template.py) to run instead of the hand-written
+        kernel -- its state is `state`, one tensor per dynamic attr, starting
+        at `defaults` (the node instance's values)."""
         if model not in MODELS:
             raise ValueError(f"model must be one of {sorted(MODELS)}")
+        self.generated = generated
+        self.state = {a: torch.full((n,), float((defaults or {}).get(a, 0.0)), device=device)
+                      for a in (generated.attrs if generated is not None else ())}
         self.n, self.group_size, self.device = n, group_size, torch.device(device)
         self.n_groups = -(-n // group_size)
         self.model, self.params = model, dict(params or {})
@@ -307,12 +313,15 @@ class FusedPop:
         uniform_emission = uniform if uniform_emission is None else uniform_emission
         uniform_sources = uniform if uniform_sources is None else uniform_sources
         self.run_id += 1
+        self._t_start, self._t_end = t_start, t_end
         w = self.ring.slot_width
         k_lo = self.ring.ring_pos
         k_hi = int(((deliver_until if deliver_until is not None else t_end) + 1e-6) // w) - 1
         fire_time = fire_time.to(self.device) if fire_time is not None else self._no_fire
         emit_delay = emit_delay.to(self.device) if emit_delay is not None else self._no_delay
         lanes = 32 * num_warps
+        if self.generated is not None:
+            return self._run_generated(k_lo, k_hi, w, round_id, uniform_sources, num_warps, stream)
         args = (
             self.t_ref_end, self.potential, self.current, self.last_time, self.next_spike, self.n,
             self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, k_lo, k_hi, w,
@@ -353,6 +362,29 @@ class FusedPop:
                                                     waves_per_eu=self.waves_per_eu)
         if aligned:
             self._launchers[key] = _direct_launch(kernel, self.n_groups, tuple(consts.values()))
+        self._advance(k_lo, k_hi)
+
+    def _run_generated(self, k_lo, k_hi, w, round_id, uniform_sources, num_warps, stream):
+        """A generated kernel's launch: its dynamic attrs' tensors, then the template's fixed arguments
+        (JIT dispatch every time: the cached direct launch is the runtime's, later)."""
+        gk, lanes, p2 = self.generated, 32 * num_warps, triton.next_power_of_2
+        args = [self.state[a] for a in gk.attrs] + [
+            self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, k_lo, k_hi, w,
+            round_id if round_id is not None else self.run_id, self.run_id % 2,
+            self.received, self.n_received, self.log, self.log_cap,
+            self.history.buf, self.history.cap, self.run_id, self._t_start, self._t_end,
+            self.trace.buf if self.trace is not None else self.log]
+        consts = dict(
+            GROUP_SIZE=self.group_size, K=self.history.K, SK=self.plan.K, KP=p2(self.plan.K),
+            UNIFORM_SOURCES=uniform_sources, N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap,
+            SIDE_CAP=self.ring.side_cap, LOG=self.log_cap > 0, STREAM=self.stream, U=self.unroll,
+            SPT=max(self.group_size // lanes, 1), NUM_WARPS=num_warps, MAX_CONNS=p2(max(self.plan.n_conns, 1)),
+            LOG_CJ=(p2(max(self.plan.n_conns, 1)) * p2(self.plan.K)).bit_length() - 1, ITERS=self.plan.iters,
+            COUNT=self.count_received, BATCH=self.batch, DIR=self.use_directory, NSP=p2(self.ring.n_slots),
+            TRACE=self.trace.level if self.trace is not None else 0,
+            TRACE_CAP=self.trace.cap if self.trace is not None else 1)
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            gk.kernel[(self.n_groups,)](*args, **consts, num_warps=num_warps, waves_per_eu=self.waves_per_eu)
         self._advance(k_lo, k_hi)
 
     def _advance(self, k_lo, k_hi):
