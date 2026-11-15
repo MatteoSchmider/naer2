@@ -1259,7 +1259,14 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      out of arrival order by less than one slot width — a receive-side
      integrator (e.g. `lif_ed`, which drops dt < 0) sees time step back.
    - **D-2 send runs after every delivery** (rooted at the target lane), and
-     once more after update — the accuracy event-driven models need.
+     once more after update — the accuracy event-driven models need. Only
+     where the delivery can change send's outcome: per connection, its
+     receive writes a node attr send reads (`ReadMemberFinder` vs the
+     receive hook's assigned members, `Population.compile`; done in the old
+     templates already, 2026-11-15). PD14_neuron's receive writes `current`,
+     its send reads `potential`: no per-delivery send. A send whose effect
+     doesn't depend on what receive changes (unconditional side effects, or
+     only `time`) thus runs once per window.
    - **D-3 any number of spikes per neuron and run** (n2.spike() in receive,
      in the per-delivery send, at several send sites) — required to keep
      long-timestep, sparsely active event-driven populations accurate.

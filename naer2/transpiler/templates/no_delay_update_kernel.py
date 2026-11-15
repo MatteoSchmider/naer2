@@ -85,7 +85,8 @@ Kernel body — two phases:
     │            is_target = mask & (offs == tgt)                            │
     │            <<< edge forward for conn 0 >>>                             │
     │            <<< receive for conn 0 >>>                                  │
-    │            <<< send_section — fire check, after this spike's receive >>>│
+    │            <<< send_section — fire check, after this spike's receive │
+    │                (only where receive writes what send reads)     >>>   │
     │        elif spike_conn[j] == 1:                                        │
     │          ... conn 1's own pointers, own CSR range, own transpiled AST │
     └────────────────────────────────────────────────────────────────────────┘
@@ -189,9 +190,12 @@ class NoDelayUpdateKernelTemplate:
     from outside — as opposed to ones that inline as a literal constant.
     """
 
-    def __init__(self, context, incoming_with_hooks: list):
+    def __init__(self, context, incoming_with_hooks: list, send_after_delivery: list[bool] | None = None):
         self.ctx = context
         self.incoming = incoming_with_hooks  # [(conn, recv_stmts, edge_fwd_stmts, source_dynamic_attrs, edge_tensor_attrs)]
+        # per connection: run send after each delivery (its receive writes a node attr send reads,
+        # see Population.compile); default: always
+        self.send_after_delivery = send_after_delivery or [True] * len(incoming_with_hooks)
 
     # ------------------------------------------------------------------ public
 
@@ -457,8 +461,10 @@ mask = offs < n_neurons
             )
 
         # send (fire check) masked to the delivered neurons, run after receive
-        # so it sees this spike's effect on their state
-        target_send = self._make_target_section(send_section)
+        # so it sees this spike's effect on their state -- only if this
+        # connection's receive writes something send reads (otherwise the
+        # delivery can't change send's outcome; send runs in the final pass)
+        target_send = self._make_target_section(send_section) if self.send_after_delivery[i] else []
 
         link_body = (
             link_loads

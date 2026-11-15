@@ -190,10 +190,22 @@ def test_flush_step_has_no_atomic(src_E):
     assert "tl.atomic_add(" not in src_E[flush_line_idx - 200:flush_line_idx]
 
 
-def test_per_link_fire_check_rooted_at_is_target(src_E):
-    # Must be rooted at is_target, not the whole-group mask — otherwise a
-    # non-target lane already above threshold would leak a spike record.
-    assert "_m0 = is_target & (potential > -50.0)" in src_E
+def _link_loops(func) -> list[ast.For]:
+    return [n for n in ast.walk(func) if isinstance(n, ast.For) and isinstance(n.target, ast.Name)
+            and n.target.id == "link_tile"]
+
+
+def test_no_per_delivery_send_when_receive_writes_nothing_send_reads(func_E, src_E):
+    # PD14_neuron's receive writes only current; send reads potential (and
+    # time): a delivery can't change send's outcome, so send runs once, in
+    # the final pass after update, not after every delivery.
+    loops = _link_loops(func_E)
+    assert loops, "the link loops should still be there"
+    for loop in loops:
+        body = ast.unparse(loop)
+        assert "potential > -50.0" not in body, "no fire check inside the link loop"
+        assert "local_spike_node_ptr" not in body, "no spike emission inside the link loop"
+    assert "_m0 = mask & (potential > -50.0)" in src_E, "send's fire check stays in the final pass"
 
 
 def test_math_exp_lowered_to_tl_exp(src_E):

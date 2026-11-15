@@ -35,8 +35,8 @@ deliveries (no negative dt for the model). Every (spike, bucket) pair is
 still walked exactly once, and the bucket is a runtime index, so the link
 body exists once per connection rather than once per bucket. See TODO.md.
 
-Everything per link -- tiling, densify, receive, send -- is exactly the
-no-delay template's.
+Everything per link -- tiling, densify, receive, send (after a delivery only
+where receive writes what send reads) -- is exactly the no-delay template's.
 
 Edge forward/backward callbacks are disallowed on every incoming
 connection of a population using this kernel (checked in Population.
@@ -75,9 +75,13 @@ class PerLinkDelayUpdateKernelTemplate:
     of any one connection.
     """
 
-    def __init__(self, context, incoming_with_hooks: list, n_buckets: int, bucket_width: float):
+    def __init__(self, context, incoming_with_hooks: list, n_buckets: int, bucket_width: float,
+                 send_after_delivery: list[bool] | None = None):
         self.ctx = context
         self.incoming = incoming_with_hooks
+        # per connection: send after each delivery only where receive writes what send reads
+        # (see Population.compile and the no-delay template); default: always
+        self.send_after_delivery = send_after_delivery or [True] * len(incoming_with_hooks)
         self.n_buckets = n_buckets
         self.bucket_width = bucket_width
 
@@ -264,7 +268,7 @@ mask = offs < n_neurons
                 f"edge_{attr} = tl.load(scratch_ptr + offs)"
             )
 
-        target_send = self._make_target_section(send_section)
+        target_send = self._make_target_section(send_section) if self.send_after_delivery[i] else []
         link_body = (
             link_loads
             + list(copy.deepcopy(edge_fwd_stmts))

@@ -761,7 +761,7 @@ class Population:
         """
         import ast
 
-        from .transpiler.analyzers.used_members import UsedMemberFinder
+        from .transpiler.analyzers.used_members import ReadMemberFinder, UsedMemberFinder
         from .transpiler.context import TranspilerContext
         from .transpiler.hook_transpiler import HookTranspiler
         from .transpiler.templates.no_delay_update_kernel import (
@@ -793,11 +793,22 @@ class Population:
                         f"e.g. conn.fabric.weight = tensor(...)."
                     )
 
+        # Send after a delivery only where that delivery can change send's
+        # outcome: the connection's receive writes a node attr send reads.
+        # Otherwise (e.g. PD14_neuron: receive writes current, send reads
+        # potential) the per-delivery send is left out and send runs once,
+        # after update -- so a send whose effect doesn't depend on what
+        # receive changes (unconditional side effects, or only `time`) runs
+        # once per window, not once per delivery.
+        send_reads = ReadMemberFinder(self.node.send.ast, "self").run()
+        send_after_delivery = []
+
         # one transpiled receive + edge-forward section per incoming connection
         incoming_with_hooks = []
         for conn in self.incoming:
             port = conn._target_port or "receive"
             hook = self.node.receive.get(port)
+            send_after_delivery.append(hook is not None and bool(hook.assigned_members & send_reads))
             edge_fwd_hook = conn.fabric.edge.get("forward")
             edge_bwd_hook = conn.fabric.edge.get("backward")
 
@@ -950,9 +961,9 @@ class Population:
 
             w, n_buckets = self._delay_layout()
             return PerLinkDelayUpdateKernelTemplate(
-                ctx, incoming_with_hooks, n_buckets, w
+                ctx, incoming_with_hooks, n_buckets, w, send_after_delivery
             ).build(update_section, send_section)
 
-        return NoDelayUpdateKernelTemplate(ctx, incoming_with_hooks).build(
+        return NoDelayUpdateKernelTemplate(ctx, incoming_with_hooks, send_after_delivery).build(
             update_section, send_section
         )
