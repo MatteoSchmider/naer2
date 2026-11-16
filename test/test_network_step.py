@@ -1,5 +1,5 @@
 """
-Network.step() driving the fused kernels end to end (TODO.md 1e, runtime
+Network.step() driving the fused kernels end to end (TODO.md, runtime
 integration step 4): the horizon scheduling deciding who runs when, every
 run of a round launched with the round's id (a run reads its sources'
 earlier rounds only) on its population's stream through one event hub, the
@@ -121,7 +121,7 @@ def test_every_run_of_a_round_carries_its_id():
 
 
 def test_gap_history_grows_with_a_slow_consumer():
-    """TODO.md 1e (sizing): an event-driven consumer reads its source only
+    """TODO.md (sizing): an event-driven consumer reads its source only
     when an arrival is due -- here every 3 ms, while the source runs (and
     spikes) every 0.1 ms, ~30 runs between reads. A history that grows when
     a consumer falls behind keeps them all; today the derived depth (8 with

@@ -1,6 +1,6 @@
 """
 Populations on the fused kernel's runtime (naer2/population.py: run(),
-fused_kernel(), runtime; TODO.md 1e, runtime integration step 3), built
+fused_kernel(), runtime; TODO.md, runtime integration step 3), built
 through the DSL and run directly -- no Network: the kernel generated from
 their hooks, their dynamic attrs as the runtime's state, their incoming
 connections' simulation topologies from Fabric.simulation.

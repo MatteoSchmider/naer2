@@ -19,7 +19,7 @@ generated fused kernels (Population.fused_kernel): A's -- no incoming
 connections, every spike site in update / send -- is checked on its source;
 B, C and D need what the template doesn't generate yet (a spike inside
 delivery, D-3; edge forward hooks; source attrs, D-10), so they are one gap
-test, failing until those close (TODO.md 1e).
+test, failing until those close (TODO.md).
 
 No GPU: generating a kernel only builds its source and the gluon.jit
 function.
@@ -109,7 +109,7 @@ def test_lowered_completely(src_A):
 
 @pytest.mark.parametrize("label", ["B", "C", "D"])
 def test_gap_coverage_network_generates(pops, label):
-    """TODO.md 1e: B -- a spike inside delivery (pos_receive, D-3); C -- an
+    """TODO.md: B -- a spike inside delivery (pos_receive, D-3); C -- an
     edge forward hook, source.src_pot (D-10); D -- three connections, one
     with an edge forward hook. Every hook lowered, the maps reversed."""
     k = pops[label].fused_kernel()  # raises NotImplementedError today

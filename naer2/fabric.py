@@ -102,7 +102,7 @@ class Fabric:
         """The connection's SimulationTopology (naer2/topology.py) for its
         consumer: the canonical topology restructured at the consumer's
         group size, per-link delays quantized at `resolution` (the finest
-        its consumer needs, TODO.md 1e D-12), carrying `attrs` -- the
+        its consumer needs, TODO.md D-12), carrying `attrs` -- the
         per-link attrs the consumer's kernel reads, the one it stages first
         (a scalar edge attr broadcast to every link). With none, one
         placeholder attr: the kernel's per-link attr load is unconditional.

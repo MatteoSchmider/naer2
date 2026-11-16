@@ -134,6 +134,11 @@ class Ring:
         self.side_count.copy_(side_count.clamp(max=old_side))
         self.watermark.copy_(watermark)
         self.flags.copy_(flags)
+        if buf.is_cuda:
+            # the old buffer is released here, but the runs queued before the growth (and the copies above) on
+            # this stream may still be using it: keep the allocator from reusing it until they are done (it was
+            # allocated on another stream, whose pool would otherwise take it back at once)
+            buf.record_stream(torch.cuda.current_stream(buf.device))
 
     def cell(self, group: int, slot: int) -> int:
         return group * self.n_slots + slot % self.n_slots

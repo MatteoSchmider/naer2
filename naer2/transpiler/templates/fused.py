@@ -1,8 +1,8 @@
 """
 The fused kernel's template: one launch per population and run -- intake,
 delivery, update, send and emission in one Gluon kernel, one program per
-group. This module is the FIXED part, written by hand and optimized (TODO.md
-1d); the hooks come in from outside: a kernel entry (generated from a
+group. This module is the FIXED part, written by hand and optimized (TODO.md,
+the optimization limits); the hooks come in from outside: a kernel entry (generated from a
 population's hooks, naer2/transpiler/templates/fused_template.py, or
 written by hand -- test/fused_reference.py, the reference) calls
 
@@ -50,7 +50,7 @@ go to its first undelivered slot (late), at or past N_SLOTS ahead are far
 future (flag 1), full runs flag 0, uniform violations flag 2, a consumer
 falling behind its sources' history raises the overrun flag.
 
-Integration into the library (TODO.md, 1e): `# INTEGRATE <KIND>: <rule>`
+Integration into the library (TODO.md): `# INTEGRATE <KIND>: <rule>`
 comments mark every point where the template meets the library's hooks
 and scheduler --
   HOOK(<callback>)        where a transpiled hook (update, receive, send,
@@ -64,7 +64,7 @@ and scheduler --
   DEV                     what only tests and tools use (compiled out)
   LIMITATION / GAP        a known limitation to keep documented when
                           porting / a missing piece that is solvable later
-  D-n                     decision n in TODO.md 1e
+  D-n                     decision n in TODO.md
 """
 
 import torch

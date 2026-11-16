@@ -1,7 +1,7 @@
 """
 A population's runtime on the fused kernel: its state, its emission history,
 its rings of arrival slots, its plan of incoming connections, and the
-launch of its kernel (TODO.md 1e, runtime integration step 1).
+launch of its kernel (TODO.md, runtime integration step 1).
 
 The kernel is a FusedKernel (naer2/transpiler/templates/fused_template.py):
 generated from the population's hooks, or any kernel with the same entry
@@ -16,7 +16,7 @@ arguments, then its constexprs (+ the kernel's own, FusedKernel.consts).
               connection: builds the ring, the watermarks and the plan;
               uniform_sources when every source's kernel emits uniformly
               (else the general pull for all -- a mixed path is an open
-              optimization, TODO.md 1e D-5)
+              optimization, TODO.md D-5)
   run()       one run over [t_start, t_end) in round round_id: the sources'
               runs of earlier rounds taken in, every slot due by
               deliver_until delivered, update, send, emission

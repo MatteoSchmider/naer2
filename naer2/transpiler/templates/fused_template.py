@@ -2,7 +2,7 @@
 Generates a population's fused kernel from its hooks: the entry and the
 receive function around the fixed template (naer2/transpiler/templates/
 fused.py), in exactly the shape of the hand-written reference (test/
-fused_reference.py) -- see TODO.md 1e for the decisions (D-n) it follows.
+fused_reference.py) -- see TODO.md for the decisions (D-n) it follows.
 
   entry    one <attr>_ptr per dynamic node attr, then the template's fixed
            arguments; _pull; the attrs receive (or a per-delivery send)
@@ -59,7 +59,7 @@ class _SpikeSites:
         if self.where == "delivery":
             raise NotImplementedError(
                 "n2.spike() inside delivery (in receive, or a send that runs after every delivery) needs the "
-                "program's emission buffer -- not implemented yet (TODO.md 1e, D-3)")
+                "program's emission buffer -- not implemented yet (TODO.md, D-3)")
         k = len(self.sites)
         self.sites.append(bare)
         return _STMTS(f"_fire{k} = {mask}\n_e{k} = ({time_expr}) + gl.zeros([GROUP_SIZE], gl.float32, layout=LN)")
@@ -101,15 +101,15 @@ class FusedKernelTemplate:
             forward, backward = conn.fabric.edge.get("forward"), conn.fabric.edge.get("backward")
             if forward is not None and forward.assigned_members:
                 raise NotImplementedError("edge forward hooks aren't generated yet: they run on link lanes while "
-                                          "staging (TODO.md 1e, HOOK(forward), D-7 / D-8)")
+                                          "staging (TODO.md, HOOK(forward), D-7 / D-8)")
             if backward is not None and backward.assigned_members:
-                raise NotImplementedError("edge backward hooks are out of scope for now (TODO.md 1e, D-11)")
+                raise NotImplementedError("edge backward hooks are out of scope for now (TODO.md, D-11)")
             hook = self.pop.node.receive.get(conn._target_port or "receive")
             if hook is None:
                 variants.add((None, None, ()))
                 continue
             if UsedMemberFinder(hook.ast, "source").run():
-                raise NotImplementedError("source.<attr> in receive is unsupported for now (TODO.md 1e, D-10)")
+                raise NotImplementedError("source.<attr> in receive is unsupported for now (TODO.md, D-10)")
             edge_rename = {hook_name: real for real, hook_name in (conn._fabric_map or {}).items()}
             used = {edge_rename.get(n, n) for n in UsedMemberFinder(hook.ast, "edge").run()}
             tensor = tuple(sorted(a for a in used if a in conn.fabric.tensor_attrs))
@@ -117,11 +117,11 @@ class FusedKernelTemplate:
                                      if a not in conn.fabric.tensor_attrs))
             if len(tensor) > 1:
                 raise NotImplementedError(f"receive reads {len(tensor)} per-link attrs {list(tensor)}: one per "
-                                          f"connection for now (TODO.md 1e, D-7)")
+                                          f"connection for now (TODO.md, D-7)")
             variants.add((id(hook), tensor, constants, tuple(sorted((conn._fabric_map or {}).items()))))
         if len(variants) > 1:
             raise NotImplementedError("incoming connections with different receive code (ports, per-link attrs, "
-                                      "edge constants) need per-variant dispatch (TODO.md 1e, D-6)")
+                                      "edge constants) need per-variant dispatch (TODO.md, D-6)")
         if not self.pop.incoming:
             # no connections in the DSL (a runtime wired up with topologies directly): the node's default
             # receive, every edge.<x> it reads a per-link attr
@@ -129,11 +129,11 @@ class FusedKernelTemplate:
             if hook is None:
                 return None, None, None
             if UsedMemberFinder(hook.ast, "source").run():
-                raise NotImplementedError("source.<attr> in receive is unsupported for now (TODO.md 1e, D-10)")
+                raise NotImplementedError("source.<attr> in receive is unsupported for now (TODO.md, D-10)")
             used = sorted(UsedMemberFinder(hook.ast, "edge").run())
             if len(used) > 1:
                 raise NotImplementedError(f"receive reads {len(used)} per-link attrs {used}: one per connection "
-                                          f"for now (TODO.md 1e, D-7)")
+                                          f"for now (TODO.md, D-7)")
             return hook, None, (used[0] if used else None)
         conn = self.pop.incoming[0]
         hook = self.pop.node.receive.get(conn._target_port or "receive")

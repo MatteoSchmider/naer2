@@ -152,7 +152,7 @@ class Population:
     def _emission_summary(self) -> tuple[int, float]:
         """(number of spikes, earliest emission time) of this population's
         last run: its history's header, read back once per run and shared by
-        all consumers (a host sync -- TODO.md 1e, D-13)."""
+        all consumers (a host sync -- TODO.md, D-13)."""
         if self._summary is None or self._summary[0] != self._run_id:
             if self._runtime is None or self._runtime.run_id == 0:
                 return 0, math.inf  # no kernel ran: nothing emitted
@@ -174,7 +174,7 @@ class Population:
             self._read_run[conn] = source._run_id
             if not self._event_driven:
                 continue  # its own clock or its inputs' horizon runs it: no summary needed
-            n, earliest = source._emission_summary()  # a host sync (TODO.md 1e, D-13)
+            n, earliest = source._emission_summary()  # a host sync (TODO.md, D-13)
             if n:
                 self._run_times.append(earliest + self._min_delay(conn))
         # (The spikes themselves: the fused kernel's pull takes them in at
@@ -281,7 +281,7 @@ class Population:
         records (later per-link arrivals of spikes already taken in). A run
         at that slot's end is the first that can deliver it. One readback of
         the ring's counts (the host sync event-driven scheduling has anyway,
-        TODO.md 1e, D-13) -- after the round's join (Network.step): the run
+        TODO.md, D-13) -- after the round's join (Network.step): the run
         is on this population's stream."""
         if self._runtime is None:
             return  # no kernel ran: nothing pending
@@ -331,7 +331,7 @@ class Population:
 
     def _slot_width(self) -> float:
         """The ring's slot width: the finest resolution its incoming
-        connections require (TODO.md 1e, D-12; population.delay_resolution
+        connections require (TODO.md, D-12; population.delay_resolution
         overrides); without incoming connections the network's."""
         if self.delay_resolution is not None:
             return float(self.delay_resolution)

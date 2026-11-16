@@ -133,7 +133,7 @@ class _spiking_receiver:
 
 
 def test_gap_spikes_inside_delivery():
-    """TODO.md 1e, D-3: n2.spike() in receive (or in a send after every
+    """TODO.md, D-3: n2.spike() in receive (or in a send after every
     delivery) needs the program's emission buffer -- the generator raises
     NotImplementedError until it exists, and this test fails until then."""
     src = PD14_neuron(K_cortical=2000) * 100
@@ -292,7 +292,7 @@ def _expected(conn, fires, n, values):
 
 
 def test_gap_receive_variants_per_connection():
-    """TODO.md 1e, D-6: each connection's port picks its receive code."""
+    """TODO.md, D-6: each connection's port picks its receive code."""
     a, b, dst = PD14_neuron(K_cortical=2000) * 200, PD14_neuron(K_cortical=2000) * 150, _two_ports() * 300
     exc = a >> static_synapse(1.0) @ "exc" @ PD14_connection(0.1) >> dst
     inh = b >> static_synapse(1.0) @ "inh" @ PD14_connection(0.1) >> dst
@@ -304,7 +304,7 @@ def test_gap_receive_variants_per_connection():
 
 
 def test_gap_several_per_link_attrs():
-    """TODO.md 1e, D-7: a receive reading two per-link attrs (one block per link)."""
+    """TODO.md, D-7: a receive reading two per-link attrs (one block per link)."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _two_attrs() * 300
     conn = src >> PD14_connection(0.1) >> dst
     conn.weight, conn.gain = torch.rand(conn.shape), torch.rand(conn.shape)
@@ -315,7 +315,7 @@ def test_gap_several_per_link_attrs():
 
 
 def test_gap_edge_forward():
-    """TODO.md 1e, HOOK(forward): plastic_synapse's forward (weight += factor)
+    """TODO.md, HOOK(forward): plastic_synapse's forward (weight += factor)
     runs per delivered link before receive sees the weight, and its update
     persists in the topology."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _accumulator() * 300
@@ -332,7 +332,7 @@ def test_gap_edge_forward():
 
 
 def test_gap_edge_forward_destination():
-    """TODO.md 1e, D-9: forward reads its target's state (destination.x): each
+    """TODO.md, D-9: forward reads its target's state (destination.x): each
     delivered link's weight gains 0.1 * the target's acc (1.0 here: every
     target starts there, and a forward runs before its receive)."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _accumulator(acc=1.0) * 300
@@ -344,7 +344,7 @@ def test_gap_edge_forward_destination():
 
 
 def test_gap_source_attrs():
-    """TODO.md 1e, D-10: receive reads its source's state (source.x); the
+    """TODO.md, D-10: receive reads its source's state (source.x); the
     stand-in sources' potential is -65."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _source_reader() * 300
     conn = src >> PD14_connection(0.1) >> dst
@@ -355,7 +355,7 @@ def test_gap_source_attrs():
 
 
 def test_gap_receive_time_is_the_arrival():
-    """TODO.md 1e, D-1: receive's time is its link's arrival, e + its bucket's
+    """TODO.md, D-1: receive's time is its link's arrival, e + its bucket's
     mean delay (the record carries it) -- not the emission time e."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _arrival_recorder() * 300
     conn = src >> PD14_connection(0.1) >> dst
@@ -401,7 +401,7 @@ class _always_firing:
 
 
 def test_gap_edge_backward():
-    """TODO.md 1e, D-11: an edge backward runs on every incoming link of each
+    """TODO.md, D-11: an edge backward runs on every incoming link of each
     spiking target (a reverse topology). The targets fire on all 3 runs, so
     every link gains 3 * 0.25."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _always_firing() * 300

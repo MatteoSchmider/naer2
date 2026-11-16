@@ -1,6 +1,6 @@
 """Fabric.simulation(): a connection's SimulationTopology for its consumer,
 and the per-link attrs living there once it's built (naer2/fabric.py;
-TODO.md 1e, runtime integration step 2). On the CPU, through the DSL."""
+TODO.md, runtime integration step 2). On the CPU, through the DSL."""
 
 import pytest
 import torch

@@ -20,14 +20,14 @@ class Network:
         self.t: float = 0.0
         # Default delay quantization of connections without their own
         # resolution (Connection.resolution); a population's ring slot width
-        # is the finest among its incoming connections' (TODO.md 1e, D-12).
+        # is the finest among its incoming connections' (TODO.md, D-12).
         self.resolution: float = 0.1
         # The round counter: every population run in one round gets its id
         # (a run reads its sources' runs of earlier rounds only).
         self.round_id: int = 0
         self._planned = False
         # Device every population's state lazily moves onto on its first
-        # real kernel launch (Population._ensure_on_device) -- see TODO.md.
+        # real kernel launch (Population._ensure_on_device).
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._streams: dict[Population, torch.cuda.Stream] = {}
 
@@ -56,20 +56,24 @@ class Network:
              Then each population says when it next wants to run
              (Population._next_run_time, inf for not yet); the round's time
              is the earliest of these, capped at t_end.
-          2. Update: every population is offered the round's time and
-             decides itself whether it runs (Population.
-             _execute_update_kernel). A population that runs overwrites its
-             emission buffer by setting its spike count.
-          3. Intake: every population with incoming connections runs one
-             kernel that reads all its sources' emission buffers and
-             integrates the spikes into its own to-deliver buffer. Done at
-             the end of the round so the next round's run times already
-             account for them.
+          2. Run: every population is offered the round's time and decides
+             itself whether it runs (Population._execute_update_kernel) --
+             one fused kernel, with the round's id, on its own stream: it
+             pulls what its sources emitted in earlier rounds (their
+             emission histories) into its ring, delivers the due slots,
+             updates, sends, and emits into its own history. The runs of a
+             round are independent and run concurrently; the round joins
+             before the next.
+          3. Host bookkeeping, after the join: an event-driven population
+             that ran notes its ring's next pending arrival, and every
+             consumer notes its sources' new runs (Population._intake: the
+             emission summary, read only for an event-driven consumer), so
+             the next round's run times already account for them.
 
-        Populations never keep their own spikes across rounds; emission
-        delay, transmission delay and waiting for a slower consumer all
-        live in the consumer's to-deliver buffer. Within each phase the
-        populations' kernels are independent and run concurrently.
+        Emission delay, transmission delay and waiting for a slower
+        consumer all live in the consumer's ring; a source's history keeps
+        its runs until every consumer has pulled them (its depth:
+        _plan_histories).
         """
         pops = list(self.populations)
         for pop in pops:

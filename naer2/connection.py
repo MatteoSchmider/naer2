@@ -203,7 +203,7 @@ class ConnectionBuilder:
     @property
     def resolution(self) -> float | None:
         """The width its per-link delays are quantized at (delay buckets;
-        TODO.md 1c); None: the network's resolution."""
+        TODO.md); None: the network's resolution."""
         return self._resolution
 
     @property

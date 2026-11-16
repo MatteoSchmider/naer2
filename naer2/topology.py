@@ -274,7 +274,7 @@ def directory_ptrs(buf, n_sources, n_pairs):
 class SimulationTopology:
     """A connection's simulation-side topology: the user's canonical links,
     restructured once, on the device, into what the fused kernel's pull and
-    delivery walk (see TODO.md, the spike-management redesign).
+    delivery walk (see naer2/transpiler/templates/fused.py).
 
     Canonical form (what the user and Topology.build give): one row per source
     neuron, its links sorted by target index; every per-link tensor (targets,
