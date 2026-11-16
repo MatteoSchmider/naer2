@@ -1255,7 +1255,15 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    topology on Fabric (per-link attrs live there; `Fabric.simulation()`, a
    placeholder attr where the receive reads none) -- done 2026-11-15; 3. Population on the
    runtime (compile via FusedKernelTemplate, the old gather/merge path
-   removed) -- Network.step's logic unchanged; 4. Network: the new
+   removed) -- Network.step's logic unchanged; done 2026-11-16:
+   `Population.run()` / `fused_kernel()` / `runtime` (built lazily, the
+   dynamic attrs shared as its state), `_emission_summary` from the
+   history; the real PD14 network through its Populations directly matches
+   PD14's rates (0.59 ms per round, one stream). Left for later steps: the
+   slot width is `delay_resolution` (4), n_slots = longest bucket mean +
+   one window + 3 slots and the ring/history capacities (5), the round id
+   comes from `network.round_id` if Network sets it (4), the old
+   `compile()` (AST) stays for its tests (6); 4. Network: the new
    horizon-based scheduling integrated itself (rounds, event hub), free to
    rewrite parts of 1-3; 5. sizing defaults; 6. the old path's code, tests
    and the tools; 7. PD14 through Network.step against the harness.

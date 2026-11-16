@@ -9,10 +9,6 @@ import torch
 
 from .network import Network
 from .nodes import Node, node_types
-from .spike_gather import BlockedSpikes, CarryBuffer, CompactedSpikes
-from .spike_gather import compact as _compact
-from .spike_gather import empty_blocked_spikes
-from .spike_gather import merge as _merge
 from .types import Region
 
 
@@ -124,28 +120,22 @@ class Population:
         self._read_run: dict = {}
         self._summary: tuple[int, int, float] | None = None
 
-        # Spike lifecycle (see naer2/spike_gather.py and TODO.md): _carry
-        # persists across calls, _fresh/_due are this round's only.
-        self._carry: CarryBuffer | None = None
-        self._fresh: BlockedSpikes | None = None
-        self._due: CompactedSpikes | None = None
-        # Target-owned input: everything merged in (scheduling) plus, for the
-        # per-link-delay kernel, the spikes whose delay buckets aren't all
-        # delivered yet (inter-timestep transmission delay) -- emission-
-        # sorted, consumed and trimmed by _execute_update_kernel.
-        self._merged: tuple | None = None
-        # Last delay diagonal already delivered (per-link-delay kernel only).
-        self._k_done: int | None = None
         self._delay_layout_cache: tuple[float, int] | None = None
-        self._blocked_cache: list | None = None
+        # compile()'s (the old templates', kept for the AST tests until they go -- TODO.md 1e step 6)
+        self._compiled_incoming_meta: list[tuple[set, set]] = []
 
-        # Real kernel execution (see _execute_update_kernel): compiled lazily
-        # on first real launch, then cached -- a population's compiled source
-        # never changes once its connections/hooks are fixed.
-        self._kernel_fn = None
-        self._compiled_incoming_meta: list[tuple[set, set]] = (
-            []
-        )  # parallel to self.incoming, set by compile()
+        # The fused kernel's runtime (naer2/runtime.py), built on the first
+        # run: the kernel generated from this population's hooks
+        # (fused_kernel()), its dynamic attrs as the runtime's state (the
+        # same tensors), its history, ring and plan of incoming
+        # connections. main_cap / side_cap / history_depth: the ring's run
+        # capacities and the history's depth (None: their defaults).
+        self._fused = None
+        self._runtime = None
+        self._connected = False
+        self.main_cap: int | None = None
+        self.side_cap: int | None = None
+        self.history_depth: int = 3
 
         self.network: Network = Network(self)
 
@@ -279,37 +269,11 @@ class Population:
             if tensor.device != device:
                 setattr(self, attr, tensor.to(device))
 
-    def _execute_gather_kernel(self, t: float) -> None:
-        """Kernel 1: this population's own compact() step (naer2/spike_gather.py).
-
-        Folding several already-compact()ed sources into the one sorted
-        buffer a target's update kernel consumes (merge()) is a network-wide
-        concern -- a source can feed multiple targets, so every source must
-        compact before any target reads it -- and so lives in
-        Network.step()/merge_incoming(), not here; see TODO.md.
-
-        Runs every sub-step for every population regardless of whether its
-        own update kernel is due this round (see Network.step()): a
-        population's carry may hold a now-due spike even on a round it has
-        nothing new to contribute, and compact() is the only thing that
-        checks.
-        """
-        device = self.network.device
-        if self._fresh is None:
-            self._fresh = empty_blocked_spikes(
-                self.n_blocks, self.local_spike_cap, device
-            )
-        self.compact(t, self.carry_cap)
-        # self._fresh is now folded into _carry/_due; reset it to "nothing
-        # new" so a round where this population's update kernel doesn't run
-        # doesn't re-fold the same entries again next time.
-        self._fresh.count.zero_()
-
     @property
     def _event_driven(self) -> bool:
         return self.timestep is None and not self.has_autonomous_dynamics
 
-    # TODO (emission contract, fixed -- the update kernel must provide this):
+    # (The emission contract of the old templates, kept for reference until they go:
     #   Every run OVERWRITES this population's emission buffer; it is valid
     #   until the population's next run, and consumers read it once per run
     #   (intake, via _run_id), in the round it was written.
@@ -330,17 +294,13 @@ class Population:
     #     overflow, not write past its slice
     def _emission_summary(self) -> tuple[int, float]:
         """(number of spikes, earliest emission time) of this population's
-        last run, read back from the device once per run and shared by all
-        consumers. Computed from the current emission buffer (the update
-        kernel's per-block output); the update kernel should eventually
-        write this summary itself."""
+        last run: its history's header, read back once per run and shared by
+        all consumers (a host sync -- TODO.md 1e, D-13)."""
         if self._summary is None or self._summary[0] != self._run_id:
-            fresh = self._fresh
-            local = torch.arange(fresh.time.shape[0], device=fresh.time.device) % fresh.cap
-            valid = local < fresh.count.repeat_interleave(fresh.cap)
-            earliest = torch.where(valid, fresh.time, math.inf).min()
-            n, earliest = torch.stack([valid.sum().to(earliest.dtype), earliest]).tolist()
-            self._summary = (self._run_id, int(n), earliest)
+            if self._runtime is None or self._runtime.run_id == 0:
+                return 0, math.inf  # no kernel ran: nothing emitted
+            n, earliest = self._runtime.history.summary(self._runtime.run_id)
+            self._summary = (self._run_id, n, earliest)
         return self._summary[1], self._summary[2]
 
     def _intake(self, t: float) -> None:
@@ -362,10 +322,8 @@ class Population:
             new.append(i)
             if self._event_driven:
                 self._run_times.append(earliest + self._min_delay(conn))
-        # TODO (merge kernel): merge the emission buffers of the connections
-        # in `new` into this population's to-deliver buffer, using
-        # self._bound (relaxed at the start of this round) as the lower
-        # bound of its next window.
+        # (The spikes themselves: the fused kernel's pull takes them in at
+        # this population's next run, straight from the sources' histories.)
 
     def _check_schedulable(self) -> None:
         """An update() population needs a clock: its own timestep, or
@@ -455,270 +413,102 @@ class Population:
             r for r in self._run_times if r > window_end and not _same_time(r, window_end)
         ]
 
-        # TODO (spike-handling redesign): everything below is the old body,
-        # still consuming the old _merged/set_fresh_output handoff.
-        device = self.network.device
-        self._ensure_on_device(device)
-        fn = self._kernel()
-        n_neurons = len(self.shape)
-        n_blocks = self.n_blocks
+        self.run(t, window_end, round_id=getattr(self.network, "round_id", None))
 
-        if self._merged is not None:
-            spike_time, spike_src, spike_conn, spike_count = self._merged
-            n_spikes = int(spike_count[0].item())
-        else:
-            spike_time = torch.zeros(1, device=device, dtype=torch.float32)
-            spike_src = torch.zeros(1, device=device, dtype=torch.int32)
-            spike_conn = torch.zeros(1, device=device, dtype=torch.int32)
-            n_spikes = 0
+    # ------------------------------------------------------------------ the fused kernel's runtime
 
-        args: dict = {}
-        for attr in self.dynamic_attrs:
-            args[f"{attr}_ptr"] = getattr(self, attr)
-        args["n_neurons"] = n_neurons
-        args["spike_time_ptr"] = spike_time
-        args["spike_src_ptr"] = spike_src
-        args["spike_conn_ptr"] = spike_conn
-        args["n_spikes"] = n_spikes
+    def fused_kernel(self):
+        """This population's FusedKernel, generated from its hooks (naer2/
+        transpiler/templates/fused_template.py), once."""
+        if self._fused is None:
+            from .transpiler.templates.fused_template import FusedKernelTemplate
 
-        delay_kernel = self.uses_per_link_delay_kernel
-        if self._blocked_cache is None:
-            self._blocked_cache = self._blocked_topologies(device)
-
-        for i, conn in enumerate(self.incoming):
-            source_dynamic_attrs, edge_tensor_attrs = self._compiled_incoming_meta[i]
-            conn._source._ensure_on_device(device)
-            offsets, target_local, bucket = self._blocked_cache[i]
-            args[f"conn{i}_src_offsets_ptr"] = offsets
-            args[f"conn{i}_target_indices_ptr"] = target_local
-            args[f"conn{i}_bucket_ptr"] = bucket
-            for attr in edge_tensor_attrs:
-                args[f"conn{i}_{attr}_ptr"] = conn.fabric.device_state[attr]
-            for attr in source_dynamic_attrs:
-                args[f"conn{i}_source_{attr}_ptr"] = getattr(conn._source, attr)
-
-        args["t"] = t
-        cap = self.local_spike_cap
-        local_spike_node = torch.zeros(n_blocks * cap, device=device, dtype=torch.int32)
-        local_spike_time = torch.zeros(
-            n_blocks * cap, device=device, dtype=torch.float32
-        )
-        local_spike_count = torch.zeros(n_blocks, device=device, dtype=torch.int32)
-        args["local_spike_node_ptr"] = local_spike_node
-        args["local_spike_time_ptr"] = local_spike_time
-        args["local_spike_count_ptr"] = local_spike_count
-        # Per-program [GROUP_SIZE] scratch, reused by every densify step
-        # (tl.histogram + atomic-scatter-add, see the update kernel templates)
-        # in this launch -- always allocated, even if this particular
-        # population's kernel never references it (then simply unused).
-        args["scratch_ptr"] = torch.zeros(
-            n_blocks * self.group_size, device=device, dtype=torch.float32
-        )
-
-        if delay_kernel:
-            w, n_buckets = self._delay_layout()
-            # last diagonal whose delivery time (k + 1) * w is <= t
-            k_t = math.floor(t / w + 1e-9) - 1
-            bins_args, n_delivered = self._emission_bins(
-                spike_time, n_spikes, w, k_t - n_buckets + 1
-            )
-            args.update(bins_args)
-            k_lo = k_t + 1 if n_spikes == 0 else bins_args["first_bin"]
-            if self._k_done is not None:
-                # spikes owing a diagonal <= k_done arrived late: those
-                # deliveries are skipped, by design
-                k_lo = max(k_lo, self._k_done + 1)
-            args["k_lo"] = k_lo
-            args["k_hi"] = k_t
-
-        args.update(
-            GROUP_SIZE=self.group_size,
-            SPIKE_BLOCK=self.spike_block,
-            LINK_BLOCK=self.link_block,
-            LOCAL_SPIKE_CAP=cap,
-        )
-        args = {k: v for k, v in args.items() if k in fn.arg_names}
-        fn[(n_blocks,)](**args)
-
-        self.set_fresh_output(
-            BlockedSpikes(local_spike_node, local_spike_time, local_spike_count, cap)
-        )
-        if delay_kernel:
-            # inter-timestep transmission delay: spikes with buckets still
-            # to deliver stay as this population's input (a suffix, since
-            # the buffer is emission-sorted); the scheduling step combines
-            # new input onto it next round
-            self._k_done = k_t
-            self._merged = (
-                (
-                    spike_time[n_delivered:n_spikes],
-                    spike_src[n_delivered:n_spikes],
-                    spike_conn[n_delivered:n_spikes],
-                    torch.tensor([n_spikes - n_delivered], device=device, dtype=torch.int32),
-                )
-                if n_delivered < n_spikes
-                else None
-            )
-        else:
-            self._merged = None
-
-    def _blocked_topologies(self, device) -> list:
-        """Per incoming connection: (offsets, target_local, bucket) on
-        `device` (bucket None without delay buckets), and the connection's
-        kernel-referenced per-link tensors moved onto the device in the same
-        blocked order for good (Fabric.bind_device). Computed once:
-        topology, delays and the delay layout are all fixed after the first
-        launch; nothing of the layout is kept host-side."""
-        n_neurons = len(self.shape)
-        result = []
-        for i, conn in enumerate(self.incoming):
-            if self.uses_per_link_delay_kernel:
-                w, n_buckets = self._delay_layout()
-                # A connection without its own per-link delay tensor still
-                # goes through the bucketed layout (uniform delay, 0 if
-                # unset) so every connection has the same offset shape.
-                d = getattr(conn.fabric, "delay", None)
-                if not isinstance(d, torch.Tensor):
-                    d = torch.full(
-                        (len(conn.fabric.topology),), float(d) if d is not None else 0.0
-                    )
-                bt = conn.fabric.topology.blocked(
-                    self.group_size, n_neurons,
-                    delay=d, n_buckets=n_buckets, bucket_width=w,
-                )
-            else:
-                bt = conn.fabric.topology.blocked(self.group_size, n_neurons)
-            _, edge_tensor_attrs = self._compiled_incoming_meta[i]
-            conn.fabric.bind_device(bt.perm, edge_tensor_attrs, device)
-            result.append((
-                bt.offsets.flatten().to(device=device, dtype=torch.int32),
-                bt.target_local.to(device=device),
-                bt.bucket.to(device=device) if bt.bucket is not None else None,
-            ))
-            del bt
-        return result
-
-    @staticmethod
-    def _emission_bins(
-        spike_time: torch.Tensor, n_spikes: int, width: float, last_done_bin: int
-    ) -> tuple[dict, int]:
-        """Emission-bin boundaries for the per-link-delay kernel's
-        (emission bin, delay bucket) convolution -- bins of `width` on an
-        absolute grid, so bin_start[m] : bin_start[m + 1] is bin
-        first_bin + m's range in the (emission-sorted) spike buffer -- plus
-        how many leading spikes are in bins <= last_done_bin (every one of
-        their buckets delivered by the end of this call). One host sync."""
-        device = spike_time.device
-        if n_spikes == 0:
-            return dict(
-                bin_start_ptr=torch.zeros(1, device=device, dtype=torch.int32),
-                first_bin=0,
-                n_bins=0,
-            ), 0
-        bins = torch.floor(spike_time[:n_spikes] / width).to(torch.int64)
-        n_done = (bins <= last_done_bin).sum()
-        first, last, n_delivered = torch.stack([bins[0], bins[-1], n_done]).tolist()
-        edges = torch.arange(first, last + 2, device=device, dtype=torch.int64)
-        return dict(
-            bin_start_ptr=torch.searchsorted(bins, edges).to(torch.int32),
-            first_bin=first,
-            n_bins=last - first + 1,
-        ), n_delivered
-
-    def _kernel(self):
-        """Compile (once) and return the loaded @triton.jit update-kernel
-        function for this population -- whichever variant compile() produced
-        (its ast.FunctionDef name is read back rather than hardcoded, so this
-        works for either template). Cached on self._kernel_fn -- a
-        population's compiled source never changes once its connections and
-        hooks are fixed."""
-        if self._kernel_fn is None:
-            module = self.compile()
-            func_name = module.body[0].name
-            source = (
-                "import triton\nimport triton.language as tl\n\n"
-                + ast.unparse(module)
-                + "\n"
-            )
-            path = pathlib.Path(tempfile.mkdtemp()) / f"naer2_kernel_{id(self)}.py"
-            path.write_text(source)
-            spec = importlib.util.spec_from_file_location(path.stem, path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            self._kernel_fn = getattr(mod, func_name)
-        return self._kernel_fn
-
-    def set_fresh_output(self, blocked: BlockedSpikes) -> None:
-        """Hand off this round's freshly emitted, GROUP-blocked spikes for
-        compact() to fold in. Called automatically by _execute_update_kernel
-        after every real kernel launch; tests may also call it directly to
-        control spikes without running the update kernel -- if
-        self.fresh_sorted is True, the entries must then already be in time
-        order, since compact() won't sort them."""
-        self._fresh = blocked
-
-    def compact(self, t_hi: float, carry_cap: int = 64) -> CompactedSpikes:
-        """This population's own lifecycle step (naer2/spike_gather.py):
-        fold this round's `_fresh` (see set_fresh_output) into `_carry`
-        (created on first call, persists across calls on this population),
-        split on `t_hi`, store the due entries as `_due` for any target's
-        merge_incoming() to read this round, and return them.
-
-        Must run for every population before ANY of them call
-        merge_incoming() — a target's merge reads its sources' `_due`,
-        which this call just (re)produces; see Network.gather().
-        """
-        if self._fresh is None:
-            raise ValueError(
-                f"{self!r} has no fresh spike output set for this round (see set_fresh_output)"
-            )
-        if self._carry is None:
-            self._carry = CarryBuffer(carry_cap, self._fresh.time.device)
-        self._due = _compact(
-            self._fresh, self._carry, t_hi, fresh_sorted=self.fresh_sorted
-        )
-        return self._due
+            self._fused = FusedKernelTemplate(self).build()
+        return self._fused
 
     @property
-    def fresh_sorted(self) -> bool:
-        """True if every n2.spike() in this population's own hooks is bare
-        (no time argument): then each one records the kernel's `t`, so all of
-        one launch's fresh output shares a single timestamp and compact() can
-        skip sorting it. Any explicit spike time (e.g. an emission delay)
-        makes it False."""
-        from .transpiler.transformers.if_transformer import IfTransformer
+    def runtime(self):
+        """The runtime (naer2/runtime.py), connected to its sources' (built on first use)."""
+        self._ensure_runtime()
+        return self._runtime
 
-        hooks = [self.node.send, self.node.update, *self.node.receive.values()]
-        for conn in self.incoming:
-            hooks += conn.fabric.edge.values()
-        for hook in hooks:
-            if hook is None:
-                continue
-            for n in ast.walk(hook.ast):
-                if IfTransformer._is_spike(n) and (n.value.args or n.value.keywords):
-                    return False
-        return True
+    def _create_runtime(self, device) -> None:
+        """The runtime itself, its state this population's dynamic attrs
+        (the same tensors: what the kernel writes, the attrs show) -- not
+        yet connected."""
+        if self._runtime is not None:
+            return
+        from .runtime import PopulationRuntime
 
-    def merge_incoming(
-        self, per_src_cap: int = 64
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """This population's merge step (naer2/spike_gather.py): combine
-        every incoming connection's source population's already-compact()ed
-        `_due` (this round) into the sorted (time, src, conn) buffer this
-        population's own update kernel would consume. conn ids are each
-        connection's index in `self.incoming`, matching compile()'s
-        conn{i}_... pointer numbering. Every source must have already run
-        compact() this round."""
-        sources = []
+        self._ensure_on_device(device)
+        kernel = self.fused_kernel()
+        self._runtime = PopulationRuntime(kernel, len(self.shape), group_size=self.group_size,
+                                          depth=self.history_depth, device=device,
+                                          state={a: getattr(self, a) for a in kernel.attrs})
+
+    def _slot_width(self) -> float:
+        """The ring's slot width: the finest resolution its incoming
+        connections require (TODO.md 1e, D-12) -- for now the population's
+        delay_resolution (step 4 of the runtime integration derives it)."""
+        if self.delay_resolution is not None:
+            return float(self.delay_resolution)
+        if not self.incoming:
+            return float(self.timestep) if self.timestep else 0.1
+        raise ValueError(f"{type(self.instance).__name__} population needs its ring's slot width: set "
+                         f"population.delay_resolution")
+
+    def _ensure_runtime(self) -> None:
+        """Every runtime of the population and its sources created, then
+        this one connected: each incoming connection's SimulationTopology
+        (Fabric.simulation, at this population's group size and slot width,
+        carrying the per-link attr its kernel stages) and its source's
+        runtime."""
+        device = self.network.device
+        self._create_runtime(device)
+        if self._connected:
+            return
+        kernel, w = self._runtime.kernel, self._slot_width()
+        sources, topologies = [], []
         for conn in self.incoming:
-            src_due = conn._source._due
-            if src_due is None:
-                raise ValueError(
-                    f"{conn._source!r} has not run compact() this round yet"
-                )
-            sources.append(src_due)
-        conns = list(range(len(self.incoming)))
-        return _merge(sources, conns, per_src_cap)
+            conn._source._create_runtime(device)
+            sources.append(conn._source._runtime)
+            topologies.append(conn.fabric.simulation(
+                len(self.shape), self.group_size, device, resolution=w,
+                attrs=[kernel.edge_attr] if kernel.edge_attr is not None else []))
+        # the ring covers the longest incoming delay (its bucket mean) and one run's window ahead
+        longest = max((float(t.bucket_mean.max()) for t in topologies), default=0.0)
+        window = self.timestep if self.timestep is not None else w
+        n_slots = math.ceil(longest / w) + math.ceil(window / w) + 3
+        caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
+        self._runtime.connect(sources, topologies, n_slots, slot_width=w, **caps)
+        self._connected = True
+
+    def run(self, t_start: float, t_end: float, deliver_until: float | None = None, round_id: int | None = None,
+            stream=None) -> None:
+        """One run of the fused kernel over [t_start, t_end) in round
+        `round_id`: what the sources emitted in earlier rounds taken in,
+        every slot due by deliver_until (default t_end) delivered, update,
+        send, emission into the history. The scheduler's entry
+        (_execute_update_kernel) and the direct one."""
+        self._ensure_runtime()
+        self._runtime.run(t_start, t_end, deliver_until=deliver_until, round_id=round_id, stream=stream)
+
+    def check(self) -> None:
+        """Raise on what the last runs flagged (ring overflow, far-future arrivals, history overrun)."""
+        if self._runtime is not None:
+            self._runtime.check()
+
+    def emitted(self) -> list[tuple[float, int]]:
+        """The last run's spikes, [(e, node)] in flat-list order."""
+        return self._runtime.emitted()
+
+    def __setattr__(self, name, value):
+        # a dynamic attr assigned once the runtime exists: the runtime's state follows (same tensor)
+        runtime = self.__dict__.get("_runtime")
+        if runtime is not None and name in runtime.state:
+            value = torch.as_tensor(value).to(runtime.device)
+            runtime.state[name] = value
+        object.__setattr__(self, name, value)
 
     def __rshift__(self, right):
         from .connection import ConnectionBuilder

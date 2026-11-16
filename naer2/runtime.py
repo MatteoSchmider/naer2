@@ -9,8 +9,9 @@ signature -- one pointer per dynamic node attr, then the template's fixed
 arguments, then its constexprs (+ the kernel's own, FusedKernel.consts).
 
   state       one [n] tensor per dynamic attr (FusedKernel.attrs), starting
-              at the given values; a caller may replace a tensor between
-              runs (same dtype and size)
+              at the given values -- a given device tensor is used as is
+              (Population shares its attrs' tensors); a caller may replace a
+              tensor between runs (same dtype and size)
   connect()   sources (their runtimes) and the SimulationTopology of each
               connection: builds the ring, the watermarks and the plan;
               uniform_sources when every source's kernel emits uniformly
@@ -69,8 +70,12 @@ class PopulationRuntime:
         self.state = {}
         for a in kernel.attrs:
             v = (state or {}).get(a, 0.0)
-            self.state[a] = (v.to(device=self.device, dtype=torch.float32).clone() if isinstance(v, torch.Tensor)
-                             else torch.full((n,), float(v), device=self.device))
+            if isinstance(v, torch.Tensor):  # used as is (shared with its owner) once on the device, any dtype
+                if v.shape != (n,):
+                    raise ValueError(f"state '{a}' must have shape ({n},), not {tuple(v.shape)}")
+                self.state[a] = v if v.device == self.device else v.to(self.device)
+            else:
+                self.state[a] = torch.full((n,), float(v), device=self.device)
         # INTEGRATE CONFIG: depth from the scheduler (naer2/history.py)
         self.history = EmissionHistory(n, depth, self.device)
         self.run_id = 0

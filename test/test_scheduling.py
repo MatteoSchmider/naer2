@@ -20,8 +20,8 @@ covering every kind of population:
 Every population runs once at t = 0. Intake is the real host side
 (Population._intake: read each source once per run, schedule event-driven
 consumers from the source's emission summary). The update kernel is a
-stand-in (the real one is being redesigned): it records the run's window,
-leaves one spike stamped at the window's start in the emission buffer, and,
+stand-in: it records the run's window, leaves the run's emission summary
+as one spike stamped at the window's start, and,
 like the real one will, records a later per-link arrival it finds.
 """
 
@@ -29,7 +29,6 @@ import pytest
 import torch
 
 from naer2.population import Population
-from naer2.spike_gather import BlockedSpikes
 from test.nodes import counter, delay_probe
 from test.patterns import all_to_all
 
@@ -68,10 +67,7 @@ def stand_ins(monkeypatch):
     def kernel(self, device):  # reached only once the run check has passed
         start, end = self._window
         runs.append((start, self, end))
-        self._fresh = BlockedSpikes(
-            torch.zeros(1, dtype=torch.int32), torch.tensor([start]),
-            torch.ones(1, dtype=torch.int32), 1,
-        )
+        self._summary = (self._run_id, 1, start)  # the run's emission summary: one spike at its start
         for conn in self.incoming:
             for e in taken.get(conn, []):
                 later = [e + d for d in _delays(conn) if e + d > end + 1e-9]
@@ -137,10 +133,7 @@ def test_a_source_run_without_spikes_schedules_nothing(monkeypatch):
 
     def kernel(self, device):
         runs.append((round(self._window[0], 6), self))
-        self._fresh = BlockedSpikes(
-            torch.zeros(1, dtype=torch.int32), torch.zeros(1),
-            torch.zeros(1, dtype=torch.int32), 1,
-        )
+        self._summary = (self._run_id, 0, float("inf"))  # the run emitted nothing
         raise _Ran
 
     original_update = Population._execute_update_kernel
