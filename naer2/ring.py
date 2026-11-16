@@ -18,8 +18,10 @@ before its source's run window end); otherwise to the side runs.
 
 An arrival before the ring position (already delivered) goes into the first
 undelivered slot (late, the timestep quantization); one at or past ring
-position + N_SLOTS is far future (flag 1, not implemented yet); a full run
-sets flag 0; a uniform-emission run that would need a side run sets flag 2.
+position + N_SLOTS is far future (flag 1, not implemented yet); a full main
+run sets flag 0, a full side run flag 3 (its links are lost: the runtime
+doubles that capacity, grow()); a uniform-emission run that would need a
+side run sets flag 2.
 """
 
 import torch
@@ -34,9 +36,9 @@ import triton.language as tl
 # TODO: run capacities are fixed constants for now; a burst (e.g. PD14's
 # 902-spike thalamic volley) lands in every slot of its delay range at once.
 # They should become population-specific and adjust themselves on overflow.
-DEFAULT_MAIN_CAP = 2048
-DEFAULT_SIDE_CAP = 512
-_N_FLAGS = 3  # run overflow, far future, uniform contract violated
+DEFAULT_MAIN_CAP = 8192  # links per (group, slot): PD14 at G=256 needs ~350 quiet, up to ~9.3k in its thalamic volley
+DEFAULT_SIDE_CAP = 2048
+_N_FLAGS = 4  # main run full, far future, uniform contract violated, side run full
 
 
 @triton.jit
@@ -96,8 +98,13 @@ class Ring:
         self.n_groups, self.n_slots, self.slot_width = n_groups, n_slots, slot_width
         if main_cap % 4 or side_cap % 4:
             raise ValueError("run capacities must be multiples of 4 (entries are interleaved by cache line)")
+        self._allocate(main_cap, side_cap, device)
+        self.watermark.fill_(float("-inf"))
+        self.ring_pos = 0  # first slot not yet delivered
+
+    def _allocate(self, main_cap: int, side_cap: int, device) -> None:
         self.main_cap, self.side_cap = main_cap, side_cap
-        cells = n_groups * n_slots
+        cells = self.n_groups * self.n_slots
         m, s = cells * main_cap, cells * side_cap
         self.buf = torch.zeros(4 * m + 4 * s + 2 * cells + 1 + _N_FLAGS, device=device, dtype=torch.int32)
         self._records = (self.buf[:4 * m].view(m, 4), self.buf[4 * m:4 * m + 4 * s].view(s, 4))
@@ -105,9 +112,28 @@ class Ring:
         self.main_count = self.buf[o:o + cells]
         self.side_count = self.buf[o + cells:o + 2 * cells]
         self.watermark = self.buf[o + 2 * cells:o + 2 * cells + 1].view(torch.float32)
-        self.watermark.fill_(float("-inf"))
         self.flags = self.buf[o + 2 * cells + 1:]
-        self.ring_pos = 0  # first slot not yet delivered
+
+    def grow(self, main_cap: int | None = None, side_cap: int | None = None) -> None:
+        """Larger run capacities, keeping what the ring holds: a record's
+        place (_rec) doesn't depend on the capacity, so each run kind's
+        records copy over as one block; the counts are clamped to what was
+        written (an overflowing run's claims beyond its capacity were lost),
+        the watermark and flags carried along. buf is a new buffer: whoever
+        holds its address (a kernel launch's arguments) takes it again."""
+        old = (self.buf, self._records, self.main_count.clone(), self.side_count.clone(), self.watermark.clone(),
+               self.flags.clone(), self.main_cap, self.side_cap)
+        buf, (main_rec, side_rec), main_count, side_count, watermark, flags, old_main, old_side = old
+        main_cap, side_cap = main_cap or old_main, side_cap or old_side
+        if main_cap % 4 or side_cap % 4 or main_cap < old_main or side_cap < old_side:
+            raise ValueError("capacities only grow, in multiples of 4")
+        self._allocate(main_cap, side_cap, buf.device)
+        self._records[0][:len(main_rec)] = main_rec
+        self._records[1][:len(side_rec)] = side_rec
+        self.main_count.copy_(main_count.clamp(max=old_main))
+        self.side_count.copy_(side_count.clamp(max=old_side))
+        self.watermark.copy_(watermark)
+        self.flags.copy_(flags)
 
     def cell(self, group: int, slot: int) -> int:
         return group * self.n_slots + slot % self.n_slots
@@ -129,10 +155,11 @@ class Ring:
         return self._fields(self._records[1], self.side_cap)
 
     def check(self) -> None:
-        overflow, far, uniform = self.flags.tolist()
-        if overflow:
+        main_full, far, uniform, side_full = self.flags.tolist()
+        if main_full or side_full:
             raise RuntimeError(
-                f"a ring run exceeded its capacity (main {self.main_cap}, side {self.side_cap} entries)"
+                f"a ring run exceeded its capacity ({'main' if main_full else 'side'}: main {self.main_cap}, "
+                f"side {self.side_cap} entries)"
             )
         if far:
             raise NotImplementedError(

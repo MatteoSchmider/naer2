@@ -24,8 +24,10 @@ def _kernel(node_type):
 def commanded_runtime(n: int, uniform: bool = True, group_size: int = 32, depth: int = 3, device="cuda:0"):
     """A population of commanded (uniform: bare n2.spike(), emission at the
     window's start) or commanded_timed nodes (emission at a given time)."""
-    return PopulationRuntime(_kernel(commanded if uniform else commanded_timed), n, group_size=group_size,
-                             depth=depth, device=device)
+    rt = PopulationRuntime(_kernel(commanded if uniform else commanded_timed), n, group_size=group_size,
+                           depth=depth, device=device)
+    rt.count_received = True  # the tests check what each neuron received
+    return rt
 
 
 def command(rt, t_start, t_end, fire_time=None, emit_delay=None, **run):

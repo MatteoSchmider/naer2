@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 from .kernel import Kernel
 
 _EPS = 1e-10
+EVENT_DRIVEN_DEPTH = 8  # the history depth of a network with an event-driven consumer (see _plan_histories)
 
 
 class Network:
@@ -121,10 +122,16 @@ class Network:
         read yet -- the most runs it makes between two of that consumer's
         reads, + 2 (naer2/history.py). From the timesteps where both are
         known: 2 + ceil(consumer timestep / source timestep); else 3 (every
-        population running every round). One K for the whole network (a
+        population running every round) -- at least EVENT_DRIVEN_DEPTH with
+        an event-driven consumer anywhere (it reads whenever an arrival is
+        due: no cadence to derive from). One K for the whole network (a
         consumer's sources must share theirs); a population's own
-        history_depth overrides, an overrun still raises (check())."""
+        history_depth overrides, an overrun still raises (check()). TODO:
+        grow a history when a consumer falls behind (test_network_step's
+        gap test)."""
         depth = 3
+        if any(pop._event_driven and pop.incoming for pop in pops):
+            depth = EVENT_DRIVEN_DEPTH
         for pop in pops:
             for conn in pop.incoming:
                 src = conn._source

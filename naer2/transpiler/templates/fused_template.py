@@ -42,7 +42,7 @@ FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "k_
               "parity", "received_ptr", "n_received_ptr", "log_ptr", "log_cap", "history", "hist_cap", "run_id",
               "t_start", "t_end", "trace_ptr")
 CONSTEXPRS = ("GROUP_SIZE", "K", "SK", "KP", "UNIFORM_SOURCES", "N_SLOTS", "MAIN_CAP", "SIDE_CAP", "LOG", "STREAM",
-              "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "ITERS", "COUNT", "BATCH", "DIR", "NSP", "TRACE",
+              "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "COUNT", "BATCH", "NSP", "TRACE",
               "TRACE_CAP")
 DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "k_lo", "k_hi", "run_id", "round_id", "parity", "log_cap", "hist_cap")
 
@@ -256,8 +256,8 @@ def fused_kernel(
     mask = offs < n_neurons
 
     n_ev = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace,
-                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, ITERS, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH,
-                 DIR, NUM_WARPS, TRACE, TRACE_CAP)
+                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
+                 TRACE, TRACE_CAP)
 
     # the node attrs receive touches: the state through delivery
 {load_state}    state = {state_tuple}

@@ -21,6 +21,12 @@ arguments, then its constexprs (+ the kernel's own, FusedKernel.consts).
               runs of earlier rounds taken in, every slot due by
               deliver_until delivered, update, send, emission
 
+Ring capacity: a run kind (main, side) that overflows -- its claims beyond
+the capacity lose their links -- doubles before the next run. No host sync:
+every run copies its ring's flags into pinned host memory on its stream,
+the next run looks at that copy once it has landed (check() waits for it).
+The overflowing run's lost links are reported with a warning.
+
 The launch: the first run per configuration goes through the JIT (and
 compiles); later ones call the compiled kernel's launcher directly (~8 us
 against ~50 us for the JIT's dispatch with this signature,
@@ -30,13 +36,14 @@ selects the compiled variant and dropped when the buffers change.
 
 import contextlib
 import math
+import warnings
 
 import torch
 import triton
 from triton import knobs
 
 from .history import EmissionHistory
-from .ring import Ring
+from .ring import _N_FLAGS, Ring
 from .trace import Trace
 from .transpiler.templates.fused import FUSED_TRACE_TAGS, PULL, WALK, FusedPlan
 
@@ -79,16 +86,21 @@ class PopulationRuntime:
         # INTEGRATE CONFIG: depth from the scheduler (naer2/history.py)
         self.history = EmissionHistory(n, depth, self.device)
         self.run_id = 0
-        # INTEGRATE DEV: the template's receive counters (count_received), delivery log, trace
+        # INTEGRATE DEV: the template's receive counters (count_received: off by default, a little work per
+        # link), delivery log, trace
         self.received = torch.zeros(n, device=self.device)
         self.n_received = torch.zeros(n, device=self.device, dtype=torch.int32)
-        self.count_received = True
+        self.count_received = False
         self.stream_block, self.unroll = WALK["stream"], WALK["unroll"]
         self.waves_per_eu = 0
-        self.batch, self.use_directory = PULL["batch"], PULL["directory"]
+        self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
         self._launchers = {}
+        # the ring's flags after each run, copied to the host asynchronously (see the module docstring)
+        self._flags_host = torch.zeros(_N_FLAGS, dtype=torch.int32, pin_memory=self.device.type == "cuda")
+        self._flags_event = None
+        self.growths: list[tuple[int, str, int]] = []  # (run id, "main" / "side", new capacity)
         signature = kernel.kernel.params
         self._constexpr_names = [p.name for p in signature if p.is_constexpr]
         self.connect([], [], n_slots=1)
@@ -114,6 +126,7 @@ class PopulationRuntime:
         every ring slot that ends by `deliver_until` (default t_end), update,
         send, emit. stream: a torch.cuda.Stream to launch on (default: the
         current one)."""
+        self._grow_if_full(stream, wait=False)
         self.run_id += 1
         w = self.ring.slot_width
         k_lo = self.ring.ring_pos
@@ -125,7 +138,7 @@ class PopulationRuntime:
             self.history.buf, self.history.cap, self.run_id, t_start, t_end,
             self.trace.buf if self.trace is not None else self.log]
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
-        key = (num_warps, self.waves_per_eu, self.count_received, self.batch, self.use_directory, self.stream_block,
+        key = (num_warps, self.waves_per_eu, self.count_received, self.batch, self.stream_block,
                self.unroll, self.log_cap > 0)
         launch = self._launchers.get(key)
         aligned = all(not (t.data_ptr() & 15) for t in self.state.values())  # the specialization every call meets
@@ -140,6 +153,37 @@ class PopulationRuntime:
                 self._launchers[key] = _direct_launch(compiled, self.n_groups,
                                                       tuple(consts[c] for c in self._constexpr_names))
         self.ring.ring_pos = max(k_lo, k_hi + 1)
+        if self.device.type == "cuda":
+            with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+                self._flags_host.copy_(self.ring.flags, non_blocking=True)
+                self._flags_event = torch.cuda.Event()
+                self._flags_event.record()
+
+    def _grow_if_full(self, stream, wait: bool) -> None:
+        """The last run's flags (their host copy, once landed -- or waited
+        for): a full main or side run doubles that capacity (Ring.grow, on
+        the run's stream), its flag cleared, the launch cache dropped (the
+        capacities are constexprs)."""
+        if self._flags_event is None or not (wait or self._flags_event.query()):
+            return
+        self._flags_event.synchronize()
+        main_full, side_full = int(self._flags_host[0]), int(self._flags_host[3])
+        self._flags_event = None
+        if not (main_full or side_full):
+            return
+        ring = self.ring
+        main_cap = 2 * ring.main_cap if main_full else None
+        side_cap = 2 * ring.side_cap if side_full else None
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            ring.grow(main_cap=main_cap, side_cap=side_cap)
+            ring.flags[0] = 0
+            ring.flags[3] = 0
+        self._launchers = {}
+        for kind, cap in (("main", main_cap), ("side", side_cap)):
+            if cap:
+                self.growths.append((self.run_id, kind, cap))
+                warnings.warn(f"a {kind} ring run overflowed by run {self.run_id}: its links beyond the capacity "
+                              f"were lost; the capacity doubles to {cap} links", RuntimeWarning, stacklevel=3)
 
     def _constexprs(self, num_warps) -> dict:
         p2, lanes = triton.next_power_of_2, 32 * num_warps
@@ -148,14 +192,18 @@ class PopulationRuntime:
             UNIFORM_SOURCES=self.uniform_sources, N_SLOTS=self.ring.n_slots, MAIN_CAP=self.ring.main_cap,
             SIDE_CAP=self.ring.side_cap, LOG=self.log_cap > 0, STREAM=self.stream_block, U=self.unroll,
             SPT=max(self.group_size // lanes, 1), NUM_WARPS=num_warps, MAX_CONNS=p2(max(self.plan.n_conns, 1)),
-            LOG_CJ=(p2(max(self.plan.n_conns, 1)) * p2(self.plan.K)).bit_length() - 1, ITERS=self.plan.iters,
-            COUNT=self.count_received, BATCH=self.batch, DIR=self.use_directory, NSP=p2(self.ring.n_slots),
+            LOG_CJ=(p2(max(self.plan.n_conns, 1)) * p2(self.plan.K)).bit_length() - 1,
+            COUNT=self.count_received, BATCH=self.batch, NSP=p2(self.ring.n_slots),
             TRACE=self.trace.level if self.trace is not None else 0,
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 
     def check(self) -> None:
+        """Wait for the last run's flags (growing a full ring), then raise on
+        what remains flagged: far-future arrivals, the uniform contract,
+        history overrun."""
+        self._grow_if_full(None, wait=True)
         self.ring.check()
         if int(self.overrun[0]):
             raise RuntimeError("a consumer fell behind a source's emission history: a run was overwritten "

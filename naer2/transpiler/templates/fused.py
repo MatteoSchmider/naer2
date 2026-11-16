@@ -82,8 +82,8 @@ FUSED_TRACE_TAGS = ("start", "state", "pulled", "slot", "headers", "streamed", "
                     "runs", "spikes", "found", "appended",  # TRACE >= 2: inside the pull
                     "a:segments", "a:mean", "a:claimed", "a:targets", "a:stored")  # TRACE >= 3:
                     # inside the append, per tile
-PULL = dict(batch=True, directory=True)  # PopulationRuntime defaults (naer2/runtime.py); tools/fused_sweep.py: directory
-# and batching ~30% (PD14, G=256, 780M)
+PULL = dict(batch=True)  # PopulationRuntime default (naer2/runtime.py); tools/fused_sweep.py: batching ~30%
+# (PD14, G=256, 780M); the group directory always on (as fast again over binary search)
 # delivery walk: links staged in LDS per stream block, links per broadcast LDS read (tools/walk_sweep.py on
 # the split kernels, PD14, G=256, 780M: larger U costs more in registers than it saves; an explicit
 # occupancy target (waves_per_eu) gains <= 3% and spills beyond 12 waves)
@@ -154,35 +154,9 @@ class FusedPlan:
         )):
             plan[(10 + i) * n:(11 + i) * n] = torch.tensor(values, dtype=torch.int32)
         self.plan = plan.to(device)
-        self.iters = max(max_segs + [1]).bit_length()  # binary-search steps: ceil(log2(most segments + 1))
 
 
 # ------------------------------------------------- pull helpers
-
-
-@gluon.jit
-def _group_range(seg_gb, lo, hi, g, ITERS: gl.constexpr):
-    """Per spike, the sub-range of its segments [lo, hi) that go into group
-    g: first with group >= g, first with group > g -- two binary searches,
-    interleaved, ITERS dependent steps."""
-    a_lo = lo
-    a_hi = hi
-    b_lo = lo
-    b_hi = hi
-    for _ in gl.static_range(ITERS):
-        am = (a_lo + a_hi) // 2
-        bm = (b_lo + b_hi) // 2
-        av = a_lo < a_hi
-        bv = b_lo < b_hi
-        ga = (gl.load(seg_gb + am, mask=av, other=0) >> 16) & 0xFFFF
-        gb = (gl.load(seg_gb + bm, mask=bv, other=0) >> 16) & 0xFFFF
-        ra = av & (ga < g)
-        rb = bv & (gb <= g)
-        a_lo = gl.where(ra, am + 1, a_lo)
-        a_hi = gl.where(av & ~ra, am, a_hi)
-        b_lo = gl.where(rb, bm + 1, b_lo)
-        b_hi = gl.where(bv & ~rb, bm, b_hi)
-    return a_lo, b_lo
 
 
 @gluon.jit
@@ -194,7 +168,7 @@ def _side_insert(side_time, side_src, side_lo, side_n, side_count, flags, cell, 
     lanes = gl.arange(0, BLK, layout=LB)
     cnt = gl.load(side_count + cell)
     if cnt >= SIDE_CAP:
-        gl.atomic_max(flags, 1)
+        gl.atomic_max(flags + 3, 1)  # side run full (main: flag 0)
     else:
         p = cnt
         for s0 in range(0, cnt, BLK):
@@ -248,28 +222,22 @@ def _popcount(x):
 
 
 @gluon.jit
-def _segments_of(s, tv, g, seg_offsets, seg_gb, dir_offs, dir_first, dir_words, W, ITERS: gl.constexpr,
-                 DIR: gl.constexpr):
-    """Per spike (source s), its segments into group g as [a, b).
-    DIR: through the topology's group directory, three dependent steps
-    (bitmap word + directory offset -> the pair's first segment and the
-    next pair's -> the segments); a clear bit stops after the first.
-    Otherwise two interleaved binary searches over the source's segments."""
-    if DIR:
-        bit = g % 32
-        at = 2 * (s * W + g // 32)
-        wb = gl.load(dir_words + at, mask=tv, other=0)
-        pre = gl.load(dir_words + at + 1, mask=tv, other=0)
-        po = gl.load(dir_offs + s, mask=tv, other=0)
-        has = tv & (((wb >> bit) & 1) != 0)
-        pair = po + pre + _popcount(wb & ((1 << bit) - 1))
-        a = gl.load(dir_first + pair, mask=has, other=0)
-        b = gl.load(dir_first + pair + 1, mask=has, other=0)
-        return a, b
-    else:
-        lo = gl.load(seg_offsets + s, mask=tv, other=0)
-        hi = gl.load(seg_offsets + s + 1, mask=tv, other=0)
-        return _group_range(seg_gb, lo, hi, g, ITERS)
+def _segments_of(s, tv, g, dir_offs, dir_first, dir_words, W):
+    """Per spike (source s), its segments into group g as [a, b), through
+    the topology's group directory: three dependent steps (bitmap word +
+    directory offset -> the pair's first segment and the next pair's -> the
+    segments); a clear bit stops after the first. (Two interleaved binary
+    searches over the source's segments instead were ~30% slower, PD14.)"""
+    bit = g % 32
+    at = 2 * (s * W + g // 32)
+    wb = gl.load(dir_words + at, mask=tv, other=0)
+    pre = gl.load(dir_words + at + 1, mask=tv, other=0)
+    po = gl.load(dir_offs + s, mask=tv, other=0)
+    has = tv & (((wb >> bit) & 1) != 0)
+    pair = po + pre + _popcount(wb & ((1 << bit) - 1))
+    a = gl.load(dir_first + pair, mask=has, other=0)
+    b = gl.load(dir_first + pair + 1, mask=has, other=0)
+    return a, b
 
 
 @gluon.jit
@@ -558,9 +526,9 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
 
 @gluon.jit
 def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace, n_ev,
-          SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr, ITERS: gl.constexpr,
+          SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
           N_SLOTS: gl.constexpr, NSP: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr,
-          UNIFORM_SOURCES: gl.constexpr, BATCH: gl.constexpr, DIR: gl.constexpr, NUM_WARPS: gl.constexpr,
+          UNIFORM_SOURCES: gl.constexpr, BATCH: gl.constexpr, NUM_WARPS: gl.constexpr,
           TRACE: gl.constexpr, TRACE_CAP: gl.constexpr):
     """Phase 1 of program pid: what the sources emitted since this consumer
     last read them, into the program's group's ring; returns n_ev (tracing)."""
@@ -636,7 +604,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
         # spike looks its pair's values up directly (no barriers, no layout conversions per block)
         tb_j = gl.load(topo_addr + c_of, mask=vj, other=0).to(gl.pointer_type(gl.int32))
         nsrc_j = gl.load(t_src_p + c_of, mask=vj, other=0)
-        j_offs, j_start, j_gb, j_mean, _tg, _at = topology_ptrs(
+        _j_offs, j_start, j_gb, j_mean, _tg, _at = topology_ptrs(
             tb_j, nsrc_j, gl.load(t_seg_p + c_of, mask=vj, other=0), gl.load(t_bkt_p + c_of, mask=vj, other=0),
             gl.load(t_lnk_p + c_of, mask=vj, other=0))
         j_doffs, j_dfirst, j_dwords = directory_ptrs(
@@ -645,7 +613,6 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
         tab_node = _table(node_addr, SM)
         tab_time = _table(time_addr, SM)
         tab_wend = _table(wend, SM)
-        tab_offs = _table(j_offs.to(gl.int64), SM)
         tab_start = _table(j_start.to(gl.int64), SM)
         tab_gb = _table(j_gb.to(gl.int64), SM)
         tab_mean = _table(j_mean.to(gl.int64), SM)
@@ -714,11 +681,10 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
                     seg_gb = tab_gb.gather(cj_t, 0).to(gl.pointer_type(gl.int32))
                     bucket_mean = tab_mean.gather(cj_t, 0).to(gl.pointer_type(gl.float32))
                     ltp_t = tab_ltp.gather(cj_t, 0).to(gl.pointer_type(gl.int16))
-                    a, b = _segments_of(s, tv, pid, tab_offs.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
-                                        seg_gb, tab_doffs.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
+                    a, b = _segments_of(s, tv, pid, tab_doffs.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
                                         tab_dfirst.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
                                         tab_dwords.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
-                                        tab_W.gather(cj_t, 0), ITERS, DIR)
+                                        tab_W.gather(cj_t, 0))
                     if TRACE >= 2:
                         b = pin(b)
                         n_ev = mark(trace, n_ev, 12, gl.sum((b > a).to(gl.int32), axis=0), TRACE_CAP)
@@ -756,7 +722,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
             c = gl.sum(gl.where(sel, c_of, 0), axis=0)
             selc = ci == c
             nsrc_r = gl.sum(gl.where(selc, nsrc_c, 0), axis=0)
-            seg_offsets, seg_start, seg_gb, bucket_mean, _tg, _at = topology_ptrs(
+            _seg_offsets, seg_start, seg_gb, bucket_mean, _tg, _at = topology_ptrs(
                 gl.sum(gl.where(selc, tbuf_c, 0), axis=0).to(gl.pointer_type(gl.int32)), nsrc_r,
                 gl.sum(gl.where(selc, nseg_c, 0), axis=0), gl.sum(gl.where(selc, nbkt_c, 0), axis=0),
                 gl.sum(gl.where(selc, nlnk_c, 0), axis=0))
@@ -776,8 +742,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
                     tv = i < n_r
                     s = gl.load(node_p + i, mask=tv, other=0)
                     e = gl.load(time_p + i, mask=tv, other=0.0)
-                    a, b = _segments_of(s, tv, pid, seg_offsets, seg_gb, dir_offs, dir_first, dir_words, dwords_r,
-                                        ITERS, DIR)
+                    a, b = _segments_of(s, tv, pid, dir_offs, dir_first, dir_words, dwords_r)
                     main = tv & (e >= wmark) & (e < wend_r)
                     has = b > a
                     violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
@@ -793,8 +758,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
                 for i in range(0, n_r):
                     s = gl.load(node_p + i)
                     e = gl.load(time_p + i)
-                    a, b = _segments_of(s, True, pid, seg_offsets, seg_gb, dir_offs, dir_first, dir_words, dwords_r,
-                                    ITERS, DIR)
+                    a, b = _segments_of(s, True, pid, dir_offs, dir_first, dir_words, dwords_r)
                     srcw = (c << 24) | s
                     for sg in range(a, b):
                         gb = gl.load(seg_gb + sg)

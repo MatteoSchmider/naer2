@@ -139,6 +139,9 @@ class Population:
         # (Network._plan_histories), 3 without a network step
         self.history_depth: int | None = None
         self._derived_depth: int = 3
+        # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
+        # development aid -- off by default, a little work per delivered link
+        self.count_received: bool = False
 
         self.network: Network = Network(self)
 
@@ -517,6 +520,7 @@ class Population:
         send, emission into the history. The scheduler's entry
         (_execute_update_kernel) and the direct one."""
         self._ensure_runtime()
+        self._runtime.count_received = self.count_received
         self._runtime.run(t_start, t_end, deliver_until=deliver_until, round_id=round_id, stream=stream)
 
     def check(self) -> None:

@@ -56,7 +56,9 @@ def _state(pop):
 
 
 def _neuron_runtime(neuron, n, **state):
-    return PopulationRuntime(FusedKernelTemplate(neuron * n).build(), n, group_size=G, device=DEVICE, state=state)
+    rt = PopulationRuntime(FusedKernelTemplate(neuron * n).build(), n, group_size=G, device=DEVICE, state=state)
+    rt.count_received = True
+    return rt
 
 
 def _check_run(pop, ref, fires, t_start):

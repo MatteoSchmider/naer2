@@ -43,8 +43,10 @@ def _defaults(population):
 def _runtime(kernel, population, **state):
     """A runtime of `population`'s size running `kernel`, its state starting at the instance's values (or
     `state`)."""
-    return PopulationRuntime(kernel, len(population.shape), group_size=G, device=DEVICE,
-                             state={**_defaults(population), **state})
+    rt = PopulationRuntime(kernel, len(population.shape), group_size=G, device=DEVICE,
+                           state={**_defaults(population), **state})
+    rt.count_received = True
+    return rt
 
 
 def _same_spikes(a, b):

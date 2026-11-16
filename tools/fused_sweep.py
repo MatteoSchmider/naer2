@@ -1,5 +1,5 @@
-"""Pull-intake variants of the fused kernel (runs batched or not, directory
-or binary search) compared fairly: one process, one
+"""Pull-intake variants of the fused kernel (runs batched by emission time
+or one by one) compared fairly: one process, one
 PD14 network, the variants alternating round by round, the clock kept up by
 untraced rounds in between. Per variant, from the kernels' own stamps:
   alone   sum over populations of the fused kernel's span, each run alone
@@ -24,9 +24,8 @@ import torch
 
 from pd14_setup import PD14
 
-CONFIGS = [(True, True), (True, False)]  # (batch, directory)
-NAMES = {(True, True): "batch+dir", (True, False): "batch+search", (False, True): "per run+dir",
-         (False, False): "per run+search"}
+CONFIGS = [True, False]  # batch
+NAMES = {True: "batched", False: "per run"}
 HEAT = 5
 t0 = time.time()
 b = PD14(G, count_received=False)
@@ -49,7 +48,7 @@ def heat(n=HEAT):
 
 def configure(cfg):
     for p in b.pops.values():
-        p.batch, p.use_directory = cfg
+        p.batch = cfg
 
 
 def span(progs):

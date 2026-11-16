@@ -39,13 +39,10 @@ def _walk(monkeypatch, request):
     monkeypatch.setattr(runtime, "WALK", dict(stream=stream, unroll=unroll))
 
 
-@pytest.fixture(autouse=True, params=[(True, True), (True, False), (False, True), (False, False)],
-                ids=["batch-dir", "batch-search", "runs-dir", "runs-search"])
+@pytest.fixture(autouse=True, params=[True, False], ids=["batch", "runs"])
 def _pull(monkeypatch, request):
-    """Pull intake: fresh runs batched by emission time or one by one;
-    segments through the group directory or by binary search."""
-    batch, directory = request.param
-    monkeypatch.setattr(runtime, "PULL", dict(batch=batch, directory=directory))
+    """Pull intake: fresh runs batched by emission time or one by one."""
+    monkeypatch.setattr(runtime, "PULL", dict(batch=request.param))
 
 
 def Pop(n, depth=3, uniform=True):

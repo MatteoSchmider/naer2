@@ -1278,7 +1278,23 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    source timestep) where both are known, else 3, one K network-wide
    (`history_depth` overrides). A float32 minimum delay is read back to its
    7 digits (else 0.10000000149 split every PD14 round in two). PD14
-   through `Network.step`: PD14's rates, 0.50 ms per round wall; 5. sizing defaults; 6. the old path's code, tests
+   through `Network.step`: PD14's rates, 0.50 ms per round wall; 5. sizing
+   defaults -- done 2026-11-16 (decided together): ring main capacity
+   8192 links per (group, slot), side 2048, each DOUBLING after an overflow
+   (`Ring.grow` keeps every record; the runtime finds the overflow in an
+   asynchronous host copy of the ring's flags, no sync; the overflowing
+   run's lost links reported with a warning) -- PD14 through its thalamic
+   volley at the defaults: 5 populations grow once (to 16384) at ~733 ms,
+   2.86 GB of rings; n_slots left as is (longest delay + one window + 3;
+   revisit with a long-time-range event-driven network); history capacity
+   one spike per neuron and run; history depth at least 8 with an
+   event-driven consumer (`EVENT_DRIVEN_DEPTH`), growing it dynamically is a
+   gap test (`test_network_step::test_gap_history_grows_with_a_slow_consumer`);
+   group size 32 per population (`Population.group_size`; an automatic
+   search is a future feature); `Network.resolution` 0.1 (see adaptive
+   implicit scheduling below); the group directory always on (the binary
+   search pull removed); the receive counters off by default
+   (`Population.count_received`). 5. sizing defaults; 6. the old path's code, tests
    and the tools; 7. PD14 through Network.step against the harness.
 
    **Progress.** (2026-11-15) Pure moves done; template split done — the
@@ -1292,6 +1308,13 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    (`test/test_fused_generated_gpu.py`: same spikes, states bit-identical
    without deliveries and within the reference's own run-to-run spread with
    them; same VGPRs, LDS, barriers, loads).
+
+   **Adaptive implicit scheduling (future).** The network should not need
+   an explicit timestep size or timing resolution (`Network.resolution`,
+   `Connection.resolution`, a population's slot width): derive the
+   resolutions a network actually needs from its populations' and
+   connections' own timing (timesteps, delay distributions, event-driven
+   arrival times) and schedule from that, instead of a 0.1 ms default.
 
    **Gap tests** — `test/test_fused_generated_gpu.py::test_gap_*`, each
    failing until its gap is closed, for after the reintegration (the
@@ -1313,6 +1336,9 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
      arrival (e + bucket mean), receive's time is it (today: e)
    - `test_gap_edge_backward` — D-11: edge backward on every incoming link
      of a spiking target (a reverse topology; out of scope for now)
+   - `test/test_network_step.py::test_gap_history_grows_with_a_slow_consumer`
+     — an emission history that grows when a consumer falls behind (today:
+     overrun raises)
    Also for the runtime: the template's per-link attr load is unconditional
    (INTEGRATE HOST in `_stage_records`): a connection whose receive reads
    no attr still needs a valid attr block, or a constexpr skipping the load.

@@ -39,7 +39,7 @@ def pd14_neuron_kernel(
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
-    ITERS: gl.constexpr, COUNT: gl.constexpr, BATCH: gl.constexpr, DIR: gl.constexpr, NSP: gl.constexpr,
+    COUNT: gl.constexpr, BATCH: gl.constexpr, NSP: gl.constexpr,
     TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
     T_MEM: gl.constexpr, T_SYN: gl.constexpr, R_MEM: gl.constexpr, T_REF: gl.constexpr, V_THRESH: gl.constexpr,
     V_RESET: gl.constexpr, V_REST: gl.constexpr,
@@ -58,8 +58,8 @@ def pd14_neuron_kernel(
     mask = offs < n_neurons
 
     n_ev = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace,
-                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, ITERS, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH,
-                 DIR, NUM_WARPS, TRACE, TRACE_CAP)
+                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
+                 TRACE, TRACE_CAP)
 
     # receive touches current: the state through delivery
     state = (gl.load(current_ptr + offs, mask=mask),)
@@ -107,7 +107,7 @@ def pd14_poisson_kernel(
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
-    ITERS: gl.constexpr, COUNT: gl.constexpr, BATCH: gl.constexpr, DIR: gl.constexpr, NSP: gl.constexpr,
+    COUNT: gl.constexpr, BATCH: gl.constexpr, NSP: gl.constexpr,
     TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
     P_RATE: gl.constexpr, P_START: gl.constexpr, P_STOP: gl.constexpr,
 ):
@@ -125,8 +125,8 @@ def pd14_poisson_kernel(
     mask = offs < n_neurons
 
     n_ev = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace,
-                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, ITERS, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH,
-                 DIR, NUM_WARPS, TRACE, TRACE_CAP)
+                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
+                 TRACE, TRACE_CAP)
     state = ()  # no receive
     if TRACE:
         n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)

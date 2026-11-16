@@ -28,6 +28,7 @@ def _net(delay, n_src=40, n_dst=60, seed=0):
     torch.manual_seed(seed)
     A, B = commanded() * n_src, commanded() * n_dst
     A.timestep = 1.0
+    B.count_received = True
     conn = A >> PD14_connection(0.3) >> B
     conn.weight = torch.rand(conn.shape)
     conn.delay = delay(conn) if callable(delay) else delay
@@ -114,3 +115,33 @@ def test_every_run_of_a_round_carries_its_id():
     ids = [r for _, r, _ in rounds]
     assert ids and all(r == current for _, r, current in rounds)  # the round's id, at launch
     assert ids[0] == 1 and ids == sorted(ids) and len(set(ids)) > 1
+
+
+# ------------------------------------------------------------ gaps (fail until closed)
+
+
+def test_gap_history_grows_with_a_slow_consumer():
+    """TODO.md 1e (sizing): an event-driven consumer reads its source only
+    when an arrival is due -- here every 3 ms, while the source runs (and
+    spikes) every 0.1 ms, ~30 runs between reads. A history that grows when
+    a consumer falls behind keeps them all; today the derived depth (8 with
+    an event-driven consumer) overruns and check() raises."""
+    from test.nodes import clock_source
+
+    torch.manual_seed(0)
+    A, B = clock_source() * 20, commanded() * 30
+    A.timestep = 0.1
+    B.count_received = True
+    conn = A >> PD14_connection(0.3) >> B
+    conn.weight = torch.rand(conn.shape)
+    conn.delay = 3.0
+    A.network.step(6.0)
+    A.check()
+    B.check()  # raises today: "fell behind a source's emission history"
+    # every run of A spiked on every neuron (e = its window's start, 0.1 k); B has delivered every slot below its
+    # ring position: all links of the runs arriving there
+    ring = B.runtime.ring
+    arrivals = (torch.arange(A.runtime.run_id, dtype=torch.float32) * 0.1 + 3.0) / ring.slot_width
+    runs_arrived = int((arrivals.floor() < ring.ring_pos).sum())
+    assert runs_arrived > 10
+    assert int(B.runtime.n_received.sum()) == runs_arrived * len(conn.fabric.topology)

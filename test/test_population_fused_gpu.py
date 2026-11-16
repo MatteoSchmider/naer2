@@ -28,7 +28,7 @@ def _pair(n_src=300, n_dst=500, seed=0):
     conn.weight = torch.rand(conn.shape)
     conn.delay = 0.2
     dst.delay_resolution = 0.1
-    dst.main_cap = 8192
+    dst.count_received = True
     return src, dst, conn
 
 
@@ -91,3 +91,30 @@ def test_a_population_without_connections():
     T.check()
     assert total > 902  # all at the start, then ~0.12 per ms
     assert torch.all(T.next_spike >= 1.0) and T.next_spike is T.runtime.state["next_spike"]
+
+
+def test_a_full_ring_run_doubles_its_capacity():
+    """Main capacity 64 per (group, slot): the first burst overflows it --
+    a warning, its excess links lost, the capacity doubled before the next
+    run (no host sync: the flags' host copy) -- and a later, smaller burst
+    is delivered exactly."""
+    src, dst, conn = _pair()
+    dst.main_cap = 64
+    big = torch.rand(300, generator=torch.Generator().manual_seed(2)) < 0.3
+    small = torch.rand(300, generator=torch.Generator().manual_seed(3)) < 0.02
+    with pytest.warns(RuntimeWarning, match="main ring run overflowed"):
+        for r in range(8):
+            t = round(1.0 + 0.1 * r, 6)
+            src.fire_now = (big if r == 0 else small if r == 4 else torch.zeros(300, dtype=torch.bool)).float()
+            src.run(t, t + 0.1, round_id=r)
+            dst.run(t, t + 0.1, round_id=r)
+            if r == 5:  # the big burst delivered (round 2), the small one not yet (round 6)
+                torch.cuda.synchronize()
+                before = dst.runtime.n_received.cpu().long().clone()
+    dst.check()  # nothing left flagged
+    assert dst.runtime.ring.main_cap == 128 and dst.runtime.growths[0][1:] == ("main", 128)
+    count_big, _ = _expected(conn, big, 500)
+    assert int(before.sum()) < int(count_big.sum())  # the overflowing run lost links
+    count_small, _ = _expected(conn, small, 500)
+    assert int(count_small.sum()) > 0
+    assert torch.equal(dst.runtime.n_received.cpu().long() - before, count_small)
