@@ -1,10 +1,11 @@
 """
 The fused kernel's template: one launch per population and run -- intake,
 delivery, update, send and emission in one Gluon kernel, one program per
-group. This module is the FIXED part, written by hand and optimized (TODO.md,
-the optimization limits); the hooks come in from outside: a kernel entry (generated from a
-population's hooks, naer2/transpiler/templates/fused_template.py, or
-written by hand -- test/fused_reference.py, the reference) calls
+group. This module is the FIXED part, written by hand and optimized (what
+limits optimizing it further: limitations.md, next to this file); the hooks
+come in from outside: a kernel entry (generated from a population's hooks,
+naer2/transpiler/templates/fused_template.py, or written by hand --
+test/fused_reference.py, the reference) calls
 
   _pull(...)                  phase 1, no user code at all
   _deliver(state, RECEIVE)    phase 2, RECEIVE(state, hit, time, w, srcword)
@@ -24,7 +25,7 @@ Per program (group g):
      since this consumer last read it (naer2/history.py: slots
      tagged with an earlier round, run id past the last-read id); per spike
      g's segments among the source's (sorted by (group, bucket)) through
-     the topology's group directory (or two interleaved binary searches),
+     the topology's group directory,
      every link of them one 16-byte record (e, source word, link index,
      target) in its slot's run of g's ring (naer2/ring.py). Uniform
      sources: all fresh runs of one emission time as one stream of spike
@@ -50,21 +51,9 @@ go to its first undelivered slot (late), at or past N_SLOTS ahead are far
 future (flag 1), full runs flag 0, uniform violations flag 2, a consumer
 falling behind its sources' history raises the overrun flag.
 
-Integration into the library (TODO.md): `# INTEGRATE <KIND>: <rule>`
-comments mark every point where the template meets the library's hooks
-and scheduler --
-  HOOK(<callback>)        where a transpiled hook (update, receive, send,
-                          edge forward / backward) goes, and what it sees
-  NODE / EDGE / SOURCE(<callbacks>)
-                          a node, per-link or source attribute: which
-                          callbacks it comes from decides where it is
-                          loaded, held and stored
-  HOST                    what the scheduler / Population provides
-  CONFIG                  per-population constants and capacities
-  DEV                     what only tests and tools use (compiled out)
-  LIMITATION / GAP        a known limitation to keep documented when
-                          porting / a missing piece that is solvable later
-  D-n                     decision n in TODO.md
+`# GAP (...)` / `# LIMITATION (...)` comments mark open work and known
+limitations, D-n the decisions in TODO.md; what limits further
+optimization here: limitations.md, next to this file.
 """
 
 import torch
@@ -110,12 +99,12 @@ def _fused_plan(plan, n_conns):
     )
 
 
-# INTEGRATE HOST: built by Population from its incoming Connections: per connection its source Population's
+# Built by Population from its incoming Connections: per connection its source Population's
 #   EmissionHistory and its Fabric's SimulationTopology (Fabric.topology + delay at the consumer's slot
 #   resolution, the finest among its incoming connections, D-12). Connections numbered grouped by receive
-#   VARIANT (D-6): the connection id in every record's source word then selects the variant by compile-time
+#   VARIANT (GAP, D-6): the connection id in every record's source word then selects the variant by compile-time
 #   comparisons
-# INTEGRATE EDGE(receive, forward): attr_addr points at each connection's per-link attribute BLOCK -- every edge
+# GAP (D-7): attr_addr points at each connection's per-link attribute BLOCK -- every edge
 #   tensor attr its receive (edge.x) or forward (self.x) references, contiguous per link (link l's attrs at
 #   block + l * n_attrs; SimulationTopology's [n_attrs, n_links] becomes [n_links, n_attrs]), D-7
 class FusedPlan:
@@ -367,18 +356,18 @@ def _deliver_link(state, t, w, srcword, e, received, n_received, lane, mask, k, 
     against t and the target lane runs the receive. A multapse's weights
     arrive one link at a time, in link order."""
     hit = (lane == t) & mask
-    # INTEGRATE HOOK(receive): RECEIVE(state, hit, time, w, srcword) -> state is the transpiled receive, rooted at
+    # RECEIVE(state, hit, time, w, srcword) -> state is the transpiled receive, rooted at
     #   `hit` (MaskAliasTransformer's is_target: the one target lane); state: the node attrs it touches, as a
     #   tuple; edge.x -> the link's staged value of x (here w); time = the link's arrival, e + its bucket's mean
     #   delay (D-1); the code chosen by the link's receive variant, a scalar (warp-uniform) branch on its
     #   connection id (D-6)
-    # INTEGRATE HOOK(send): send runs here too, after every delivery, rooted at `hit` (D-2) -- and once more after
-    #   update; only for connections whose receive writes a node attr send reads (Population.compile's
-    #   send_after_delivery: PD14_neuron has none). Its n2.spike() (and receive's) can fire any number of times
+    # send runs here too, after every delivery, rooted at `hit` (D-2) -- and once more after
+    #   update; only for connections whose receive writes a node attr send reads (fused_template's
+    #   per-delivery send: PD14_neuron has none). GAP (D-3): its n2.spike() (and receive's) can fire any number of times
     #   per neuron and run (D-3): each spike appended to the program's emission buffer, its time the expression's
-    # INTEGRATE GAP: source.x is unsupported for now (D-10)
+    # GAP (D-10): source.x is unsupported for now
     state = RECEIVE(state, hit, e, w, srcword)
-    if COUNT:  # INTEGRATE DEV: the stand-in's bookkeeping (tests)
+    if COUNT:  # dev: the stand-in's bookkeeping (tests)
         received = gl.where(hit, received + w, received)
         n_received = n_received + hit.to(gl.int32)
     if LOG:
@@ -408,9 +397,9 @@ def _walk(r_tgt, r_w, r_src, r_e, nq, state, received, n_received, lane, mask, u
           LU: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, STAGE_E: gl.constexpr):
     """The staged stream block's nq links, U per broadcast LDS read,
     received one by one by their target lanes."""
-    # INTEGRATE EDGE(receive): one broadcast LDS read and one register select per staged attr slot (here: w);
+    # GAP (D-7): one broadcast LDS read and one register select per staged attr slot (here: w);
     #   up to the most attrs any variant's receive reads (D-7)
-    # INTEGRATE HOOK(receive): per link, its variant from srcword >> 24 (D-6) and its arrival time (D-1) are
+    # GAP (D-6, D-1): per link, its variant from srcword >> 24 (D-6) and its arrival time (D-1) are
     #   selected alongside -- a variant is the same for all links of one source spike through one connection,
     #   but links of different spikes and connections interleave here, so the choice is made per link
     for g in range(0, (nq + U - 1) // U):
@@ -459,24 +448,24 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, S
     l = gl.convert_layout(l, LRQ)
     srcw = gl.convert_layout(srcw, LRQ)
     t = gl.convert_layout(t, LRQ)
-    # INTEGRATE EDGE(receive, forward): the link's attribute block, loaded here by link index l through the
+    # GAP (D-7): the link's attribute block, loaded here by link index l through the
     #   connection's block pointer (D-7): its variant's attrs into the stage's attr slots; here: the weight
-    # INTEGRATE HOST: the load is unconditional -- a connection whose receive reads no per-link attr still needs a
+    # The load is unconditional -- a connection whose receive reads no per-link attr still needs a
     #   valid attr block (or a constexpr that skips the load), else this reads past its topology
     atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
     w = gl.load(atp + l, mask=qv, other=0.0)
-    # INTEGRATE HOOK(forward): the transpiled edge forward goes here, on link lanes (one record per lane, rooted
+    # GAP (forward): the transpiled edge forward goes here, on link lanes (one record per lane, rooted
     #   at qv -- the old template's lane_mask="_lk_valid"), its assigned attrs stored back at l before staging,
     #   so receive sees the updated values as in the no-delay template. The variant differs per LANE here
     #   (unlike in the walk): each variant present in the block runs masked to its lanes (D-6); time = the
     #   link's arrival (D-1)
-    # INTEGRATE LIMITATION (D-8): keep this as a comment when porting -- one link twice in one stream block (its
+    # LIMITATION (D-8): one link twice in one stream block (its
     #   source spiking in two runs taken in together) is read by both lanes before either stores: the later
     #   lane works on a stale value, and the last store wins, overwriting the changes of every forward call on
     #   that link in the block but the last
-    # INTEGRATE GAP (D-9): forward's destination.x (the target neuron's state) isn't wired up -- the target is
+    # GAP (D-9): forward's destination.x (the target neuron's state) isn't wired up -- the target is
     #   known here (t) and its state is in scope in the walk; connecting the two is left for later
-    # INTEGRATE GAP (D-10): source.x unsupported for now
+    # GAP (D-10): source.x unsupported for now
     s_tgt.store(gl.where(qv, t, -1))
     s_w.store(w)
     if LOG:
@@ -494,7 +483,7 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
     """A slot with side entries: its main and side runs of link records
     merged by emission time with two cursors (main first on ties), each
     link received in order."""
-    # INTEGRATE HOOK(forward), HOOK(receive), HOOK(send), EDGE: as in _stage_records and _walk, one link at a
+    # GAP (forward, D-1): as in _stage_records and _walk, one link at a
     #   time (forward strictly sequential here: no D-8 limitation); the main/side merge by the records' time
     #   word -- the arrival once the record carries it (D-1)
     im = gl.to_tensor(0)
@@ -550,7 +539,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
      _watermark, flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
     n_cells = n_groups * N_SLOTS
 
-    # INTEGRATE: no user code in the pull -- it only moves (e, source, link, target) records into the ring;
+    # No user code in the pull -- it only moves (e, source, link, target) records into the ring;
     #   every hook runs at delivery, in delivery order (strict per-link order)
     ci = gl.arange(0, MAX_CONNS, layout=LV)
     cv = ci < n_conns
@@ -673,7 +662,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_widt
                         s = pin(s)
                         e = pin(e)
                         n_ev = mark(trace, n_ev, 11, gl.sum(tv.to(gl.int32), axis=0), TRACE_CAP)
-                    # INTEGRATE GAP (D-10): source.x unsupported for now; taken at emission, it would be read off
+                    # GAP (D-10): source.x unsupported for now; taken at emission, it would be read off
                     #   the history here, next to the spike's node and e, and travel with its records
                     wend_t = tab_wend.gather(cj_t, 0)
                     c_t = cj_t // KP
@@ -828,7 +817,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     (main_time, main_src, main_lo, main_n, main_count, side_time, side_src, side_lo, side_n, side_count,
      _watermark, _flags) = _ring(ring, n_groups, N_SLOTS, MAIN_CAP, SIDE_CAP)
     n_cells = n_groups * N_SLOTS
-    if COUNT:  # INTEGRATE DEV
+    if COUNT:  # dev
         received = gl.load(received_ptr + offs, mask=mask, other=0.0)
         n_received = gl.load(n_received_ptr + offs, mask=mask, other=0)
     else:
@@ -837,7 +826,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     log_e = (log_ptr + 4 * log_cap + 1).to(gl.pointer_type(gl.float32))
     # the stream block's fields, staged flat (the walk reads them as [STREAM // U, U]), and the
     # connections' attribute pointers (weights by link index), a read-only table
-    # INTEGRATE EDGE(receive): one block pointer per connection; one LDS stage buffer per attr slot -- the most
+    # GAP (D-7): one block pointer per connection; one LDS stage buffer per attr slot -- the most
     #   attrs any variant's receive reads (here: the weight), D-7
     cq = gl.arange(0, MAX_CONNS, layout=LV)
     s_atp = gl.allocate_shared_memory(gl.int64, [MAX_CONNS], SM)
@@ -857,10 +846,10 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     r_src = s_src.reinterpret(gl.int32, [STREAM // U, U], SM)
     r_e = s_e.reinterpret(gl.float32, [STREAM // U, U], SM)
     gl.barrier()
-    # INTEGRATE HOOK(receive): every delivery's time is its link's arrival, e + its bucket's mean delay (D-1): the
+    # GAP (D-1): every delivery's time is its link's arrival, e + its bucket's mean delay (D-1): the
     #   pull knows the mean when it appends, so the record's time word carries the arrival (the main/side
     #   decision on e is made by then)
-    # INTEGRATE LIMITATION (D-1): a slot's records are in emission order, not arrival order -- links of different
+    # LIMITATION (D-1): a slot's records are in emission order, not arrival order -- links of different
     #   buckets in one slot can reach a target out of arrival order by less than one slot width (a receive-side
     #   integrator sees time step back)
     for k in range(k_lo, k_hi + 1):
@@ -891,7 +880,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                 RECEIVE, GROUP_SIZE, LOG, COUNT)
         gl.store(main_count + cell, 0)
         gl.store(side_count + cell, 0)
-    if COUNT:  # INTEGRATE DEV
+    if COUNT:  # dev
         gl.store(received_ptr + offs, received, mask=mask)
         gl.store(n_received_ptr + offs, n_received, mask=mask)
     if TRACE:
@@ -914,7 +903,7 @@ def _emit_spikes(fires, e, offs, history, hist_cap, run_id, K: gl.constexpr, SPT
     _n_fire = fires.to(gl.int32)
     _local_pos = gl.convert_layout(gl.cumsum(gl.convert_layout(_n_fire, LS), axis=0), fires.type.layout) - _n_fire
     n_emit = gl.sum(_n_fire, axis=0)
-    # INTEGRATE CONFIG: the history's cap is no longer one spike per neuron (D-3); a run's spikes beyond it raise
+    # GAP (D-3): the history's cap is no longer one spike per neuron (D-3); a run's spikes beyond it raise
     #   the overflow flag
     slot = run_id % K
     (h_tag, h_count, h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, slot, K, hist_cap)
@@ -935,7 +924,7 @@ def _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K:
     run's slot. Returns n_ev (tracing)."""
     if TRACE:
         n_ev = mark(trace, n_ev, 8, 0, TRACE_CAP)
-    # INTEGRATE HOOK(backward): out of scope -- needs this run's spikes at every incoming link of each firing
+    # GAP (D-11): edge backward out of scope -- needs this run's spikes at every incoming link of each firing
     #   target (a reverse topology), D-11
     if pid == 0:
         (h_tag, _hc, h_wend, _hm, _hn, _ht, _ho) = history_ptrs(history, run_id % K, K, hist_cap)

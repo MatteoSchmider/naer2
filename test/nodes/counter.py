@@ -5,7 +5,7 @@ import naer2 as n2
 class counter:
     """
     A deliberately trivial node for exercising a compiled kernel on real GPU
-    hardware (see TODO.md's staged GPU verification). Every quantity is a
+    hardware. Every quantity is a
     small integer, so the spike count/timing produced from a given starting
     potential can be worked out by hand instead of reasoned about numerically
     -- unlike test/networks/coverage's relay, which exists to exercise AST

@@ -1,9 +1,7 @@
 """
 Unit tests for naer2.transpiler.transformers.math_lowering_transformer.
 
-Pure AST rewriting — no network, no Triton compile. Real-compile coverage of
-the whitelist (does tl.extra.libdevice actually have each name, on both
-backends) is a separate, later-stage system-test concern; see TODO.md.
+Pure AST rewriting — no network, no Triton compile.
 """
 
 import ast

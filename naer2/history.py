@@ -26,11 +26,11 @@ round). A consumer that falls further behind sees a gap in the run ids it
 finds and raises its overrun flag.
 """
 
-# INTEGRATE CONFIG: depth K -- the most runs a source makes between two reads of its slowest consumer + 2 --
-#   comes from the scheduler, which knows the populations' run cadences; cap is no longer one spike per neuron
-#   and run: a neuron can fire any number of times per run (in receive, after every delivery, at several send
+# Depth K -- the most runs a source makes between two reads of its slowest consumer + 2 --
+#   comes from the scheduler, which knows the populations' run cadences.
+# GAP (D-3): cap is no longer one spike per neuron and run: a neuron can fire any number of times per run (in receive, after every delivery, at several send
 #   sites -- D-3), so cap is sized per population, a run beyond it raising the overflow flag
-# INTEGRATE HOST: what an event-driven consumer's scheduling needs of a source run (spike count, earliest e)
+# What an event-driven consumer's scheduling needs of a source run (spike count, earliest e)
 #   is the slot header, read on the host -- a sync per run, kept for now (D-13)
 import math
 

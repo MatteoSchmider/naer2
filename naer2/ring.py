@@ -28,14 +28,14 @@ import torch
 import triton
 import triton.language as tl
 
-# INTEGRATE CONFIG: one ring per consumer population; n_slots covers its longest incoming delay (+ emission
+# One ring per consumer population; n_slots covers its longest incoming delay (+ emission
 #   delay) at one slot width -- the finest resolution any of its incoming connections requires (D-12; the
 #   coarser connections could be optimized later); capacities per population, below
-# INTEGRATE HOOK(receive): a record's time word carries the link's arrival, e + its bucket's mean delay, once
-#   the pull writes it (D-1)
-# TODO: run capacities are fixed constants for now; a burst (e.g. PD14's
-# 902-spike thalamic volley) lands in every slot of its delay range at once.
-# They should become population-specific and adjust themselves on overflow.
+# GAP (D-1): a record's time word carries the link's arrival, e + its bucket's mean delay, once
+#   the pull writes it
+# Run capacities: these defaults, per population (Population.main_cap / side_cap), each doubling after an
+# overflow (PopulationRuntime._grow_if_full; a burst like PD14's 902-spike thalamic volley lands in every slot of
+# its delay range at once).
 DEFAULT_MAIN_CAP = 8192  # links per (group, slot): PD14 at G=256 needs ~350 quiet, up to ~9.3k in its thalamic volley
 DEFAULT_SIDE_CAP = 2048
 _N_FLAGS = 4  # main run full, far future, uniform contract violated, side run full

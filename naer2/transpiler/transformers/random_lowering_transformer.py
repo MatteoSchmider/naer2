@@ -42,12 +42,12 @@ class RandomLoweringTransformer(StmtTransformer):
         DIFFERENT random.random() calls in the same hook from returning the
         same value.
 
-    KNOWN LIMITATION, accepted for now — see TODO.md: seed is derived only
-    from t (plus the call-site salt), with no population identity folded in,
-    so two different populations' kernels draw IDENTICAL numbers for the
-    same lane index at the same t — randomness only differs within one
-    population's own kernel, not network-wide. TODO.md tracks the fix (each
-    population owning its own public seed).
+    GAP (TODO.md, test_gap_populations_draw_their_own_random_numbers): seed
+    is derived only from t (plus the call-site salt), with no population
+    identity folded in, so two different populations' kernels draw
+    IDENTICAL numbers for the same lane index at the same t — randomness
+    only differs within one population's own kernel, not network-wide. The
+    fix: each population owning its own public seed.
 
     ALSO NOT HANDLED: `offs` is GROUP_SIZE-shaped (one lane per neuron);
     nothing here checks which lane space the surrounding code actually runs

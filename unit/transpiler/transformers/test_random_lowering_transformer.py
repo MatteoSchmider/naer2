@@ -1,11 +1,7 @@
 """
 Unit tests for naer2.transpiler.transformers.random_lowering_transformer.
 
-Pure AST rewriting — no network, no Triton compile. Real-compile/real-GPU
-coverage of tl.rand/tl.randn actually behaving as expected (deterministic
-given the same (seed, offset), varying across lanes and across t) is a
-separate concern, already checked directly against Triton on real hardware
-before this transformer was written — see TODO.md.
+Pure AST rewriting — no network, no Triton compile.
 """
 
 import ast

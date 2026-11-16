@@ -83,10 +83,10 @@ class PopulationRuntime:
                 self.state[a] = v if v.device == self.device else v.to(self.device)
             else:
                 self.state[a] = torch.full((n,), float(v), device=self.device)
-        # INTEGRATE CONFIG: depth from the scheduler (naer2/history.py)
+        # depth from the scheduler (naer2/history.py)
         self.history = EmissionHistory(n, depth, self.device)
         self.run_id = 0
-        # INTEGRATE DEV: the template's receive counters (count_received: off by default, a little work per
+        # dev aids: the template's receive counters (count_received: off by default, a little work per
         # link), delivery log, trace
         self.received = torch.zeros(n, device=self.device)
         self.n_received = torch.zeros(n, device=self.device, dtype=torch.int32)

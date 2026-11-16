@@ -243,7 +243,7 @@ def delay_buckets(
 #   and the edge attrs the consumer's kernel reads as `attrs`) at the consumer's group size and slot
 #   resolution (D-12) -- the device copy of a per-link attr lives here, in simulation order, `perm` giving
 #   canonical order for user access
-# INTEGRATE EDGE(receive, forward): attrs become one block per link -- link l's attrs contiguous,
+# GAP (D-7): attrs become one block per link -- link l's attrs contiguous,
 #   [n_links, n_attrs] instead of [n_attrs, n_links] -- so one pointer per connection reaches them all (D-7)
 
 
