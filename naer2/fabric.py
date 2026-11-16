@@ -4,7 +4,7 @@ from .edges import edge_types
 
 _INTERNAL = frozenset({
     'instance', 'edge', 'dynamic_attrs', 'static_attrs', 'topology', 'state',
-    'perm', 'device_state', 'sim', '_sim_key',
+    'sim', '_sim_key',
 })
 PLACEHOLDER = "_no_attr"  # the per-link attr a connection gets when its receive reads none (see simulation())
 
@@ -23,13 +23,6 @@ class Fabric:
     and are routed to fabric.state by __setattr__/__getattr__.  The reserved names
     (topology, state, instance, edge, …) behave as normal attributes.
 
-    Once the target population first launches, every per-link tensor its
-    kernel references moves to the GPU for good (bind_device): it lives in
-    device_state, in the kernel's blocked link order, and is the only live
-    copy -- the kernel reads it and writes plastic updates back into it.
-    Reading fabric.<attr> after that returns it in canonical order (a GPU
-    gather, for analysis between steps); assigning re-initializes it.
-
     Topology is set by ConnectionBuilder.target() after Topology.build() completes.
     Per-link tensors are populated by the user (or a future initializer) afterwards.
 
@@ -42,12 +35,10 @@ class Fabric:
     nothing loads such a tensor unless some hook actually references
     edge.<name>, exactly as for a real edge class's unused attrs.
 
-    On the fused kernel's path the connection's SimulationTopology (built
-    once by simulation(), for its consumer) holds the per-link attrs the
-    consumer's kernel reads: from then on they live there only, on the
-    device in simulation order, and fabric.<attr> reads / assigns them in
-    canonical order through its perm. (bind_device / device_state are the
-    old templates' path, until they go.)
+    The connection's SimulationTopology (built once by simulation(), for
+    its consumer) holds the per-link attrs the consumer's kernel reads: from
+    then on they live there only, on the device in simulation order, and
+    fabric.<attr> reads / assigns them in canonical order through its perm.
     """
 
     def __init__(self, instance=None):
@@ -62,8 +53,6 @@ class Fabric:
         )
         object.__setattr__(self, 'topology', None)
         object.__setattr__(self, 'state', {})
-        object.__setattr__(self, 'perm', None)
-        object.__setattr__(self, 'device_state', {})
         object.__setattr__(self, 'sim', None)
         object.__setattr__(self, '_sim_key', None)
 
@@ -99,7 +88,7 @@ class Fabric:
         "inline as a literal constant"; this property is the actual answer.
         """
         sim_attrs = set(self.sim.attrs) - {PLACEHOLDER} if self.sim is not None else set()
-        return set(self.dynamic_attrs) | (set(self.state) - {"delay"}) | set(self.device_state) | sim_attrs
+        return set(self.dynamic_attrs) | (set(self.state) - {"delay"}) | sim_attrs
 
     @property
     def constant_attrs(self) -> dict[str, object]:
@@ -153,24 +142,6 @@ class Fabric:
         object.__setattr__(self, '_sim_key', key)
         return sim
 
-    # ------------------------------------------------------------------ device residency
-
-    def bind_device(self, perm: torch.Tensor, attrs, device) -> None:
-        """Move `attrs` onto `device` in blocked order `perm` (canonical
-        link index of each blocked position), once. An attr with no tensor
-        set (e.g. a plastic edge's weight left at its scalar default) is
-        broadcast from the edge instance's own value."""
-        perm = perm.to(device=device, dtype=torch.int64)
-        object.__setattr__(self, 'perm', perm)
-        for attr in attrs:
-            if attr in self.device_state:
-                continue
-            if attr in self.state:
-                canonical = torch.as_tensor(self.state.pop(attr))
-            else:
-                canonical = torch.full((len(perm),), float(getattr(self.instance, attr)))
-            self.device_state[attr] = canonical.to(device=device, dtype=torch.float32)[perm]
-
     # ------------------------------------------------------------------ state routing
 
     def __setattr__(self, name, value):
@@ -183,26 +154,17 @@ class Fabric:
             self.sim.write(name, value)
         elif name == "delay" and self.sim is not None:
             raise ValueError("the delay is fixed once the simulation topology is built (it is its delay buckets)")
-        elif name in self.device_state:
-            blocked = self.device_state[name]
-            blocked.copy_(torch.as_tensor(value).to(blocked.device, blocked.dtype)[self.perm])
         else:
             object.__getattribute__(self, 'state')[name] = value
 
     def __getattr__(self, name):
         try:
             state = object.__getattribute__(self, 'state')
-            device_state = object.__getattribute__(self, 'device_state')
         except AttributeError:
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
         sim = object.__getattribute__(self, 'sim')
         if sim is not None and name in sim.attrs and name != PLACEHOLDER:
             return sim.read(name)
-        if name in device_state:
-            blocked = device_state[name]
-            canonical = torch.empty_like(blocked)
-            canonical[object.__getattribute__(self, 'perm')] = blocked
-            return canonical
         if name in state:
             return state[name]
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")

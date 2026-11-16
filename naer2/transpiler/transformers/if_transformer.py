@@ -16,25 +16,15 @@ class IfTransformer(ast.NodeTransformer):
         else:
             x = b             →   x = tl.where(~_m0 & mask, b, x)
 
-    n2.spike(time=...) lowers to a compacted write of (node_id, timestamp) into
-    this program instance's own private slice of a global scratch buffer,
-    gated by the current branch mask: tl.cumsum turns the branch mask into
-    each firing lane's offset within that slice, both buffers are written
-    with that mask so only firing lanes actually store anything, and the
-    local write-cursor (local_spike_count) is bumped by plain scalar
-    arithmetic — no atomic needed, since this slice belongs exclusively to
-    this program instance. That count is published once, at the very end of
-    the kernel, with a plain scalar store (also no atomic) — see
-    NoDelayUpdateKernelTemplate.build's flush step and naer2/spike_gather.py:
-    the local scratch buffers this writes into are already laid out exactly
-    as a BlockedSpikes, so nothing needs compacting into a shared buffer at
-    all, let alone with a contended global atomic.
-    time=None (default, no argument) records `t`; an expression is spliced in
-    verbatim as the timestamp instead — see naer2.sends.spike's docstring.
-    Whatever mask this ends up gated by (root "mask", or "is_target" after
-    MaskAliasTransformer rewrites it for per-link use) is exactly the set of
-    lanes this statement should treat as firing, so the lowering itself needs
-    no is_target-awareness of its own.
+    n2.spike(time=...) lowers through spike_lowering(mask, time_expr, bare),
+    gated by the current branch mask (the fused template's _SpikeSites: each
+    site's fire mask and emission time, emitted after the hooks). time=None
+    (default, no argument) records default_spike_time; an expression is
+    spliced in verbatim as the timestamp instead -- see naer2.sends.spike's
+    docstring. Whatever mask this ends up gated by (root "mask", or
+    "is_target" after MaskAliasTransformer rewrites it for per-link use) is
+    exactly the set of lanes this statement should treat as firing, so the
+    lowering itself needs no is_target-awareness of its own.
 
     ast.Assign  → tl.where on the branch mask.
     ast.AugAssign → expanded to BinOp then tl.where.
@@ -43,10 +33,10 @@ class IfTransformer(ast.NodeTransformer):
     """
 
     def __init__(self, spike_lowering=None, default_spike_time: str = "t"):
-        """spike_lowering: lower n2.spike() with this instead of the local
-        spike buffer write -- called as spike_lowering(mask, time_expr, bare)
-        -> list[ast.stmt] (the fused template collects each site's fire mask
-        and emission time). default_spike_time: a bare n2.spike()'s time."""
+        """spike_lowering: lowers n2.spike(), called as
+        spike_lowering(mask, time_expr, bare) -> list[ast.stmt] (None: a
+        hook without n2.spike()).
+        default_spike_time: a bare n2.spike()'s time."""
         self._counter = 0
         self.spike_lowering = spike_lowering
         self.default_spike_time = default_spike_time
@@ -84,16 +74,10 @@ class IfTransformer(ast.NodeTransformer):
 
     def _lower_spike(self, node: ast.Expr, mask: str) -> list[ast.stmt]:
         time_expr = self._spike_time_expr(node)
-        if self.spike_lowering is not None:
-            bare = not node.value.args and not node.value.keywords
-            return self.spike_lowering(mask, time_expr, bare)
-        return _STMTS(f"""\
-_n_fire = {mask}.to(tl.int32)
-_local_pos = local_spike_count + tl.cumsum(_n_fire, axis=0) - _n_fire
-local_spike_count = local_spike_count + tl.sum(_n_fire, axis=0)
-tl.store(local_spike_node_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, offs, mask={mask})
-tl.store(local_spike_time_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, {time_expr}, mask={mask})
-""")
+        bare = not node.value.args and not node.value.keywords
+        if self.spike_lowering is None:
+            raise ValueError("n2.spike() needs a spike_lowering to lower it with")
+        return self.spike_lowering(mask, time_expr, bare)
 
     def _lower_body(self, stmts: list[ast.stmt], mask: str) -> list[ast.stmt]:
         result = []

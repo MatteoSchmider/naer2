@@ -1,9 +1,4 @@
-import ast
-import importlib.util
 import math
-import pathlib
-import tempfile
-from logging import debug
 
 import torch
 
@@ -26,55 +21,24 @@ class Population:
         instance,
         shape,
         group_size: int = 32,
-        spike_block: int = 32,
-        link_block: int = 64,
-        local_spike_cap: int = 64,
-        carry_cap: int = 64,
-        per_src_cap: int = 64,
         timestep: float | None = None,
         delay_resolution: float | None = None,
     ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
         self.shape: Region = Region(shape)
 
-        # Triton tile sizes for this population's compiled kernel (see
-        # naer2/transpiler/templates/update_kernel.py). Defaults sized for
-        # small test networks; override per-population for real scale.
+        # neurons per program of the fused kernel (one group: its ring, its share of every link)
         self.group_size = group_size
-        self.spike_block = spike_block
-        self.link_block = link_block
-        self.local_spike_cap = local_spike_cap
 
-        # Spike-lifecycle capacities (naer2/spike_gather.py): carry_cap caps
-        # how many not-yet-due spikes this population can hold across
-        # rounds; per_src_cap caps how many due entries any ONE incoming
-        # connection can contribute to a merge. Both were hardcoded to 64 at
-        # every call site until this population-level override existed --
-        # see TODO.md's "compact()/merge() capacity" entry. Must exceed the
-        # population's own size for an all-firing-at-once worst case (e.g.
-        # every neuron spiking the same round); defaults preserve existing
-        # small-test-network behavior exactly.
-        self.carry_cap = carry_cap
-        self.per_src_cap = per_src_cap
-
-        # This population's own, explicit re-check interval -- independent of
-        # (and taking priority over) both has_autonomous_dynamics' "every
-        # sub-step" default and _min_incoming_delay()'s event-driven floor.
-        # None (default) preserves existing behavior exactly: an autonomous
-        # population (real update() dynamics) runs every sub-step, a purely
-        # event-driven one only when due by incoming delay. Set this when
-        # neither applies -- e.g. a population whose send() fires on its own
-        # clock with no incoming connections at all (a Poisson background
-        # generator) has no other way to ever become due; see
-        # Network._validate_schedulable and TODO.md.
+        # This population's own clock: a run every timestep (its window
+        # [t, t + timestep)). None (default): an update() population runs as
+        # far as its inputs' horizon allows, an event-driven one when an
+        # arrival is due (see _next_run_time). A population with update()
+        # dynamics and no incoming connections needs one (_check_schedulable).
         self.timestep = timestep
 
-        # Width w of the per-link-delay kernel's delay buckets and emission
-        # bins (naer2/transpiler/templates/per_link_delay_update_kernel.py),
-        # only used when some incoming connection carries a per-link delay
-        # tensor. None (default) adopts the network's sub-step; fixed once
-        # this population first compiles, together with the bucket count and
-        # the per-bucket topology splits (see _delay_layout).
+        # The ring's slot width; None (default): the finest resolution of the
+        # incoming connections (see _slot_width).
         self.delay_resolution = delay_resolution
 
         # Check that instance's type was decorated and registered
@@ -105,8 +69,8 @@ class Population:
         # _run_times: pending arrivals of an event-driven population --
         #   intake appends arrival + the connection's minimum delay for a
         #   connection whose source emitted new spikes; later per-link
-        #   arrivals are found while the update kernel expands spikes to
-        #   their links, which then records the next one.
+        #   arrivals are found in its ring after each run
+        #   (_note_pending_arrivals).
         self._horizon: float = 0.0
         self._bound: float = math.inf
         self._run_times: list[float] = []
@@ -119,10 +83,6 @@ class Population:
         self._run_id: int = 0
         self._read_run: dict = {}
         self._summary: tuple[int, int, float] | None = None
-
-        self._delay_layout_cache: tuple[float, int] | None = None
-        # compile()'s (the old templates', kept for the AST tests until they go -- TODO.md 1e step 6)
-        self._compiled_incoming_meta: list[tuple[set, set]] = []
 
         # The fused kernel's runtime (naer2/runtime.py), built on the first
         # run: the kernel generated from this population's hooks
@@ -153,96 +113,6 @@ class Population:
     def has_autonomous_dynamics(self) -> bool:
         """True when the update hook modifies state, so the network clock must drive it."""
         return bool(self.node.update.assigned_members)
-
-    @property
-    def n_blocks(self) -> int:
-        """Number of program instances this population's kernel launches
-        with -- also the number of GROUPs (BlockedSpikes' n_groups)."""
-        return -(-len(self.shape) // self.group_size)
-
-    @property
-    def uses_per_link_delay_kernel(self) -> bool:
-        """True when any incoming connection carries a real per-link delay
-        tensor, as opposed to no delay or one uniform scalar for the whole
-        connection -- selects which update-kernel variant compile() produces
-        (see naer2/transpiler/templates/). This is population-wide: if any
-        ONE incoming connection is per-link-delayed, every incoming
-        connection's edge forward/backward callbacks are disallowed, not
-        just that connection's own -- see per_link_delay_update_kernel.py's
-        module docstring for why."""
-        return any(
-            isinstance(getattr(conn.fabric, "delay", None), torch.Tensor)
-            for conn in self.incoming
-        )
-
-    def _min_incoming_delay(self) -> float:
-        """Smallest per-link delay across all incoming connections."""
-        min_d = math.inf
-        for conn in self.incoming:
-            d = getattr(conn.fabric, "delay", None)
-            if d is None:
-                continue
-            min_d = min(
-                min_d,
-                float(d.min().item()) if isinstance(d, torch.Tensor) else float(d),
-            )
-        return min_d
-
-    def _delay_layout(self) -> tuple[float, int]:
-        """(w, n_buckets) for the per-link-delay kernel, computed once and
-        then fixed: w is delay_resolution if set, else the network's
-        sub-step (the last step()'s, or -- when compiling before any
-        step() -- the finest positive effective period in the network);
-        n_buckets covers the largest incoming delay."""
-        if self._delay_layout_cache is None:
-            w = self.delay_resolution or self.network.sub_dt
-            if w is None:
-                positive = [
-                    p
-                    for p in self.network._compute_effective_periods().values()
-                    if 0.0 < p < math.inf
-                ]
-                if not positive:
-                    raise ValueError(
-                        f"{type(self.instance).__name__} population needs a delay "
-                        f"resolution before any network.step() has run: set "
-                        f"population.delay_resolution explicitly."
-                    )
-                w = min(positive)
-            max_bucket = 0
-            for conn in self.incoming:
-                d = getattr(conn.fabric, "delay", None)
-                if isinstance(d, torch.Tensor):
-                    max_bucket = max(max_bucket, int((d / w).floor().max()))
-                elif d is not None:
-                    max_bucket = max(max_bucket, math.floor(float(d) / w))
-            self._delay_layout_cache = (w, max_bucket + 1)
-        return self._delay_layout_cache
-
-    def _is_due(self, t: float, period: float) -> bool:
-        """Whether this population's update kernel needs to run at time t,
-        given `period` -- the coarsest interval it can safely go without
-        being checked, computed network-wide by
-        Network._compute_effective_periods() (0.0 for autonomous with no
-        override, self.timestep if set, otherwise derived from incoming
-        delay -- recursively, through undelayed connections, from upstream
-        populations' own periods). A single `t - last_update >= period`
-        check covers every other case uniformly: period 0.0 means "every
-        sub-step" (always true), since last_update only ever moves forward.
-        period == math.inf ("never due" -- see Network._validate_schedulable,
-        which should already have raised before this matters) is special-
-        cased explicitly rather than left to fall out of the arithmetic:
-        last_update starts at -inf, so t - (-inf) is +inf, and +inf >= +inf
-        is True in Python -- the opposite of "never due."
-
-        See Network.step(), which calls this after every population's
-        gather phase has already run (gather is unconditional, every
-        sub-step, for every population: a population's carried spikes may
-        need to surface for a downstream target even on a round it itself
-        has nothing new to compute)."""
-        if period == math.inf:
-            return False
-        return t - self.last_update >= period
 
     def _ensure_on_device(self, device) -> None:
         """Move this population's own per-neuron dynamic-attr tensors onto
@@ -279,25 +149,6 @@ class Population:
     def _event_driven(self) -> bool:
         return self.timestep is None and not self.has_autonomous_dynamics
 
-    # (The emission contract of the old templates, kept for reference until they go:
-    #   Every run OVERWRITES this population's emission buffer; it is valid
-    #   until the population's next run, and consumers read it once per run
-    #   (intake, via _run_id), in the round it was written.
-    #   - node  [n_blocks * local_spike_cap] int32  population-local index
-    #   - time  [n_blocks * local_spike_cap] float32 emission time e: >= the
-    #           run's window start, possibly past its end (emission delay);
-    #           each block's valid entries SORTED ascending by e (sorted in
-    #           the kernel before writing out: once at the source, so every
-    #           consumer's intake only merges, never sorts; across blocks
-    #           there is no order -- no grid-wide barrier in Triton)
-    #   - count [n_blocks] int32  valid entries of block b are
-    #           [b * cap, b * cap + count[b]); setting it invalidates the rest
-    #   - summary [2] float32  (number of spikes, earliest emission time),
-    #           written by the kernel itself -- read back once per run by
-    #           _emission_summary, which computes it on the host side until
-    #           then
-    #   - a block emitting more than local_spike_cap spikes must flag
-    #     overflow, not write past its slice
     def _emission_summary(self) -> tuple[int, float]:
         """(number of spikes, earliest emission time) of this population's
         last run: its history's header, read back once per run and shared by
@@ -567,223 +418,3 @@ class Population:
         if not isinstance(mapping, dict):
             raise ValueError("Population @ mapping expects a dict (source_map)")
         return ConnectionBuilder(self).source_map(mapping)
-
-    def compile(self) -> "ast.Module":
-        """Compile the merged update-receive-send kernel for this population.
-
-        Selects between the two update-kernel variants first
-        (uses_per_link_delay_kernel) -- see per_link_delay_update_kernel.py's
-        module docstring for why that switch disallows edge callbacks
-        population-wide rather than per-connection. Otherwise, pairs each
-        incoming connection with its transpiled receive-hook stmts, then
-        feeds them — along with the update and send sections — into
-        NoDelayUpdateKernelTemplate to produce the final ast.Module.
-        """
-        import ast
-
-        from .transpiler.analyzers.used_members import ReadMemberFinder, UsedMemberFinder
-        from .transpiler.context import TranspilerContext
-        from .transpiler.hook_transpiler import HookTranspiler
-        from .transpiler.templates.no_delay_update_kernel import (
-            NoDelayUpdateKernelTemplate,
-        )
-
-        ctx = TranspilerContext(
-            static_attrs={
-                k: v
-                for k, v in self.instance.__dict__.items()
-                if k not in self.dynamic_attrs
-            },
-            dynamic_attrs=self.dynamic_attrs,
-        )
-
-        if self.uses_per_link_delay_kernel:
-            for conn in self.incoming:
-                if conn.fabric.dynamic_attrs:
-                    edge_name = type(conn.fabric.instance).__name__
-                    raise ValueError(
-                        f"{type(self.instance).__name__} population uses a per-link-delay "
-                        f"kernel (some incoming connection has a real per-link delay "
-                        f"tensor), which disallows edge forward/backward callbacks on "
-                        f"every incoming connection -- but edge type '{edge_name}' "
-                        f"declares forward/backward-assigned per-link attrs "
-                        f"{sorted(conn.fabric.dynamic_attrs)}, which can never actually "
-                        f"change under this kernel. Use an edge with no forward/backward "
-                        f"assignment and set any needed per-link tensor directly instead, "
-                        f"e.g. conn.fabric.weight = tensor(...)."
-                    )
-
-        # Send after a delivery only where that delivery can change send's
-        # outcome: the connection's receive writes a node attr send reads.
-        # Otherwise (e.g. PD14_neuron: receive writes current, send reads
-        # potential) the per-delivery send is left out and send runs once,
-        # after update -- so a send whose effect doesn't depend on what
-        # receive changes (unconditional side effects, or only `time`) runs
-        # once per window, not once per delivery.
-        send_reads = ReadMemberFinder(self.node.send.ast, "self").run()
-        send_after_delivery = []
-
-        # one transpiled receive + edge-forward section per incoming connection
-        incoming_with_hooks = []
-        for conn in self.incoming:
-            port = conn._target_port or "receive"
-            hook = self.node.receive.get(port)
-            send_after_delivery.append(hook is not None and bool(hook.assigned_members & send_reads))
-            edge_fwd_hook = conn.fabric.edge.get("forward")
-            edge_bwd_hook = conn.fabric.edge.get("backward")
-
-            # Which source.attr names (real, post-source_map) do this connection's
-            # hooks actually reference? Only those need a per-spike gather load —
-            # a source population can have dynamic attrs no connection here uses.
-            source_rename = {
-                hook_name: real for real, hook_name in (conn._source_map or {}).items()
-            }
-            used_source_names = set()
-            if hook is not None:
-                used_source_names |= UsedMemberFinder(hook.ast, "source").run()
-            if edge_fwd_hook is not None:
-                used_source_names |= UsedMemberFinder(edge_fwd_hook.ast, "source").run()
-            real_source_attrs = {source_rename.get(n, n) for n in used_source_names}
-
-            source_pop = conn._source
-            for attr in real_source_attrs:
-                if (
-                    attr not in source_pop.dynamic_attrs
-                    and attr not in source_pop.instance.__dict__
-                ):
-                    raise ValueError(
-                        f"source.{attr} referenced but '{attr}' does not exist on {source_pop!r}"
-                    )
-            source_dynamic_attrs = {
-                a for a in real_source_attrs if a in source_pop.dynamic_attrs
-            }
-            source_static_attrs = {
-                a: source_pop.instance.__dict__[a]
-                for a in real_source_attrs
-                if a not in source_dynamic_attrs
-            }
-
-            # Which edge attrs (real, post-fabric_map) does this connection actually
-            # reference — via edge.attr in receive, or self.attr in forward/backward?
-            # Fabric.dynamic_attrs (forward/backward's *assigned* members) alone is
-            # not a reliable signal here: an attr can be read-only in backward (not
-            # yet wired into the kernel, but still worth accounting for now) without
-            # ever being assigned anywhere, or referenced only from receive and
-            # nowhere in the edge's own code at all — UsedMemberFinder catches both,
-            # same treatment as source.attr above.
-            edge_rename = {
-                hook_name: real for real, hook_name in (conn._fabric_map or {}).items()
-            }
-            used_edge_names = set()
-            if hook is not None:
-                used_edge_names |= UsedMemberFinder(hook.ast, "edge").run()
-            real_used_edge_from_receive = {
-                edge_rename.get(n, n) for n in used_edge_names
-            }
-            used_self_forward = (
-                UsedMemberFinder(edge_fwd_hook.ast, "self").run()
-                if edge_fwd_hook
-                else set()
-            )
-            used_self_backward = (
-                UsedMemberFinder(edge_bwd_hook.ast, "self").run()
-                if edge_bwd_hook
-                else set()
-            )
-            referenced_edge_attrs = (
-                real_used_edge_from_receive | used_self_forward | used_self_backward
-            )
-
-            for attr in referenced_edge_attrs:
-                if (
-                    attr not in conn.fabric.dynamic_attrs
-                    and attr not in conn.fabric.static_attrs
-                    and attr not in conn.fabric.tensor_attrs
-                ):
-                    raise ValueError(
-                        f"edge.{attr}/self.{attr} referenced but '{attr}' does not exist on {conn.fabric!r}"
-                    )
-            # Tensor-backed = assigned by forward/backward, or given an explicit
-            # per-link override from outside (conn.fabric.state) — same test as
-            # Fabric.tensor_attrs, just restricted to names actually referenced here.
-            edge_tensor_attrs = {
-                a
-                for a in referenced_edge_attrs
-                if a in conn.fabric.tensor_attrs
-            }
-            edge_constant_attrs = {
-                a: conn.fabric.static_attrs[a]
-                for a in referenced_edge_attrs
-                if a not in edge_tensor_attrs
-            }
-
-            recv_stmts = (
-                HookTranspiler(hook, ctx).emit_for_spike_loop(
-                    set(self.dynamic_attrs),
-                    fabric_map=conn._fabric_map,
-                    source_map=conn._source_map,
-                    edge_static_attrs=edge_constant_attrs,
-                    source_static_attrs=source_static_attrs,
-                )
-                if hook
-                else []
-            )
-
-            # edge forward hook (updates per-link edge state inside the spike loop)
-            if edge_fwd_hook is not None and edge_fwd_hook.assigned_members:
-                edge_ctx = TranspilerContext(
-                    static_attrs=edge_constant_attrs,
-                    dynamic_attrs=edge_tensor_attrs,
-                )
-                edge_fwd_stmts = HookTranspiler(
-                    edge_fwd_hook, edge_ctx, self_prefix="lk_"
-                ).emit_for_spike_loop(
-                    edge_tensor_attrs,
-                    source_map=conn._source_map,
-                    source_static_attrs=source_static_attrs,
-                    mask_target=False,
-                    lane_mask="_lk_valid",
-                )
-            else:
-                edge_fwd_stmts = []
-
-            incoming_with_hooks.append(
-                (
-                    conn,
-                    recv_stmts,
-                    edge_fwd_stmts,
-                    source_dynamic_attrs,
-                    edge_tensor_attrs,
-                )
-            )
-
-        update_section = HookTranspiler(self.node.update, ctx).emit()
-        send_section = HookTranspiler(self.node.send, ctx).emit()
-
-        # Which source/edge attrs each connection's compiled branch actually
-        # needs a conn{i}_... pointer for -- _execute_update_kernel reads
-        # this back to build the real launch args with matching names.
-        self._compiled_incoming_meta = [
-            (source_dynamic_attrs, edge_tensor_attrs)
-            for (
-                _,
-                _,
-                _,
-                source_dynamic_attrs,
-                edge_tensor_attrs,
-            ) in incoming_with_hooks
-        ]
-
-        if self.uses_per_link_delay_kernel:
-            from .transpiler.templates.per_link_delay_update_kernel import (
-                PerLinkDelayUpdateKernelTemplate,
-            )
-
-            w, n_buckets = self._delay_layout()
-            return PerLinkDelayUpdateKernelTemplate(
-                ctx, incoming_with_hooks, n_buckets, w, send_after_delivery
-            ).build(update_section, send_section)
-
-        return NoDelayUpdateKernelTemplate(ctx, incoming_with_hooks, send_after_delivery).build(
-            update_section, send_section
-        )

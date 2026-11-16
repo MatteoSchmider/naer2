@@ -1,42 +1,31 @@
 """
-Mini E/I compilation smoke-test.
+Mini E/I compilation smoke-test: the generated fused kernels' structure.
 
-Builds a 2-population E/I circuit (100 E + 25 I neurons, 4 connections) and
-compiles the merged update-receive-send kernel for both populations.
+Builds a 2-population E/I circuit (100 E + 25 I PD14 neurons, 4 bare
+connections, a per-link weight on each) and generates both populations'
+fused kernels (Population.fused_kernel, naer2/transpiler/templates/
+fused_template.py), then asserts on the generated source:
 
-Expected kernel structure:
-  - ONE outer for-loop over the unified sorted spike buffer
-  - Inner real loop (range(SPIKE_BLOCK), not tl.static_range — see TODO.md),
-    guarded by blk_mask[j], containing:
-      * time / spike_src_j / spike_conn_j loaded as scalars for this spike slot
-      * An if/elif dispatch on spike_conn_j (warp-uniform — same value for
-        every lane in this program, so this branches with no divergence),
-        one branch per incoming connection, each with its own scalar CSR
-        range lookup using that connection's own directly-named pointers:
-          if spike_conn_j == 0:
-            link_start = tl.load(conn0_src_offsets_ptr + _row + spike_src_j)
-            link_end   = tl.load(conn0_src_offsets_ptr + _row + spike_src_j + 1)
-            for link_tile in range(link_start, link_end, LINK_BLOCK):
-              <<edge forward on link lanes; densify links -> neuron lanes>>
-              <<receive + send on neuron lanes, masked by is_target>>
-          elif spike_conn_j == 1: ...
-  - Final propagation block (time = t) after the spike loop
-  - edge.weight replaced by locally loaded scalar weight
-  - current = current + weight * is_target  (ReceiveMaskTransformer)
-  - Signature: spike_src_ptr (not spike_tgt_ptr), conn{i}_src_offsets_ptr,
-    conn{i}_target_indices_ptr
+  - the entry signature: one pointer per dynamic node attr, then the
+    template's fixed arguments, then its constexprs; static attrs inlined
+  - receive: the per-link edge.weight as the staged attr `w`, its update
+    rooted at the delivered lanes (is_target = hit)
+  - the receive state (current) loaded before delivery, every other attr
+    after it
+  - no send after each delivery: receive writes current, send reads
+    potential, so send runs once, after update
+  - bare n2.spike(): emitted at the window's start (D-4)
+  - math.exp lowered, no tl.* left (the Gluon transformer)
 
-This is an integration test: it goes through the real node/edge/pattern/
-connection chain and compiles real kernels, then asserts on their structure.
-It does not invoke the real Triton compiler or run anything — that's a later,
-separate system-test concern (see TODO.md); correctness here is checked by
-inspecting the generated AST.
+No GPU: generating a kernel only builds its source and the gluon.jit
+function; the GPU tests (test_fused_generated_gpu.py) run them.
 """
 
 import ast
 
 import pytest
 
+from naer2.transpiler.templates.fused_template import CONSTEXPRS, FIXED_ARGS
 from test.networks.mini_ei import build
 
 
@@ -47,23 +36,17 @@ def pops():
 
 
 @pytest.fixture(scope="module")
-def E_module(pops):
-    return pops["E"].compile()
+def kernel_E(pops):
+    return pops["E"].fused_kernel()
 
 
 @pytest.fixture(scope="module")
-def I_module(pops):
-    return pops["I"].compile()
+def src_E(kernel_E):
+    return kernel_E.source
 
 
-@pytest.fixture(scope="module")
-def func_E(E_module):
-    return E_module.body[0]
-
-
-@pytest.fixture(scope="module")
-def src_E(E_module):
-    return ast.unparse(E_module)
+def _function(src, name):
+    return next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
 def test_populations_have_expected_incoming_connections(pops):
@@ -75,141 +58,65 @@ def test_populations_have_expected_incoming_connections(pops):
         assert conn.fabric.topology.target_indices.shape[0] > 0
 
 
-def test_I_kernel_also_compiles(I_module):
-    assert isinstance(I_module, ast.Module)
-    assert isinstance(I_module.body[0], ast.FunctionDef)
+def test_I_kernel_also_generates(pops):
+    k = pops["I"].fused_kernel()
+    assert isinstance(ast.parse(k.source), ast.Module)
+    assert k.attrs == pops["E"].fused_kernel().attrs
 
 
-def test_one_outer_loop_over_unified_spike_buffer(func_E):
-    outer_loops = sum(1 for s in func_E.body if isinstance(s, ast.For))
-    assert outer_loops == 1
+def test_signature_attr_pointers_then_fixed_args_then_constexprs(kernel_E, src_E):
+    args = [a.arg for a in _function(src_E, "fused_kernel").args.args]
+    attrs = [f"{a}_ptr" for a in kernel_E.attrs]
+    assert sorted(kernel_E.attrs) == ["current", "last_time", "potential", "t_ref_end"]
+    assert args == attrs + list(FIXED_ARGS) + list(CONSTEXPRS)
+    assert kernel_E.consts == {}, "PD14_neuron's static attrs are inlined as literals, not constexprs"
+    assert "-63.2438" in src_E  # V_rest at K_cortical 125
 
 
-def test_dispatches_via_if_elif_on_spike_conn(func_E, src_E):
-    # spike_conn_j is warp-uniform (same value for every lane in this program),
-    # so this branch is not divergent, and each branch runs that connection's
-    # own transpiled AST with its own directly-named pointers — no dynamic
-    # pointer selection needed, the branch itself is the selection.
-    has_spike_conn_dispatch = any(
-        isinstance(node, ast.If)
-        and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Name)
-        and node.test.left.id == "spike_conn_j"
-        for node in ast.walk(func_E)
-    )
-    assert has_spike_conn_dispatch
-    assert "spike_conn_j == 0" in src_E
-    assert "spike_conn_j == 1" in src_E
+def test_the_kernel_s_contract(kernel_E):
+    assert kernel_E.edge_attr == "weight", "receive reads edge.weight: the staged per-link attr"
+    assert kernel_E.state_attrs == ["current"]
+    assert kernel_E.uniform_emission and not kernel_E.stage_e
 
 
-def test_scalar_per_branch_csr_range_lookup(src_E):
-    # scalar lookup inside each branch, using that connection's own pointer
-    # directly — no block-level vectorized pre-gather, no per-connection
-    # link_start_i/link_end_i vectors — indexed by this program's row of the
-    # blocked [n_blocks, N_src + 1] offsets table
-    assert "link_start = tl.load(conn0_src_offsets_ptr + _row + spike_src_j)" in src_E
-    assert "link_end = tl.load(conn0_src_offsets_ptr + _row + spike_src_j + 1)" in src_E
-    assert "link_start = tl.load(conn1_src_offsets_ptr + _row + spike_src_j)" in src_E
-    assert "_row = pid.to(tl.int64) * " in src_E
-    assert "range(link_start, link_end, LINK_BLOCK)" in src_E
-    assert "link_start_0" not in src_E, "old block-level vectorized gather should be gone"
+def test_receive_reads_the_staged_weight_on_the_delivered_lanes(src_E):
+    recv = ast.unparse(_function(src_E, "_receive"))
+    assert "edge.weight" not in recv, "AttrPrefixTransformer missed edge.weight"
+    assert "is_target = hit" in recv
+    assert "edge_weight = w" in recv
+    assert "current = gl.where(is_target, current + edge_weight, current)" in recv
+    assert "return (current,)" in recv
 
 
-def test_links_densified_into_per_neuron_is_target(src_E):
-    # Densify used to be a one-hot [GROUP_SIZE, LINK_BLOCK] compare-and-reduce
-    # (_hit); replaced with tl.histogram (cheaper to compile, see TODO.md) —
-    # no _hit left anywhere.
-    assert "is_target" in src_E
-    assert "is_target = (tl.histogram(_tgt, GROUP_SIZE, mask=_lk_valid) > 0) & mask" in src_E
-    assert "_hit" not in src_E, "one-hot compare-and-reduce densify should be gone"
-    assert "_own" not in src_E, "ownership is structural in the blocked layout — no _own mask"
+def test_receive_state_loaded_before_delivery_the_rest_after(src_E):
+    deliver = src_E.index("state, n_ev = _deliver(")
+    assert src_E.index("current = gl.load(current_ptr + offs, mask=mask)") < deliver
+    for attr in ("potential", "t_ref_end", "last_time"):
+        assert src_E.index(f"{attr} = gl.load({attr}_ptr + offs, mask=mask)") > deliver
+    for attr in ("potential", "current", "t_ref_end", "last_time"):
+        assert f"gl.store({attr}_ptr + offs, {attr}, mask=mask)" in src_E
 
 
-def test_edge_weight_loaded_as_link_tile_then_reduced(src_E):
-    # edge_weight used to be a reduction over the one-hot _hit matrix;
-    # replaced with a scratch-buffer atomic scatter-add (see TODO.md) —
-    # scope="cta" since only this program's own lanes ever read it back.
-    assert "edge.weight" not in src_E, "AttrPrefixTransformer missed edge.weight"
-    assert "conn0_weight_ptr" in src_E
-    assert "lk_weight = tl.load(conn0_weight_ptr + _lk, mask=_lk_valid, other=0)" in src_E
-    assert "tl.atomic_add(scratch_ptr + pid * GROUP_SIZE + _tgt, lk_weight, mask=_lk_valid, scope='cta')" in src_E
-    assert "edge_weight = tl.load(scratch_ptr + offs)" in src_E
-
-
-def test_receive_masked_by_is_target(src_E):
-    assert "tl.where(is_target, current + edge_weight, current)" in src_E
-
-
-def test_update_send_masked_by_is_target(src_E):
-    assert "tl.where(is_target" in src_E
-
-
-def test_event_driven_timing(src_E):
-    assert "time = tl.load(spike_time_ptr + _s)" in src_E
-    assert "time = t" in src_E
-
-
-def test_signature_has_unified_buffer_and_csr_args(func_E):
-    arg_names = {a.arg for a in func_E.args.args}
-    assert "spike_src_ptr" in arg_names
-    assert "spike_conn_ptr" in arg_names
-    assert "spike_tgt_ptr" not in arg_names, "old spike_tgt_ptr should be gone"
-    assert "spike_link_ptr" not in arg_names, "old spike_link_ptr should be gone"
-    assert "conn0_src_offsets_ptr" in arg_names
-    assert "conn0_target_indices_ptr" in arg_names
-    assert "conn1_src_offsets_ptr" in arg_names
-
-
-def test_spike_lowers_to_local_buffer_write_no_atomic(func_E, src_E):
-    # Per-emission-site writes go into this program's private local_spike_*
-    # slice with no atomic (plain scalar local_spike_count, since no other
-    # program instance touches this slice). PD14_neuron calls bare n2.spike()
-    # (no time arg), so the time=None default should record t, the kernel's
-    # own timestep boundary, not the contextual time.
-    arg_names = {a.arg for a in func_E.args.args}
-    assert {"local_spike_node_ptr", "local_spike_time_ptr", "local_spike_count_ptr"} <= arg_names
-    assert "out_spike_ptr" not in arg_names, "old placeholder out_spike_ptr should be gone"
-    assert not any(a.startswith("out_spike_") for a in arg_names), \
-        "flush no longer compacts into a shared out_spike_* buffer"
-    assert "LOCAL_SPIKE_CAP" in arg_names
-    assert "tl.store(local_spike_node_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, offs, mask=_m0)" in src_E
-    assert "tl.store(local_spike_time_ptr + pid * LOCAL_SPIKE_CAP + _local_pos, t, mask=_m0)" in src_E, \
-        "bare n2.spike() should default to recording t, not the contextual time"
-
-
-def test_flush_step_has_no_atomic(src_E):
-    # The flush step used to do one tl.atomic_add per program instance to
-    # compact into a shared buffer; now it's a plain per-pid scalar store
-    # (local_spike_node/time_ptr are already laid out exactly as a
-    # BlockedSpikes wants -- see naer2/spike_gather.py). Densify's own
-    # scratch-buffer scatter-add (see TODO.md) is a real, separate,
-    # intentional atomic elsewhere in the kernel -- not what this test is
-    # about -- so check the flush statement itself, not "no atomics anywhere".
-    assert "tl.store(local_spike_count_ptr + pid, local_spike_count)" in src_E
-    flush_line_idx = src_E.index("tl.store(local_spike_count_ptr + pid, local_spike_count)")
-    assert "tl.atomic_add(" not in src_E[flush_line_idx - 200:flush_line_idx]
-
-
-def _link_loops(func) -> list[ast.For]:
-    return [n for n in ast.walk(func) if isinstance(n, ast.For) and isinstance(n.target, ast.Name)
-            and n.target.id == "link_tile"]
-
-
-def test_no_per_delivery_send_when_receive_writes_nothing_send_reads(func_E, src_E):
+def test_no_per_delivery_send_when_receive_writes_nothing_send_reads(src_E):
     # PD14_neuron's receive writes only current; send reads potential (and
-    # time): a delivery can't change send's outcome, so send runs once, in
-    # the final pass after update, not after every delivery.
-    loops = _link_loops(func_E)
-    assert loops, "the link loops should still be there"
-    for loop in loops:
-        body = ast.unparse(loop)
-        assert "potential > -50.0" not in body, "no fire check inside the link loop"
-        assert "local_spike_node_ptr" not in body, "no spike emission inside the link loop"
-    assert "_m0 = mask & (potential > -50.0)" in src_E, "send's fire check stays in the final pass"
+    # time): a delivery can't change send's outcome, so send runs once,
+    # after update, not after every delivery.
+    recv = ast.unparse(_function(src_E, "_receive"))
+    assert "potential" not in recv, "no fire check inside the delivery"
+    tail = src_E[src_E.index("# update, then send"):]
+    assert "_m0 = mask & (potential > -50.0)" in tail, "send's fire check after update"
 
 
-def test_math_exp_lowered_to_tl_exp(src_E):
-    # PD14's update hook calls math.exp on tensors; MathLoweringTransformer
-    # must have rewritten it for the kernel to even be well-formed.
+def test_bare_spike_emits_at_the_window_start(src_E):
+    assert "_fire0 = _m0" in src_E
+    assert "_e0 = t_start + gl.zeros([GROUP_SIZE], gl.float32, layout=LN)" in src_E
+    assert "_emit_spikes(_fire0, _e0, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)" in src_E
+    assert src_E.count("_emit_spikes(") == 1
+    assert "_emit_close(" in src_E
+
+
+def test_math_exp_lowered_to_gl_exp(src_E):
+    # PD14's update hook calls math.exp on tensors; MathLoweringTransformer, then the Gluon transformer
     assert "math." not in src_E
-    assert "tl.exp(" in src_E
+    assert "tl." not in src_E
+    assert "gl.exp(" in src_E

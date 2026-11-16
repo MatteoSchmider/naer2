@@ -49,7 +49,6 @@ class ConnectionBuilder:
         self._target_port: str = None
         self._source_map: dict[str, str | Set[str]] = None
         self._fabric_map: dict[str, str] = None
-        self._delay: int | float | torch.Tensor = None
         self._resolution: float | None = None
 
     # ------------------------------------------------------------------ properties
@@ -195,7 +194,7 @@ class ConnectionBuilder:
                 raise ValueError("delay must be an int, float or tensor")
             elif value.shape != self.shape:
                 raise ValueError(f"delay tensor must be shape {self.shape}")
-        self._delay = value
+        setattr(self._ensure_fabric(), "delay", value)  # where conn.delay = ... puts it
         return self
 
     def __or__(self, value) -> "ConnectionBuilder":
@@ -232,7 +231,7 @@ class Connection:
             return
         if name == "delay":
             # delay is read directly off fabric by the framework itself
-            # (Population._min_incoming_delay, uses_per_link_delay_kernel),
+            # (Population._min_delay, Fabric.simulation's delay buckets),
             # never via edge.delay inside a hook -- so it's exempt from the
             # "some receive hook must reference this name" check below.
             setattr(self.builder._ensure_fabric(), name, value)
@@ -246,8 +245,7 @@ class Connection:
         tensor, no learning rule" case (see Fabric(instance=None)).
 
         Only stores it if the target's receive hook at this connection's
-        port actually reads edge.<name> (after reversing fabric_map, same
-        resolution Population.compile() itself does) -- storing a tensor
+        port actually reads edge.<name> (after reversing fabric_map) -- storing a tensor
         nothing will ever load is almost certainly a mistake, and with no
         edge class there's no other check (a real edge class's dynamic_attrs
         validation) to catch it.

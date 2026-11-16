@@ -9,8 +9,6 @@ if TYPE_CHECKING:
     from .connection import Connection
     from .population import Population
 
-from .kernel import Kernel
-
 _EPS = 1e-10
 EVENT_DRIVEN_DEPTH = 8  # the history depth of a network with an event-driven consumer (see _plan_histories)
 
@@ -19,7 +17,6 @@ class Network:
     def __init__(self, population: Population):
         self.populations: Set[Population] = {population}
         self.connections: Set[Connection] = set()
-        self.kernels: Set[Kernel] = set()
         self.t: float = 0.0
         # Default delay quantization of connections without their own
         # resolution (Connection.resolution); a population's ring slot width

@@ -8,7 +8,7 @@ class delay_probe:
     that crosses threshold. With weight in {0, 1} and threshold=0.5, a
     weight-0 link can never cross threshold -- only weight-1 links fire,
     recording the exact (bucketed) arrival time their delay landed them
-    in. See TODO.md / test_per_link_delay_kernel.py."""
+    in."""
 
     def __init__(self, threshold: float = 0.5):
         self.threshold = threshold

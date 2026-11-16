@@ -46,7 +46,7 @@ class HookTranspiler:
     def __init__(self, hook: Hook, context: TranspilerContext, self_prefix: str = "", spike_lowering=None,
                  default_spike_time: str = "t"):
         """spike_lowering / default_spike_time: passed to IfTransformer (the
-        fused template lowers n2.spike() its own way)."""
+        fused template's _SpikeSites); a hook without n2.spike() needs none."""
         self.hook = hook
         self.context = context
         self.self_prefix = self_prefix

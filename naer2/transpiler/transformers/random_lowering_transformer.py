@@ -30,7 +30,7 @@ class RandomLoweringTransformer(StmtTransformer):
     independent) has no per-lane state to carry across calls, so every draw
     is reseeded from scratch:
       - offs (the lane's global neuron index — every kernel already computes
-        this once, see NoDelayUpdateKernelTemplate) makes different lanes in
+        this once, see the fused template's entry) makes different lanes in
         the same call draw different numbers.
       - t (the kernel's own per-call time-boundary argument — also already
         in scope everywhere, node hook or spike loop alike — bit-
@@ -53,8 +53,8 @@ class RandomLoweringTransformer(StmtTransformer):
     nothing here checks which lane space the surrounding code actually runs
     in. Fine for node hooks (update/send/receive, which is all that's
     exercised so far — see test/networks/PD14/poisson.py), wrong if ever
-    reached from an edge forward/backward hook, which runs on LINK_BLOCK-
-    shaped lanes instead. No edge hook calls random.* yet.
+    reached from an edge forward/backward hook, which runs on link lanes
+    instead. No edge hook calls random.* yet.
     """
 
     def __init__(self):
