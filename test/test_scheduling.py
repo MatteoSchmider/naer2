@@ -78,9 +78,9 @@ def stand_ins(monkeypatch):
 
     original_update = Population._execute_update_kernel
 
-    def update(self, t):
+    def update(self, t, **kw):
         try:
-            original_update(self, t)
+            original_update(self, t, **kw)
         except _Ran:
             pass
 
@@ -138,9 +138,9 @@ def test_a_source_run_without_spikes_schedules_nothing(monkeypatch):
 
     original_update = Population._execute_update_kernel
 
-    def update(self, t):
+    def update(self, t, **kw):
         try:
-            original_update(self, t)
+            original_update(self, t, **kw)
         except _Ran:
             pass
 

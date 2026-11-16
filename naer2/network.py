@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import math
 from typing import TYPE_CHECKING, Set
 
 import torch
@@ -18,6 +20,14 @@ class Network:
         self.connections: Set[Connection] = set()
         self.kernels: Set[Kernel] = set()
         self.t: float = 0.0
+        # Default delay quantization of connections without their own
+        # resolution (Connection.resolution); a population's ring slot width
+        # is the finest among its incoming connections' (TODO.md 1e, D-12).
+        self.resolution: float = 0.1
+        # The round counter: every population run in one round gets its id
+        # (a run reads its sources' runs of earlier rounds only).
+        self.round_id: int = 0
+        self._planned = False
         # Device every population's state lazily moves onto on its first
         # real kernel launch (Population._ensure_on_device) -- see TODO.md.
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,6 +76,9 @@ class Network:
         pops = list(self.populations)
         for pop in pops:
             pop._check_schedulable()
+        if not self._planned:
+            self._plan_histories(pops)
+            self._planned = True
         t_end = self.t + t_step
         while self.t < t_end - _EPS:
             for pop in pops:
@@ -86,33 +99,64 @@ class Network:
                     f"{', '.join(stale)} -- a population's run-time bookkeeping is wrong"
                 )
             self.t = t_next
+            self.round_id += 1  # every run of this round reads its sources' earlier rounds only
 
             self._concurrently(
-                (pop, lambda p=pop: p._execute_update_kernel(self.t)) for pop in pops
+                (pop, lambda stream, p=pop: p._execute_update_kernel(self.t, stream=stream)) for pop in pops
             )
 
-            self._concurrently(
-                (pop, lambda p=pop: p._intake(self.t)) for pop in pops if pop.incoming
-            )
+            # host bookkeeping only, after the round's join (reads on the current stream see every run):
+            # an event-driven population that ran notes its ring's next pending arrival; every
+            # consumer notes its sources' new runs (the spikes themselves its next run pulls)
+            for pop in pops:
+                if pop._event_driven and pop.incoming and pop.last_update == self.t:
+                    pop._note_pending_arrivals()
+            for pop in pops:
+                if pop.incoming:
+                    pop._intake(self.t)
+
+    def _plan_histories(self, pops) -> None:
+        """The emission histories' depth K, once, before the first round: a
+        source's history must keep every run its slowest consumer hasn't
+        read yet -- the most runs it makes between two of that consumer's
+        reads, + 2 (naer2/history.py). From the timesteps where both are
+        known: 2 + ceil(consumer timestep / source timestep); else 3 (every
+        population running every round). One K for the whole network (a
+        consumer's sources must share theirs); a population's own
+        history_depth overrides, an overrun still raises (check())."""
+        depth = 3
+        for pop in pops:
+            for conn in pop.incoming:
+                src = conn._source
+                if pop.timestep and src.timestep:
+                    depth = max(depth, 2 + math.ceil(pop.timestep / src.timestep - 1e-9))
+        for pop in pops:
+            pop._derived_depth = depth
 
     def _concurrently(self, work) -> None:
-        """Launch each population's work on its own CUDA stream, then make
-        the current stream wait on all of them: a device-side join, no
-        host sync. Kernel launches are still issued sequentially from the
-        host; only their execution overlaps."""
+        """Launch each population's work on its own CUDA stream: every
+        stream after what came before (one pre-made event recorded on the
+        current stream), the current stream after all of them (one pre-made
+        event per stream) -- a device-side join, no host sync. work: (pop,
+        fn(stream)); fn(None) runs on the current stream (CPU: in order)."""
         if self.device.type != "cuda":
             for _, fn in work:
-                fn()
+                fn(None)
             return
         main = torch.cuda.current_stream()
-        streams = []
+        if not hasattr(self, "_ready"):
+            self._ready = torch.cuda.Event()
+            self._done: dict = {}
+        self._ready.record(main)
+        launched = []
         for pop, fn in work:
             stream = self._streams.get(pop)
             if stream is None:
                 stream = self._streams[pop] = torch.cuda.Stream()
-            stream.wait_stream(main)
-            with torch.cuda.stream(stream):
-                fn()
-            streams.append(stream)
-        for stream in streams:
-            main.wait_stream(stream)
+                self._done[pop] = torch.cuda.Event()
+            stream.wait_event(self._ready)
+            fn(stream)
+            self._done[pop].record(stream)
+            launched.append(pop)
+        for pop in launched:
+            main.wait_event(self._done[pop])

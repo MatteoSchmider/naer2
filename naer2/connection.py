@@ -50,6 +50,7 @@ class ConnectionBuilder:
         self._source_map: dict[str, str | Set[str]] = None
         self._fabric_map: dict[str, str] = None
         self._delay: int | float | torch.Tensor = None
+        self._resolution: float | None = None
 
     # ------------------------------------------------------------------ properties
 
@@ -201,6 +202,12 @@ class ConnectionBuilder:
         return self.delay(value)
 
     @property
+    def resolution(self) -> float | None:
+        """The width its per-link delays are quantized at (delay buckets;
+        TODO.md 1c); None: the network's resolution."""
+        return self._resolution
+
+    @property
     def shape(self) -> tuple[int, ...]:
         if self._topology is None:
             raise ValueError("shape is not available before the target is set")
@@ -216,6 +223,12 @@ class Connection:
     def __setattr__(self, name, value):
         if name == "builder":
             object.__setattr__(self, name, value)
+            return
+        if name == "resolution":
+            # the delay quantization: the framework's own setting, never an edge attr
+            if value is not None and not (isinstance(value, (int, float)) and value > 0):
+                raise ValueError("resolution must be a positive number (or None: the network's)")
+            self.builder._resolution = float(value) if value is not None else None
             return
         if name == "delay":
             # delay is read directly off fabric by the framework itself

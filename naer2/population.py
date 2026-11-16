@@ -135,7 +135,10 @@ class Population:
         self._connected = False
         self.main_cap: int | None = None
         self.side_cap: int | None = None
-        self.history_depth: int = 3
+        # the emission history's depth; None: the network's derived one
+        # (Network._plan_histories), 3 without a network step
+        self.history_depth: int | None = None
+        self._derived_depth: int = 3
 
         self.network: Network = Network(self)
 
@@ -310,17 +313,15 @@ class Population:
         schedule a run at the source's earliest emission + the connection's
         minimum delay (later per-link arrivals are found by the update
         kernel)."""
-        new = []
-        for i, conn in enumerate(self.incoming):
+        for conn in self.incoming:
             source = conn._source
             if source._run_id == 0 or self._read_run.get(conn) == source._run_id:
                 continue
             self._read_run[conn] = source._run_id
-            n, earliest = source._emission_summary()
-            if n == 0:
-                continue
-            new.append(i)
-            if self._event_driven:
+            if not self._event_driven:
+                continue  # its own clock or its inputs' horizon runs it: no summary needed
+            n, earliest = source._emission_summary()  # a host sync (TODO.md 1e, D-13)
+            if n:
                 self._run_times.append(earliest + self._min_delay(conn))
         # (The spikes themselves: the fused kernel's pull takes them in at
         # this population's next run, straight from the sources' histories.)
@@ -337,13 +338,18 @@ class Population:
 
     def _min_delay(self, conn) -> float:
         """Smallest delay on `conn` (0.0 if it has none), cached: delays
-        are static and a per-link tensor can be very large."""
+        are static and a per-link tensor can be very large. A float32 tensor
+        holds ~7 significant digits: its minimum is read back to those (0.1
+        stays 0.1, not 0.10000000149 -- which would put this population's
+        runs a hair after its sources' and split every round in two)."""
         if conn not in self._min_delays:
             d = getattr(conn.fabric, "delay", None)
             if d is None:
                 self._min_delays[conn] = 0.0
             elif isinstance(d, torch.Tensor):
-                self._min_delays[conn] = float(d.min())
+                m = float(d.min())
+                self._min_delays[conn] = float(f"{m:.7g}") if d.dtype in (torch.float32, torch.float16,
+                                                                          torch.bfloat16) else m
             else:
                 self._min_delays[conn] = float(d)
         return self._min_delays[conn]
@@ -397,7 +403,7 @@ class Population:
             return arrival
         return math.inf
 
-    def _execute_update_kernel(self, t: float) -> None:
+    def _execute_update_kernel(self, t: float, stream=None) -> None:
         """Offered every round's time t by Network.step(); runs only if t is
         this population's own next run time. The run's window ends at
         t + timestep for a clocked population, else at its input bound."""
@@ -413,7 +419,26 @@ class Population:
             r for r in self._run_times if r > window_end and not _same_time(r, window_end)
         ]
 
-        self.run(t, window_end, round_id=getattr(self.network, "round_id", None))
+        self.run(t, window_end, round_id=self.network.round_id, stream=stream)
+
+    def _note_pending_arrivals(self) -> None:
+        """An event-driven population runs when an arrival is due: its ring
+        knows the next one after a run -- the first slot still holding
+        records (later per-link arrivals of spikes already taken in). A run
+        at that slot's end is the first that can deliver it. One readback of
+        the ring's counts (the host sync event-driven scheduling has anyway,
+        TODO.md 1e, D-13) -- after the round's join (Network.step): the run
+        is on this population's stream."""
+        if self._runtime is None:
+            return  # no kernel ran: nothing pending
+        ring = self._runtime.ring
+        pending = (ring.main_count + ring.side_count).view(ring.n_groups, ring.n_slots).amax(0).tolist()
+        for k in range(ring.ring_pos, ring.ring_pos + ring.n_slots):
+            if pending[k % ring.n_slots]:
+                arrival = (k + 1) * ring.slot_width
+                if arrival not in self._run_times:
+                    self._run_times.append(arrival)
+                return
 
     # ------------------------------------------------------------------ the fused kernel's runtime
 
@@ -443,19 +468,20 @@ class Population:
         self._ensure_on_device(device)
         kernel = self.fused_kernel()
         self._runtime = PopulationRuntime(kernel, len(self.shape), group_size=self.group_size,
-                                          depth=self.history_depth, device=device,
+                                          depth=self.history_depth or self._derived_depth, device=device,
                                           state={a: getattr(self, a) for a in kernel.attrs})
+
+    def _resolution(self, conn) -> float:
+        """A connection's delay quantization: its own, else the network's."""
+        return conn.resolution if conn.resolution is not None else self.network.resolution
 
     def _slot_width(self) -> float:
         """The ring's slot width: the finest resolution its incoming
-        connections require (TODO.md 1e, D-12) -- for now the population's
-        delay_resolution (step 4 of the runtime integration derives it)."""
+        connections require (TODO.md 1e, D-12; population.delay_resolution
+        overrides); without incoming connections the network's."""
         if self.delay_resolution is not None:
             return float(self.delay_resolution)
-        if not self.incoming:
-            return float(self.timestep) if self.timestep else 0.1
-        raise ValueError(f"{type(self.instance).__name__} population needs its ring's slot width: set "
-                         f"population.delay_resolution")
+        return min((self._resolution(c) for c in self.incoming), default=self.network.resolution)
 
     def _ensure_runtime(self) -> None:
         """Every runtime of the population and its sources created, then
@@ -473,7 +499,7 @@ class Population:
             conn._source._create_runtime(device)
             sources.append(conn._source._runtime)
             topologies.append(conn.fabric.simulation(
-                len(self.shape), self.group_size, device, resolution=w,
+                len(self.shape), self.group_size, device, resolution=self._resolution(conn),
                 attrs=[kernel.edge_attr] if kernel.edge_attr is not None else []))
         # the ring covers the longest incoming delay (its bucket mean) and one run's window ahead
         longest = max((float(t.bucket_mean.max()) for t in topologies), default=0.0)

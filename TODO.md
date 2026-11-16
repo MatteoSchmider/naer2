@@ -1265,7 +1265,20 @@ propagation** (formerly also called "Part 1/Part 2" in the template docstrings).
    comes from `network.round_id` if Network sets it (4), the old
    `compile()` (AST) stays for its tests (6); 4. Network: the new
    horizon-based scheduling integrated itself (rounds, event hub), free to
-   rewrite parts of 1-3; 5. sizing defaults; 6. the old path's code, tests
+   rewrite parts of 1-3 -- done 2026-11-16: `Network.step` hands out
+   round ids (`network.round_id`), launches each round's runs on per-
+   population streams through pre-made events, then does the host side
+   after the join (an event-driven population's next pending arrival from
+   its ring's counts; intake reads a source's summary only for event-driven
+   consumers -- PD14 has no host sync per round). Slot width: the finest
+   `Connection.resolution` among a population's incoming connections
+   (unset: `Network.resolution`, 0.1), `delay_resolution` overrides; each
+   connection's delays bucketed at its own resolution. History depth:
+   derived once (`Network._plan_histories`), 2 + ceil(consumer timestep /
+   source timestep) where both are known, else 3, one K network-wide
+   (`history_depth` overrides). A float32 minimum delay is read back to its
+   7 digits (else 0.10000000149 split every PD14 round in two). PD14
+   through `Network.step`: PD14's rates, 0.50 ms per round wall; 5. sizing defaults; 6. the old path's code, tests
    and the tools; 7. PD14 through Network.step against the harness.
 
    **Progress.** (2026-11-15) Pure moves done; template split done — the
