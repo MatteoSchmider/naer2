@@ -122,3 +122,25 @@ def test_group_directory_finds_every_source_group_range(group_size):
                 pair = offs[s] + earlier + bin(bits & ((1 << (g % 32)) - 1) & 0xFFFFFFFF).count("1")
                 segs = [seg_index[x] for x in by_pair[(s, g)]]
                 assert (first[pair], first[pair + 1]) == (min(segs), max(segs) + 1), (s, g)
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 64])
+@pytest.mark.parametrize("quantile", [False, True])
+def test_a_build_in_chunks_is_the_one_piece_build(monkeypatch, chunk, quantile):
+    """The build, write and read go a range of sources at a time (CHUNK_LINKS
+    links each, a source with more alone): every chunking gives the layout,
+    the bucket means and the attribute round trip of a one-chunk build."""
+    topo = _random_topology(40, 90, 25, seed=3)
+    delay = torch.rand(len(topo), generator=torch.Generator().manual_seed(4)) * 2.0 + 0.1
+    weight = torch.rand(len(topo), generator=torch.Generator().manual_seed(5))
+    q = dict(num_buckets=6) if quantile else dict(resolution=0.3)
+    whole = SimulationTopology(topo, 90, 16, "cpu", delay=delay, attrs={"weight": weight}, **q)
+    monkeypatch.setattr(SimulationTopology, "CHUNK_LINKS", chunk)
+    parts = SimulationTopology(topo, 90, 16, "cpu", delay=delay, attrs={"weight": weight}, **q)
+    assert len(parts._chunks) > 1
+    assert torch.equal(parts.buf, whole.buf) and torch.equal(parts.perm, whole.perm)
+    assert (parts.n_segments, parts.n_buckets, parts.d_min, parts.resolution) == \
+        (whole.n_segments, whole.n_buckets, whole.d_min, whole.resolution)
+    assert torch.equal(parts.read("weight"), weight)
+    parts.write("weight", weight * 2)
+    assert torch.equal(parts.read("weight"), weight * 2)

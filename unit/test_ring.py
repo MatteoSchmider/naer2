@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from naer2.ring import Ring
+from naer2.ring import POOL_RESERVE, Ring
 
 
 def test_run_capacity_must_be_a_multiple_of_4():
@@ -39,3 +39,48 @@ def test_growing_keeps_every_record_and_clamps_overflowing_counts():
             assert torch.equal(f_after.view(24, new_cap)[:, :old_cap], f_before.view(24, old_cap))
     with pytest.raises(ValueError, match="only grow"):
         ring.grow(main_cap=12)
+
+
+def test_a_pooled_ring_starts_with_its_reserve_per_main_run():
+    """Every main run holds POOL_RESERVE blocks (slot s of a group: blocks
+    s * R .. (s + 1) * R), the rest of every group's arena is free; side
+    runs hold none."""
+    R = POOL_RESERVE
+    ring = Ring(3, 8, 0.1, "cpu", pool=(4, 8 * R + 2))
+    assert (ring.main_cap, ring.side_cap, ring.arena) == ((8 * R + 2) * 4,) * 3  # a run can take the whole arena
+    assert ring.table[:, :R].flatten().tolist() == list(range(8 * R)) * 3 and bool((ring.table[:, R:] == -1).all())
+    assert ring.nblk.tolist() == [R] * 24 and bool((ring.side_table == -1).all())
+    assert ring.top.tolist() == [2, 2, 2] and ring.stack[1, :2].tolist() == [8 * R, 8 * R + 1]
+    with pytest.raises(ValueError, match="more blocks than slots"):
+        Ring(3, 8, 0.1, "cpu", pool=(4, 8 * R))
+
+
+def test_growing_a_pooled_ring_keeps_records_tables_and_free_blocks():
+    """Two groups: some blocks in use (in main and side tables, one missing:
+    -1), the rest free; doubling the arena keeps every run's records where
+    its table points and adds the new blocks to the free stacks."""
+    torch.manual_seed(1)
+    ring = Ring(2, 3, 0.1, "cpu", pool=(4, 8))
+    ring._records[0].copy_(torch.randint(0, 1000, ring._records[0].shape, dtype=torch.int32))
+    ring.table[0, :2] = torch.tensor([3, 1], dtype=torch.int32)  # group 0, slot 0: blocks 3, 1
+    ring.side_table[1, 0] = 0  # group 0, slot 1: side block 0
+    ring.table[4, :2] = torch.tensor([2, -1], dtype=torch.int32)  # group 1, slot 1: block 2, one lost
+    ring.main_count[0], ring.side_count[1], ring.main_count[4] = 7, 2, 6
+    ring.stack[0, :1] = torch.tensor([2], dtype=torch.int32)
+    ring.top[0] = 1  # group 0: block 2 free
+    ring.stack[1, :3] = torch.tensor([0, 1, 3], dtype=torch.int32)
+    ring.top[1] = 3  # group 1: blocks 0, 1, 3 free
+    nblk = ring.nblk.clone()
+    main_before, side_before = [f.clone() for f in ring.main], [f.clone() for f in ring.side]
+    ring.grow(pool_nb=16)
+    assert (ring.pool_nb, ring.arena) == (16, 64)
+    for before, after in ((main_before, ring.main), (side_before, ring.side)):
+        for f_before, f_after in zip(before, after):  # per cell: its first 32 records' views unchanged
+            assert torch.equal(f_after.view(6, 64)[:, :32], f_before.view(6, 32))
+    assert ring.table[0, :2].tolist() == [3, 1] and ring.table[4, :2].tolist() == [2, -1]
+    assert torch.equal(ring.nblk, nblk) and ring.top.tolist() == [9, 11]
+    assert sorted(ring.stack[0, :9].tolist()) == [2] + list(range(8, 16))
+    assert sorted(ring.stack[1, :11].tolist()) == [0, 1, 3] + list(range(8, 16))
+    assert (ring.main_count[0], ring.side_count[1], ring.main_count[4]) == (7, 2, 6)
+    with pytest.raises(ValueError, match="arena"):
+        ring.grow(pool_nb=8)

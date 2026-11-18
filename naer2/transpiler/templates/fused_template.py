@@ -43,7 +43,7 @@ FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "k_
               "t_start", "t_end", "trace_ptr")
 CONSTEXPRS = ("GROUP_SIZE", "K", "SK", "KP", "UNIFORM_SOURCES", "N_SLOTS", "MAIN_CAP", "SIDE_CAP", "LOG", "STREAM",
               "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "COUNT", "BATCH", "NSP", "TRACE",
-              "TRACE_CAP")
+              "TRACE_CAP", "POOL_B", "POOL_NB")
 DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "k_lo", "k_hi", "run_id", "round_id", "parity", "log_cap", "hist_cap")
 
 
@@ -257,7 +257,7 @@ def fused_kernel(
 
     n_ev = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace,
                  n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
-                 TRACE, TRACE_CAP)
+                 GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, POOL_NB)
 
     # the node attrs receive touches: the state through delivery
 {load_state}    state = {state_tuple}
@@ -267,7 +267,7 @@ def fused_kernel(
     state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                            n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive, GROUP_SIZE, N_SLOTS, MAIN_CAP,
                            SIDE_CAP, STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
-                           TRACE_CAP)
+                           TRACE_CAP, POOL_B, POOL_NB)
 {unpack}
     # the node attrs only update / send touch
 {load_later}

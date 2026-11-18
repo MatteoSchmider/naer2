@@ -113,14 +113,14 @@ def _expected_deliveries(topo: SimulationTopology, c: int, spikes, ring_pos: int
     return out
 
 
-def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n_targets):
+def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n_targets, group_size=GROUP_SIZE):
     pending = [d for run in expected_by_read for d in run]
     for r, delivered in enumerate(delivered_by_run):
         lo = due_until[r - 1] + 1 if r else -10**9
         want = sorted((k, e, c, s, tg) for k, e, c, s, tg, _ in pending if lo <= k <= due_until[r])
         assert sorted(delivered) == want, f"run {r}"
         for grp in range(consumer.n_groups):
-            order = [(k, e) for k, e, c, s, tg in delivered if tg // GROUP_SIZE == grp]
+            order = [(k, e) for k, e, c, s, tg in delivered if tg // group_size == grp]
             assert order == sorted(order), f"run {r}, group {grp}: not in slot then emission order"
     assert any(delivered_by_run), "nothing was delivered"
     sums = torch.zeros(n_targets, dtype=torch.float64)
@@ -133,10 +133,11 @@ def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n
     assert torch.allclose(consumer.received.cpu().double(), sums, atol=1e-4)
 
 
+@pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])  # pool: PROTOTYPE per-group arenas
 @pytest.mark.parametrize("consumer_first", [True, False])
 @pytest.mark.parametrize("long_segments", [False, True])
 @pytest.mark.parametrize("uniform", [True, False])
-def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first):
+def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first, pool):
     """Sources A, B -> consumer C (3 groups), six rounds, every population
     running once per round -- C before or after its sources within the round
     (the outcome must not depend on it: C only ever sees earlier rounds).
@@ -149,7 +150,7 @@ def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first):
     ]
     # run capacities count links (one ring record per link): emission-delayed spikes with long
     # segments put a few thousand links into a side run
-    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000, side_cap=4096)
+    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000, side_cap=4096, pool=pool)
 
     expected_by_read, delivered_by_run = [], []
     for r in range(6):
@@ -177,6 +178,38 @@ def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first):
         prev_spikes = [src.history.spikes(src.run_id) for src in (a, b)]
     due_until = [int(round((1.0 + 0.1 * r + 0.1) / 0.1)) - 1 for r in range(6)]
     _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, 96)
+
+
+@pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])
+@pytest.mark.parametrize("group_size", [256, 512])  # the link targets as bytes / as 16-bit halves
+@pytest.mark.parametrize("uniform", [True, False])
+def test_link_targets_at_either_width(uniform, group_size, pool):
+    """A consumer group's targets travel one byte each up to a group size
+    of 256, else two (SimulationTopology.target_bits, the kernel's from its
+    GROUP_SIZE): every link reaches the right target, up to a group's last
+    neuron."""
+    rng = random.Random(9)
+    n = 3 * group_size - 17  # a ragged last group
+    src = Pop(200, uniform=uniform)
+    consumer = commanded_runtime(n, group_size=group_size, device=DEVICE)
+    topo = _topology(src.n, n, group_size, delay="random", k=60, seed=12, weight=True)
+    assert topo.target_bits == (8 if group_size <= 256 else 16)
+    assert int(topo.link_target.to(torch.int32).max() & (0xFF if group_size <= 256 else 0xFFFF)) > group_size - 8
+    consumer.connect([src], [topo], n_slots=24, log_cap=100_000, side_cap=4096, pool=pool)
+    expected, delivered = [], []
+    for r in range(5):
+        t = round(1.0 + 0.1 * r, 6)
+        ring_pos = consumer.ring.ring_pos
+        before = len(consumer.deliveries())
+        consumer.run(t, t + 0.1, round_id=r)
+        delivered.append(consumer.deliveries()[before:])
+        if r:
+            expected.append(_expected_deliveries(topo, 0, prev, ring_pos, 0.1))
+        command(src, t, t + 0.1, _fire_pattern(src.n, t, t + 0.1, 0.3, rng), round_id=r)
+        prev = src.history.spikes(src.run_id)
+        consumer.check()
+    due_until = [int(round((1.0 + 0.1 * r + 0.1) / 0.1)) - 1 for r in range(5)]
+    _check_deliveries(consumer, expected, delivered[1:], due_until[1:], n, group_size)
 
 
 @pytest.mark.parametrize("depth", [4, 3])

@@ -56,3 +56,29 @@ interleaving got the locality instead).
 - `tl.histogram` compiles to LDS atomics (`ds_add_u32`); a one-hot
   compare-and-reduce over a tile compiles to long cross-lane shuffle
   chains -- categorically different code.
+
+## Synchronization (from the ring arenas, 2026-11-18)
+
+- **Any decision across warps is a synchronization.** A reduction over a
+  tile (`gl.max`, `gl.sum` of a tensor spread over warps) goes through LDS
+  with a barrier, and costs about as much as an explicit `gl.barrier()` --
+  not because of the instruction, but because the warps stop overlapping
+  their memory waits. A per-tile "does anyone need X" check cost ~2.5
+  Mcycles of a ~27 Mcycle PD14 round, as much as the barrier it guarded.
+  Decide from what every lane knows alone (here: the claim's atomic returns
+  the cell's block count with the count), or from values every warp reads
+  alike after a barrier that exists anyway.
+- **Gluon has no barrier-free way for one warp to wait for another.**
+  `gl.atomic_poll` waits for the whole block ("the block waits for all polls
+  to finish": a barrier after its loop; with acquire/release one before the
+  store too), and a scalar atomic is performed by one thread and broadcast
+  through LDS with a barrier -- so a hand-written `while` on
+  `gl.atomic_load` has barriers inside its loop. Only inline assembly could
+  spin per wave.
+- **Masked loads in the hot loop are expensive** when most lanes use them
+  (a branch, and the memory waits fall back to waiting for everything); a
+  load almost no lane needs, masked off, is cheap (the arenas' table reads
+  past a run's reserve).
+- **A dependent load per record doubles the round trips:** issue it with
+  the loads it doesn't depend on (the arenas' block ids with the link
+  targets), or avoid it (fixed reserved blocks: arithmetic addresses).

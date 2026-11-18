@@ -93,16 +93,22 @@ def test_a_population_without_connections():
     assert torch.all(T.next_spike >= 1.0) and T.next_spike is T.runtime.state["next_spike"]
 
 
-def test_a_full_ring_run_doubles_its_capacity():
-    """Main capacity 64 per (group, slot): the first burst overflows it --
-    a warning, its excess links lost, the capacity doubled before the next
-    run (no host sync: the flags' host copy) -- and a later, smaller burst
-    is delivered exactly."""
+@pytest.mark.parametrize("ring", ["cells", "arena"])
+def test_a_full_ring_run_doubles_its_capacity(ring):
+    """cells: main capacity 64 per (group, slot); arena: every group's
+    arena at its minimum (4-record blocks: per slot its reserved ones and a
+    partly used one). The first
+    burst overflows it -- a warning, its excess links lost, the capacity
+    doubled before the next run (no host sync: the flags' host copy) -- and
+    a later, smaller burst is delivered exactly."""
     src, dst, conn = _pair()
-    dst.main_cap = 64
+    if ring == "cells":
+        dst.ring_block, dst.main_cap = None, 64
+    else:
+        dst.ring_block, dst.ring_in_flight = 4, 0.0
     big = torch.rand(300, generator=torch.Generator().manual_seed(2)) < 0.3
-    small = torch.rand(300, generator=torch.Generator().manual_seed(3)) < 0.02
-    with pytest.warns(RuntimeWarning, match="main ring run overflowed"):
+    small = torch.rand(300, generator=torch.Generator().manual_seed(3)) < 0.01
+    with pytest.warns(RuntimeWarning, match="main ring run overflowed" if ring == "cells" else "ran out"):
         for r in range(8):
             t = round(1.0 + 0.1 * r, 6)
             src.fire_now = (big if r == 0 else small if r == 4 else torch.zeros(300, dtype=torch.bool)).float()
@@ -112,7 +118,13 @@ def test_a_full_ring_run_doubles_its_capacity():
                 torch.cuda.synchronize()
                 before = dst.runtime.n_received.cpu().long().clone()
     dst.check()  # nothing left flagged
-    assert dst.runtime.ring.main_cap == 128 and dst.runtime.growths[0][1:] == ("main", 128)
+    if ring == "cells":
+        assert dst.runtime.ring.main_cap == 128 and dst.runtime.growths[0][1:] == ("main", 128)
+    else:
+        from naer2.ring import POOL_RESERVE
+
+        n_slots = dst.runtime.ring.n_slots  # the minimum arena: per slot its reserved blocks and a partly used one
+        assert dst.runtime.growths[0][1:] == ("arena", 4 * 2 * (n_slots * (POOL_RESERVE + 1) + 1))
     count_big, _ = _expected(conn, big, 500)
     assert int(before.sum()) < int(count_big.sum())  # the overflowing run lost links
     count_small, _ = _expected(conn, small, 500)

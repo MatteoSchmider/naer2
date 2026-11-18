@@ -110,9 +110,10 @@ class PopulationRuntime:
         return self.kernel.uniform_emission
 
     def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
-                main_cap: int | None = None, side_cap: int | None = None):
+                main_cap: int | None = None, side_cap: int | None = None, pool: tuple[int, int] | None = None):
+        """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs."""
         caps = {k: v for k, v in (("main_cap", main_cap), ("side_cap", side_cap)) if v}
-        self.ring = Ring(self.n_groups, n_slots, slot_width, self.device, **caps)
+        self.ring = Ring(self.n_groups, n_slots, slot_width, self.device, pool=pool, **caps)
         self.wmark = torch.full((self.n_groups,), -math.inf, device=self.device)
         self.plan = FusedPlan([s.history for s in sources], topologies, self.n_groups, self.device)
         self.uniform_sources = all(s.uniform_emission for s in sources)
@@ -172,6 +173,17 @@ class PopulationRuntime:
         if not (main_full or side_full):
             return
         ring = self.ring
+        if ring.pool_b:  # pooled: the group arenas double
+            with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+                ring.grow(pool_nb=2 * ring.pool_nb)
+                ring.flags[0] = 0
+                ring.flags[3] = 0
+            self._launchers = {}
+            self.growths.append((self.run_id, "arena", ring.arena))
+            warnings.warn(f"a group's ring arena (or a slot's overflow log) ran out by run {self.run_id}: the links "
+                          f"it couldn't take were lost; the arenas double to {ring.arena} records", RuntimeWarning,
+                          stacklevel=3)
+            return
         main_cap = 2 * ring.main_cap if main_full else None
         side_cap = 2 * ring.side_cap if side_full else None
         with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
@@ -196,6 +208,7 @@ class PopulationRuntime:
             COUNT=self.count_received, BATCH=self.batch, NSP=p2(self.ring.n_slots),
             TRACE=self.trace.level if self.trace is not None else 0,
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
+            POOL_B=self.ring.pool_b, POOL_NB=self.ring.pool_nb,
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 

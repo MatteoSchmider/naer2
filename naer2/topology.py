@@ -197,6 +197,35 @@ class DelayBuckets:
         return len(self.mean)
 
 
+class _DelayGrid:
+    """A connection's delay quantization, from all its delays (see
+    delay_buckets): `raw(delays)` gives any subset of them its bucket on the
+    grid, before empty buckets are dropped -- so the links can be bucketed
+    a chunk at a time."""
+
+    def __init__(self, delay: torch.Tensor, resolution: float | None, num_buckets: int | None):
+        if (resolution is None) == (num_buckets is None):
+            raise ValueError("give exactly one of resolution or num_buckets")
+        self.d_min, self.d_max = float(delay.min()), float(delay.max())
+        self.resolution, self.num_buckets, self.bounds = resolution, num_buckets, None
+        if num_buckets is not None:
+            sorted_res = torch.sort(delay.to(torch.float64) - self.d_min).values
+            idx = (torch.arange(1, num_buckets, device=delay.device) * len(sorted_res)) // num_buckets
+            bounds = torch.unique(sorted_res[idx])
+            self.bounds = bounds[bounds > 0]
+
+    def raw(self, delay: torch.Tensor) -> torch.Tensor:
+        residual = delay.to(torch.float64) - self.d_min
+        if self.bounds is None:
+            return torch.floor(residual / self.resolution + 1e-9).to(torch.int64)
+        return torch.searchsorted(self.bounds.to(residual.device), residual, right=True)
+
+    def reported_resolution(self, n: int) -> float:
+        if self.num_buckets is None:
+            return self.resolution
+        return (self.d_max - self.d_min) / n if self.d_max > self.d_min else 0.0
+
+
 def delay_buckets(
     delay: torch.Tensor, resolution: float | None = None, num_buckets: int | None = None
 ) -> DelayBuckets:
@@ -215,26 +244,12 @@ def delay_buckets(
     num_buckets, `resolution` is the average bucket width). Empty buckets
     are dropped and the ids renumbered, so every bucket has links and a
     mean delay."""
-    if (resolution is None) == (num_buckets is None):
-        raise ValueError("give exactly one of resolution or num_buckets")
-    delay = delay.to(torch.float64)
-    d_min, d_max = float(delay.min()), float(delay.max())
-    residual = delay - d_min
-    if resolution is not None:
-        bucket = torch.floor(residual / resolution + 1e-9).to(torch.int64)
-    else:
-        sorted_res = torch.sort(residual).values
-        idx = (torch.arange(1, num_buckets, device=delay.device) * len(sorted_res)) // num_buckets
-        bounds = torch.unique(sorted_res[idx])
-        bounds = bounds[bounds > 0]
-        bucket = torch.searchsorted(bounds, residual, right=True)
-    used, bucket = torch.unique(bucket, return_inverse=True)
+    grid = _DelayGrid(delay, resolution, num_buckets)
+    used, bucket = torch.unique(grid.raw(delay), return_inverse=True)
     n = len(used)
-    mean = torch.zeros(n, dtype=torch.float64, device=delay.device).index_add_(0, bucket, delay)
+    mean = torch.zeros(n, dtype=torch.float64, device=delay.device).index_add_(0, bucket, delay.to(torch.float64))
     mean /= torch.bincount(bucket, minlength=n).to(torch.float64)
-    if num_buckets is not None:
-        resolution = (d_max - d_min) / n if d_max > d_min else 0.0
-    return DelayBuckets(bucket, mean.to(torch.float32), d_min, resolution)
+    return DelayBuckets(bucket, mean.to(torch.float32), grid.d_min, grid.reported_resolution(n))
 
 
 # ------------------------------------------------------------ simulation form
@@ -248,19 +263,16 @@ def delay_buckets(
 
 
 @triton.jit
-def topology_ptrs(buf, n_sources, n_segments, n_buckets, n_links):
+def topology_ptrs(buf, n_sources, n_segments):
     """Typed pointers into a SimulationTopology buffer: seg_offsets, seg_start,
-    seg_gb, bucket_mean, link_target (int16, read & 0xFFFF), attrs."""
+    seg_gb, bucket_mean (link_target and attrs: through the plan's addresses,
+    SimulationTopology.link_addresses -- the targets' width depends on the
+    group size)."""
     seg_offsets = buf
     seg_start = seg_offsets + n_sources + 1
     seg_gb = seg_start + n_segments + 1
     mean = seg_gb + n_segments
-    link_target = mean + n_buckets
-    attrs = link_target + (n_links + 1) // 2
-    return (
-        seg_offsets, seg_start, seg_gb, mean.to(tl.pointer_type(tl.float32)),
-        link_target.to(tl.pointer_type(tl.int16)), attrs.to(tl.pointer_type(tl.float32)),
-    )
+    return seg_offsets, seg_start, seg_gb, mean.to(tl.pointer_type(tl.float32))
 
 
 @triton.jit
@@ -291,11 +303,13 @@ class SimulationTopology:
       seg_gb      [n_segments]      (group << 16) | bucket -- read the group as
                                     (gb >> 16) & 0xFFFF (bit 31 may be set)
       bucket_mean [n_buckets]       mean delay of each bucket's links (float32)
-      link_target [n_links]         target within its group, uint16, two per word
+      link_target [n_links]         target within its group: uint8, four per word, for a
+                                    group size up to 256 (target_bits 8), else uint16, two per word
       attrs       [n_attrs, n_links] per-link attributes in simulation order (float32)
     Everything is linear in sources, segments and links -- nothing dense over
     (source, group, bucket). `perm` (simulation position -> canonical link) is
-    kept separately, for reading and writing attributes in canonical order.
+    kept separately, on the host: only reading and writing attributes in
+    canonical order needs it.
 
     topology      the canonical Topology (CSR, rows sorted by target)
     n_targets     target population size
@@ -322,47 +336,77 @@ class SimulationTopology:
         if group_size > 65536:
             raise ValueError("group_size must fit a uint16 target index (<= 65536)")
         self.group_size = group_size
+        self.target_bits = 8 if group_size <= 256 else 16  # the kernel's choice too (from its GROUP_SIZE)
         self.n_sources = len(topology.source_offsets) - 1
         self.n_groups = -(-n_targets // group_size)
         self.n_links = len(topology.target_indices)
         if self.n_groups >= 65536:
             raise ValueError("more than 65535 target groups don't fit the (group << 16 | bucket) packing")
 
-        offsets = topology.source_offsets.to(device)
-        target = topology.target_indices.to(device=device, dtype=torch.int64)
-        source = torch.repeat_interleave(torch.arange(self.n_sources, device=device), offsets.diff())
-        group = target // group_size
-
+        # Built a range of sources at a time (`_chunks`, ~CHUNK_LINKS links each): the simulation order is
+        # source-major like the canonical one, so a range of sources holds the same link range in both, and
+        # the build's link-sized temporaries (~90 bytes per link) stay bounded by the chunk, not the connection.
+        offsets = topology.source_offsets.cpu()
+        self._chunks = self._source_chunks(offsets)
+        self._link_chunks = [(int(offsets[s0]), int(offsets[s1])) for s0, s1 in self._chunks]
         if isinstance(delay, torch.Tensor):
-            db = delay_buckets(delay.to(device), resolution=resolution, num_buckets=num_buckets)
-            bucket, mean, self.d_min, self.resolution = db.bucket, db.mean, db.d_min, db.resolution
+            delay = delay.reshape(-1)
+            grid = _DelayGrid(delay, resolution, num_buckets)
+            counts = torch.zeros(0, device=device, dtype=torch.int64)
+            sums = torch.zeros(0, device=device, dtype=torch.float64)
+            for s0, s1 in self._chunks:  # pass 1: which buckets are used, and their mean delays
+                d = delay[offsets[s0]:offsets[s1]].to(device)
+                raw = grid.raw(d)
+                n = max(len(counts), int(raw.max()) + 1 if len(raw) else 0)
+                counts = torch.nn.functional.pad(counts, (0, n - len(counts)))
+                sums = torch.nn.functional.pad(sums, (0, n - len(sums)))
+                counts += torch.bincount(raw, minlength=n)
+                sums.index_add_(0, raw, d.to(torch.float64))
+                del d, raw
+            used = counts > 0
+            remap = torch.cumsum(used, 0) - 1  # grid bucket -> bucket id, empty buckets dropped
+            mean = (sums[used] / counts[used]).to(torch.float32)
+            self.d_min, self.resolution = grid.d_min, grid.reported_resolution(len(mean))
+            bucket_of = lambda l0, l1: remap[grid.raw(delay[l0:l1].to(device))]
         else:
             d = float(delay) if delay is not None else 0.0
-            bucket = torch.zeros(self.n_links, device=device, dtype=torch.int64)
             mean = torch.tensor([d], device=device, dtype=torch.float32)
             self.d_min, self.resolution = d, 0.0
+            bucket_of = lambda l0, l1: torch.zeros(l1 - l0, device=device, dtype=torch.int64)
         self.n_buckets = len(mean)
         if self.n_buckets >= 65536:
             raise ValueError("more than 65535 delay buckets don't fit the (group << 16 | bucket) packing")
 
-        # (source, group, bucket); canonical order is (source, target), so a
-        # stable sort keeps target order within every segment
-        key = (source * self.n_groups + group) * self.n_buckets + bucket
-        perm = torch.argsort(key, stable=True)
-        sorted_key = key[perm]
-        del key, source, group, bucket
-        first = torch.ones(self.n_links, device=device, dtype=torch.bool)
-        first[1:] = sorted_key[1:] != sorted_key[:-1]
-        seg_first = first.nonzero().flatten()
-        self.n_segments = len(seg_first)
-        seg_key = sorted_key[seg_first]
-        seg_source = seg_key // (self.n_groups * self.n_buckets)
-        seg_group = (seg_key // self.n_buckets) % self.n_groups
-        seg_bucket = seg_key % self.n_buckets
-        del sorted_key, first, seg_key
+        # pass 2, per chunk: (source, group, bucket); canonical order is (source, target), so a stable sort
+        # keeps target order within every segment
+        seg_counts, seg_starts, seg_gbs, link_targets, perms = [], [], [], [], []
+        for s0, s1 in self._chunks:
+            l0, l1 = int(offsets[s0]), int(offsets[s1])
+            target = topology.target_indices[l0:l1].to(device=device, dtype=torch.int64)
+            source = torch.repeat_interleave(torch.arange(s1 - s0, device=device), offsets[s0:s1 + 1].diff().to(device))
+            key = (source * self.n_groups + target // group_size) * self.n_buckets + bucket_of(l0, l1)
+            del source
+            perm = torch.argsort(key, stable=True)
+            sorted_key = key[perm]
+            del key
+            first = torch.ones(l1 - l0, device=device, dtype=torch.bool)
+            first[1:] = sorted_key[1:] != sorted_key[:-1]
+            seg_first = first.nonzero().flatten()
+            seg_key = sorted_key[seg_first]
+            del sorted_key, first
+            # each chunk's results wait on the host until the buffer (sized by the segment count) exists
+            seg_counts.append(torch.bincount(seg_key // (self.n_groups * self.n_buckets), minlength=s1 - s0).cpu())
+            seg_starts.append((seg_first + l0).to(torch.int32).cpu())
+            seg_gbs.append(((((seg_key // self.n_buckets) % self.n_groups) << 16) | (seg_key % self.n_buckets))
+                           .to(torch.int32).cpu())
+            link_targets.append((target[perm] % group_size).to(self._target_dtype).cpu())
+            perms.append((perm + l0).to(torch.int32).cpu())
+            del target, perm, seg_first, seg_key
+        self.n_segments = sum(len(x) for x in seg_starts)
 
         n_attr_words = len(attrs) * self.n_links
-        link_words = (self.n_links + 1) // 2
+        per_word = 32 // self.target_bits
+        link_words = (self.n_links + per_word - 1) // per_word
         size = (self.n_sources + 1) + (self.n_segments + 1) + self.n_segments + self.n_buckets + link_words + n_attr_words
         self.buf = torch.zeros(size, device=device, dtype=torch.int32)
         o = 0
@@ -370,17 +414,19 @@ class SimulationTopology:
         self.seg_start = self.buf[o:o + self.n_segments + 1]; o += self.n_segments + 1
         self.seg_gb = self.buf[o:o + self.n_segments]; o += self.n_segments
         self.bucket_mean = self.buf[o:o + self.n_buckets].view(torch.float32); o += self.n_buckets
-        self.link_target = self.buf[o:o + link_words].view(torch.int16)[: self.n_links]; o += link_words
+        self.link_target = self.buf[o:o + link_words].view(self._target_dtype)[: self.n_links]; o += link_words
         self._attr_offset = o
         attr_block = self.buf[o:o + n_attr_words].view(torch.float32).view(len(attrs), self.n_links)
 
-        self.seg_offsets.copy_(torch.searchsorted(seg_source, torch.arange(self.n_sources + 1, device=device)))
-        self.seg_start[: self.n_segments].copy_(seg_first)
+        if self._chunks:
+            self.seg_offsets[1:].copy_(torch.cumsum(torch.cat(seg_counts), 0))
+            self.seg_start[: self.n_segments].copy_(torch.cat(seg_starts))
+            self.seg_gb.copy_(torch.cat(seg_gbs))
+            self.link_target.copy_(torch.cat(link_targets))
         self.seg_start[self.n_segments] = self.n_links
-        self.seg_gb.copy_((seg_group << 16) | seg_bucket)
         self.bucket_mean.copy_(mean)
-        self.link_target.copy_((target[perm] % group_size).to(torch.int32).to(torch.int16))
-        self.perm = perm.to(torch.int32)
+        self.perm = torch.cat(perms) if perms else torch.zeros(0, dtype=torch.int32)  # host side
+        del seg_counts, seg_starts, seg_gbs, link_targets, perms
         self.attrs = {}
         for i, (name, values) in enumerate(attrs.items()):
             self.attrs[name] = attr_block[i]
@@ -432,22 +478,47 @@ class SimulationTopology:
             self._directory = (buf, n_pairs, W)
         return self._directory
 
+    def links_per_group(self) -> torch.Tensor:
+        """[n_groups] int64 (host): the links into every target group."""
+        group = ((self.seg_gb >> 16) & 0xFFFF).long()
+        return torch.bincount(group, weights=self.seg_start.diff().double(), minlength=self.n_groups).long().cpu()
+
     def link_addresses(self) -> tuple[int, int, int]:
         """Device addresses of seg_start, link_target and the attribute block
         (attribute i of link l at attrs + 4 * (i * n_links + l)), for kernels
         that keep them per connection instead of recomputing the layout."""
         return self.seg_start.data_ptr(), self.link_target.data_ptr(), self.buf.data_ptr() + 4 * self._attr_offset
 
+    CHUNK_LINKS = 1 << 22  # links per build / write / read chunk (see __init__)
+
+    @property
+    def _target_dtype(self):
+        return torch.uint8 if self.target_bits == 8 else torch.int16  # int16: a uint16's bits (read & 0xFFFF)
+
+    def _source_chunks(self, offsets: torch.Tensor) -> list[tuple[int, int]]:
+        """Source ranges of ~CHUNK_LINKS links each (a source with more is a chunk of its own)."""
+        chunks, s0, n = [], 0, self.n_sources
+        while s0 < n:
+            s1 = int(torch.searchsorted(offsets, offsets[s0] + self.CHUNK_LINKS, right=True)) - 1
+            s1 = min(max(s1, s0 + 1), n)
+            chunks.append((s0, s1))
+            s0 = s1
+        return chunks
+
     def write(self, name: str, canonical: torch.Tensor) -> None:
-        """Set a per-link attribute from canonical link order."""
+        """Set a per-link attribute from canonical link order (a chunk at a time)."""
         view = self.attrs[name]
-        view.copy_(canonical.to(device=view.device, dtype=torch.float32)[self.perm.to(torch.int64)])
+        canonical = torch.as_tensor(canonical)
+        for l0, l1 in self._link_chunks:  # the same link range in both orders
+            idx = (self.perm[l0:l1] - l0).long().to(canonical.device)
+            view[l0:l1] = canonical[l0:l1][idx].to(device=view.device, dtype=torch.float32)
 
     def read(self, name: str) -> torch.Tensor:
-        """A per-link attribute in canonical link order (a device gather)."""
+        """A per-link attribute in canonical link order (a device gather, a chunk at a time)."""
         view = self.attrs[name]
         out = torch.empty_like(view)
-        out[self.perm.to(torch.int64)] = view
+        for l0, l1 in self._link_chunks:
+            out[l0:l1][(self.perm[l0:l1] - l0).long().to(view.device)] = view[l0:l1]
         return out
 
     def segments(self) -> list[tuple[int, int, int, int, int]]:

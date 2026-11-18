@@ -40,9 +40,45 @@ comments; D-n are the decisions below.
   overflow), not with `AMD_SERIALIZE_KERNEL=3`, not with a synchronize
   before the growth; not reproduced on a small pair with 500 overflowing
   runs in a row. Probably many PD14 runs overflowing in a row (the item
-  above) -- revisit once that is fixed.
+  above) -- revisit once that is fixed. (Seen with the per-cell rings,
+  now `Population.ring_block = None`; PD14's default arenas don't
+  overflow.)
 - **A ring growth costs a recompile** (~1 s, PD14): the capacities are
-  constexprs.
+  constexprs (pooled: `POOL_NB`, and `MAIN_CAP` / `SIDE_CAP` from it).
+- **Ring arenas: sizing** (2026-11-18). Every group's main and side runs
+  in one arena of 256-record blocks (`naer2/ring.py`, `fused.py`:
+  `_append_links`, `_pool_fixup`, `_free_blocks`); PD14 runs as fast as
+  with per-cell rings in quiet activity and ~6% faster through the
+  volley, spike-for-spike identical, 1.36 GB of rings against 2.32 GB.
+  The sizes are still constants, and the arena is sized for the volley
+  all the time:
+  - the arena: `Population.ring_in_flight` (1/8) of the largest group's
+    incoming links + per slot its reserve and a partly used block -- E_4
+    ~108k records per group, while quiet activity keeps ~2k live and the
+    volley peaks at ~65k. Derive the need from Little's law (live records
+    ~ arrival rate x mean delay: a slot's fill is the delay distribution's
+    survival function, see the PD14 ring occupancy map), and grow and
+    shrink at runtime with headroom and hysteresis (e.g. +50% on growth,
+    shrink only below half the current size), from a rough base estimate.
+  - the per-cell overflow log: half an arena over the slots (PD14: one
+    cell grows by up to ~1400 records in one volley run, ~80 in quiet
+    ones) -- most of the memory beyond the arenas themselves; size it
+    from the expected per-run growth instead.
+  - the reserve: `ring.POOL_RESERVE` = 2 blocks per main run (PD14's quiet
+    slots end with ~220-360 records: 512 covers them, a quiet run hardly
+    ever overflows) -- derive per population from the same estimate.
+  - a run holds at most `ring.POOL_MAX_BLOCKS` = 2047 blocks (the packed
+    claim counter's field).
+- **Ring arenas: clean-up**. The implementation grew through several
+  optimizations, each measured (reserve, fixed reserved blocks, the
+  packed claim counter, the per-cell overflow log, the barrier-free
+  freeing) -- consolidate it before sizing: the ring layout is computed
+  twice (`Ring._allocate` and `_ring`, including the log records' index),
+  the general (non-uniform) pull still allocates per record through
+  `_take_block` with barriers, the `lost` path (missing blocks, compacted
+  freeing) is only exercised by the tests, `Population.main_cap` /
+  `side_cap` apply to per-cell rings only, and the tools' options follow
+  the experiments (`tools/pd14_network.py`, `tools/trace_network.py`).
 - **Gaps**, each a failing test until closed (the generator raises
   NotImplementedError naming the decision, or the values are wrong), each
   checking the closed behaviour end to end:

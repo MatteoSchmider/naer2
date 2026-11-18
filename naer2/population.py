@@ -88,11 +88,19 @@ class Population:
         # run: the kernel generated from this population's hooks
         # (fused_kernel()), its dynamic attrs as the runtime's state (the
         # same tensors), its history, ring and plan of incoming
-        # connections. main_cap / side_cap / history_depth: the ring's run
-        # capacities and the history's depth (None: their defaults).
+        # connections.
+        # The ring (naer2/ring.py): every group's runs in one arena of
+        # ring_block-record blocks, holding ring_in_flight of the group's
+        # incoming links at once (the largest group's; + per slot its reserved
+        # blocks and a partly used one), doubling when it runs out. PD14's peak, its
+        # thalamic volley: 5-11% of a group's incoming links in flight.
+        # ring_block None: per-cell runs of main_cap / side_cap records
+        # (None: their defaults) instead.
         self._fused = None
         self._runtime = None
         self._connected = False
+        self.ring_block: int | None = 256
+        self.ring_in_flight: float = 1 / 8
         self.main_cap: int | None = None
         self.side_cap: int | None = None
         # the emission history's depth; None: the network's derived one
@@ -337,6 +345,18 @@ class Population:
             return float(self.delay_resolution)
         return min((self._resolution(c) for c in self.incoming), default=self.network.resolution)
 
+    def _ring_pool(self, topologies, n_slots: int) -> tuple[int, int] | None:
+        """(block, blocks per group) of the ring's arenas (see __init__), None without ring_block."""
+        if not self.ring_block:
+            return None
+        n_groups = -(-len(self.shape) // self.group_size)
+        links = sum((t.links_per_group() for t in topologies), torch.zeros(n_groups, dtype=torch.int64))
+        from .ring import POOL_RESERVE
+
+        records = math.ceil(self.ring_in_flight * int(links.max())) if len(links) else 0
+        # + per slot its reserved blocks and one partly used one (see naer2/ring.py)
+        return self.ring_block, -(-records // self.ring_block) + n_slots * (POOL_RESERVE + 1) + 1
+
     def _ensure_runtime(self) -> None:
         """Every runtime of the population and its sources created, then
         this one connected: each incoming connection's SimulationTopology
@@ -360,7 +380,8 @@ class Population:
         window = self.timestep if self.timestep is not None else w
         n_slots = math.ceil(longest / w) + math.ceil(window / w) + 3
         caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
-        self._runtime.connect(sources, topologies, n_slots, slot_width=w, **caps)
+        self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, n_slots),
+                              **caps)
         self._connected = True
 
     def run(self, t_start: float, t_end: float, deliver_until: float | None = None, round_id: int | None = None,
