@@ -44,10 +44,19 @@ comments; D-n are the decisions below.
   arenas: spike-for-spike identical to per-cell rings, 0.42 GB of rings in
   quiet activity (1.36 GB fixed before), ~1.7 GB at the volley's peak.
   Left:
-  - the volley's growths: a resize copies the arena once (growing; a shrink
-    compacts), batched across populations behind one drain -- measured
-    cost in the volley below; arenas that grow by a segment instead of a
-    copy (a kernel change) would remove it.
+  - **segmented arena growth** (next for sizing): a resize copies the
+    arena once (growing; a shrink compacts), batched across populations
+    behind one drain. PD14 on the RX 6600, G=256 / 8 warps (2026-11-19),
+    the volley's first 200 rounds: 26 resizes in 8 batches, 92 ms (57 ms of
+    copies, up to 477 MB), ~1.03 ms a round against ~0.50 without them.
+    Instead: an arena of segments, a growth adding one (new block ids past
+    the old ones, onto the free stacks) and copying nothing -- the kernel
+    addresses a block through its segment (a block id's segment from its
+    high bits, or a small per-group segment table: one more lookup per
+    record address, issued with the block id's load; limitations.md, the
+    dependent loads), the reserve and the tables staying where they are; a
+    shrink still compacts (rare, in quiet activity). Also fewer drains: 8
+    batches are 8 waits for an idle device.
   - the per-cell overflow log: at least one block (256 records) per cell,
     most of the quiet-activity memory beyond the arenas; a per-group log
     would be smaller (a claim per record past the held blocks).
