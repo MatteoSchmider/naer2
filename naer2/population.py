@@ -83,6 +83,11 @@ class Population:
         self._run_id: int = 0
         self._read_run: dict = {}
         self._summary: tuple[int, int, float] | None = None
+        # The scheduler's hot path, fixed for one Network.step (_prepare_step): (connection, source, minimum
+        # delay) per incoming connection, event-driven, update() dynamics.
+        self._ins: list = []
+        self._is_event_driven: bool = False
+        self._autonomous: bool = False
 
         # The fused kernel's runtime (naer2/runtime.py), built on the first
         # run: the kernel generated from this population's hooks
@@ -159,6 +164,14 @@ class Population:
     def _event_driven(self) -> bool:
         return self.timestep is None and not self.has_autonomous_dynamics
 
+    def _prepare_step(self) -> None:
+        """Start of a Network.step: what its rounds look up constantly, cached for the step (incoming
+        connections, their sources and minimum delays; event-driven; update() dynamics) -- the scheduler's
+        Python is a good part of a round's host time."""
+        self._ins = [(c, c._source, self._min_delay(c)) for c in self.incoming]
+        self._is_event_driven = self._event_driven
+        self._autonomous = self.has_autonomous_dynamics
+
     def _emission_summary(self) -> tuple[int, float]:
         """(number of spikes, earliest emission time) of this population's
         last run: its history's header, read back once per run and shared by
@@ -178,16 +191,16 @@ class Population:
         schedule a run at the source's earliest emission + the connection's
         minimum delay (later per-link arrivals are found by the update
         kernel)."""
-        for conn in self.incoming:
-            source = conn._source
-            if source._run_id == 0 or self._read_run.get(conn) == source._run_id:
+        read = self._read_run
+        for conn, source, min_delay in self._ins:
+            if source._run_id == 0 or read.get(conn) == source._run_id:
                 continue
-            self._read_run[conn] = source._run_id
-            if not self._event_driven:
+            read[conn] = source._run_id
+            if not self._is_event_driven:
                 continue  # its own clock or its inputs' horizon runs it: no summary needed
             n, earliest = source._emission_summary()  # a host sync (TODO.md, D-13)
             if n:
-                self._run_times.append(earliest + self._min_delay(conn))
+                self._run_times.append(earliest + min_delay)
         # (The spikes themselves: the fused kernel's pull takes them in at
         # this population's next run, straight from the sources' histories.)
 
@@ -222,9 +235,9 @@ class Population:
     def _reset_horizon(self) -> None:
         """Start of a round's horizon fixed point: derived values restart at
         inf and only shrink while relaxing (see Network.step)."""
-        if self.incoming:
+        if self._ins:
             self._bound = math.inf
-        if self._event_driven and self.last_update != -math.inf:
+        if self._is_event_driven and self.last_update != -math.inf:
             self._horizon = math.inf
 
     def _relax_horizon(self) -> bool:
@@ -233,12 +246,13 @@ class Population:
         emits nothing before its earliest unprocessed arrival, so its own
         horizon is min(bound, earliest pending arrival). True if anything
         changed."""
-        bound = min(
-            (c._source._horizon + self._min_delay(c) for c in self.incoming),
-            default=math.inf,
-        )
+        bound = math.inf
+        for _conn, source, min_delay in self._ins:
+            b = source._horizon + min_delay
+            if b < bound:
+                bound = b
         horizon = self._horizon
-        if self._event_driven and self.last_update != -math.inf:
+        if self._is_event_driven and self.last_update != -math.inf:
             horizon = min(bound, min(self._run_times, default=math.inf))
         changed = bound != self._bound or horizon != self._horizon
         self._bound, self._horizon = bound, horizon
@@ -259,7 +273,7 @@ class Population:
             return 0.0
         if self.timestep is not None:
             return self._horizon
-        if self.has_autonomous_dynamics:
+        if self._autonomous:
             if self._bound > self._horizon and not _same_time(self._bound, self._horizon):
                 return max(self._horizon, self.network.t)
             return math.inf
@@ -278,7 +292,7 @@ class Population:
         self._run_id += 1
         window_end = t + self.timestep if self.timestep is not None else self._bound
         self._window = (t, window_end)
-        if not self._event_driven:
+        if not self._is_event_driven:
             self._horizon = window_end
         self._run_times = [
             r for r in self._run_times if r > window_end and not _same_time(r, window_end)
@@ -409,6 +423,9 @@ class Population:
         return self._runtime.emitted()
 
     def __setattr__(self, name, value):
+        if name[0] == "_":  # the internal bookkeeping (the scheduler sets these every round): never a dynamic attr
+            object.__setattr__(self, name, value)
+            return
         # a dynamic attr assigned once the runtime exists: the runtime's state follows (same tensor)
         runtime = self.__dict__.get("_runtime")
         if runtime is not None and name in runtime.state:

@@ -83,6 +83,25 @@ def _direct_launch(kernel, n_programs, consts):
     return launch
 
 
+def _warp_cap(device) -> int:
+    """The most warps a program gets by default on this device: 8 with 12 or more multiprocessors as torch
+    counts them (RDNA: work-group processors, two CUs each; NVIDIA: SMs), else 4. PD14 at G=256, quiet: the
+    RX 6600 (14 WGPs) ~280 us a round at 8 warps against ~465 at 4; the 780M (6 WGPs) ~425 at 4 against ~470
+    at 8 -- a full small GPU gains no latency hiding from more waves, and every
+    barrier waits for more of them. A threshold from two devices: TODO.md (an automatic, device-dependent
+    group size; a calibration at startup could replace it)."""
+    if device.type != "cuda":
+        return 4
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _WARP_CAPS:
+        units = torch.cuda.get_device_properties(index).multi_processor_count
+        _WARP_CAPS[index] = 8 if units >= 12 else 4
+    return _WARP_CAPS[index]
+
+
+_WARP_CAPS: dict = {}
+
+
 class _Launches:
     """Every runtime's launches on one device, in launch order, each kept until its run is known complete
     (its status judged: every group done), and the stop word ctl the kernels share: a run whose ring is too
@@ -188,6 +207,7 @@ class PopulationRuntime:
         self.count_received = False
         self.stream_block, self.unroll = WALK["stream"], WALK["unroll"]
         self.waves_per_eu = 0
+        self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
@@ -237,12 +257,14 @@ class PopulationRuntime:
         # the most blocks / log records any run needed, and the runs judged, since the last shrink check
         self._window = [0, 0, 0]
 
-    def run(self, t_start, t_end, deliver_until=None, round_id=None, num_warps=4, stream=None):
+    def run(self, t_start, t_end, deliver_until=None, round_id=None, num_warps=None, stream=None):
         """One run over [t_start, t_end) in round `round_id` (default: the
         run id): take in what the sources emitted in earlier rounds, deliver
         every ring slot that ends by `deliver_until` (default t_end), update,
         send, emit. stream: a torch.cuda.Stream to launch on (default: the
-        current one)."""
+        current one). num_warps: default one lane per neuron, up to 8 warps;
+        never more lanes than the group has neurons (see _warps)."""
+        num_warps = self._warps(num_warps)
         self._judge_pending(stream, wait=False)
         cuda = self.device.type == "cuda"
         if cuda:
@@ -260,6 +282,25 @@ class PopulationRuntime:
         if cuda:
             self._launches.journal[(id(self), self.run_id)] = (self, params)
             self._pending.append(self.run_id)
+
+    def _warps(self, num_warps: int | None) -> int:
+        """A program's warps: one lane per neuron of its group, up to max_warps (None: the device's cap,
+        _warp_cap). More lanes than neurons put
+        every neuron's values in several lanes (a replicated layout), and the kernel's emission then
+        intermittently lost spikes (PD14 at G=64 with 4 warps: a spike's slot in the history left unwritten,
+        found as the uniform contract's flag; limitations.md) -- so it isn't allowed. Fewer lanes than
+        neurons serialize each lane's neurons and leave fewer waves to hide the memory round trips: PD14 on
+        the RX 6600 in quiet activity, G=256 at 4 warps ~465 us a round (GPU-bound), at 8 ~280 (host-bound);
+        G=512 at 16 warps ~620 (1024-thread programs: fewer resident per CU). Where more warps stop paying
+        depends on the device (_warp_cap)."""
+        cap = self.max_warps if self.max_warps is not None else _warp_cap(self.device)
+        most = max(1, min(cap, self.group_size // 32))
+        if num_warps is None:
+            return most
+        if 32 * num_warps > self.group_size and num_warps > 1:
+            raise ValueError(f"{num_warps} warps are more lanes than a group of {self.group_size} neurons "
+                             f"(at most {most}: a replicated layout loses spikes, see PopulationRuntime._warps)")
+        return num_warps
 
     def _launch(self, params, stream) -> None:
         """One run's kernel launch (run(); a rerun: _Launches.recover)."""
@@ -289,8 +330,9 @@ class PopulationRuntime:
     # ---- the ring's status and size (see the module docstring)
 
     def _landed(self, run_id: int) -> bool:
-        """Every group of run run_id wrote its done word (finished or stopped) into the run's host slot."""
-        return bool((np.abs(self._status_np[run_id % self.status_slots, :, 3]) == run_id).all())
+        """Every group of run run_id wrote its done word (finished or stopped) into the run's host slot
+        (fused.py: _run_status -- 2 run_id, + 1 if stopped; the slot's earlier runs wrote less)."""
+        return int(self._status_np[run_id % self.status_slots, :, 3].min()) >= 2 * run_id
 
     def _wait_landed(self, run_id: int) -> None:
         """Until run run_id's status has landed: polling the host slot a little, then waiting for the device
@@ -316,21 +358,22 @@ class PopulationRuntime:
         run, or a main run / arena out of room: it takes room one record at a time and can't stop) double
         that size."""
         self._wait_landed(run_id)
-        status, ring = self._status_np[run_id % self.status_slots], self.ring
-        if (status[:, 3] < 0).any():
+        ring = self.ring
+        # per column, the most any group wrote: blocks held, records logged, lost bits (any), done (odd: stopped)
+        blocks, most, lost, done = (int(v) for v in self._status_np[run_id % self.status_slots].max(0))
+        if done & 1:
             self._launches.recover()
             return
         self._launches.journal.pop((id(self), run_id), None)
-        main_full, side_full = bool((status[:, 2] & 1).any()), bool((status[:, 2] & 2).any())
+        main_full = side_full = lost > 0  # (the general pull: either kind grows)
         if not ring.pool_b:
-            longest = int(status[:, 0].max())
+            longest = blocks
             main_cap = ring.main_cap
             if longest * self.grow_at > main_cap or main_full:
                 main_cap = max(-(-math.ceil(longest * self.grow_to) // 4) * 4, 2 * main_cap if main_full else 0)
             if main_cap != ring.main_cap or side_full:
                 self._grow_cells(main_cap, 2 * ring.side_cap if side_full else None, run_id, main_full or side_full)
             return
-        blocks, most = int(status[:, 0].max()), int(status[:, 1].max())
         if main_full:  # (the general pull: the arena ran out, links lost)
             blocks = max(blocks, 2 * ring.pool_nb)
         w = self._window

@@ -82,3 +82,28 @@ interleaving got the locality instead).
 - **A dependent load per record doubles the round trips:** issue it with
   the loads it doesn't depend on (the arenas' block ids with the link
   targets), or avoid it (fixed reserved blocks: arithmetic addresses).
+
+## Replicated layouts (2026-11-19)
+
+- **No more lanes than a group has neurons.** With G < 32 x warps every
+  neuron's values live in several lanes (a replicated layout). PD14 at G=64
+  with 4 warps then intermittently lost spikes in `_emit_spikes`: a
+  program claimed its place in the history (the count atomic) but none of
+  its lanes stored -- its firing lane saw a different position or base than
+  the one claimed -- so the slot kept an older run's entry there (found as
+  the uniform contract's flag: a consumer took a spike below its
+  watermark). Timing-dependent (more often with the host ahead and the
+  populations' kernels overlapping), never with 2 warps (8 of 8 runs clean,
+  against about 1 in 2 with 4); barriers around the count atomic didn't
+  help. Not pinned to one op -- the cumsum over the replicated layout
+  (shared memory a replica may read before its owner wrote it) is the
+  likeliest. `PopulationRuntime._warps` derives the warps from the group
+  size (one lane per neuron, up to 8 warps) and refuses more.
+- **Fewer lanes than neurons costs as much.** PD14 on the RX 6600, quiet:
+  G=256 at 4 warps (2 neurons per lane) ~465 us a round, GPU-bound; at 8
+  warps ~280, host-bound -- each lane's neurons are serial, and half the
+  waves hide the memory round trips (limit 1). G=512 at 16 warps ~620:
+  1024-thread programs, fewer resident per CU. Device-dependent: the 780M
+  (12 CUs) at G=256 is best at 4 warps (~425 us, ~470 at 8) --
+  `runtime._warp_cap`: 8 warps from 12 multiprocessors (RDNA: WGPs) up,
+  else 4.

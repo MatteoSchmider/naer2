@@ -78,6 +78,7 @@ class Network:
         pops = list(self.populations)
         for pop in pops:
             pop._check_schedulable()
+            pop._prepare_step()
         if not self._planned:
             self._plan_histories(pops)
             self._planned = True
@@ -111,10 +112,10 @@ class Network:
             # an event-driven population that ran notes its ring's next pending arrival; every
             # consumer notes its sources' new runs (the spikes themselves its next run pulls)
             for pop in pops:
-                if pop._event_driven and pop.incoming and pop.last_update == self.t:
+                if pop._is_event_driven and pop._ins and pop.last_update == self.t:
                     pop._note_pending_arrivals()
             for pop in pops:
-                if pop.incoming:
+                if pop._ins:
                     pop._intake(self.t)
 
     def _plan_histories(self, pops) -> None:
