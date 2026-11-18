@@ -91,11 +91,11 @@ class Population:
         # connections.
         # The ring (naer2/ring.py): every group's runs in one arena of
         # ring_block-record blocks, holding ring_in_flight of the group's
-        # incoming links at once (the largest group's; + per slot its reserved
-        # blocks and a partly used one), doubling when it runs out. PD14's peak, its
-        # thalamic volley: 5-11% of a group's incoming links in flight.
-        # ring_block None: per-cell runs of main_cap / side_cap records
-        # (None: their defaults) instead.
+        # incoming links at once (the largest group's; + per slot its
+        # reserved blocks and a partly used one), doubling when it runs out
+        # (PD14's thalamic volley: 5-11% of a group's incoming links in
+        # flight). main_cap / side_cap: with ring_block None only, per-cell
+        # runs of that many records (None: their defaults).
         self._fused = None
         self._runtime = None
         self._connected = False

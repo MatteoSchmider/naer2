@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from naer2.ring import POOL_RESERVE, Ring
+from naer2.ring import POOL_RESERVE, Ring, pool_log_cap
 
 
 def test_run_capacity_must_be_a_multiple_of_4():
@@ -22,7 +22,8 @@ def test_cells_and_flags_start_empty():
 def test_growing_keeps_every_record_and_clamps_overflowing_counts():
     torch.manual_seed(0)
     ring = Ring(3, 8, 0.1, "cpu", main_cap=8, side_cap=4)
-    ring.buf[:4 * 3 * 8 * (8 + 4)] = torch.randint(0, 1000, (4 * 3 * 8 * (8 + 4),), dtype=torch.int32)
+    for rec in ring._records:  # every main and side record
+        rec.copy_(torch.randint(0, 1000, rec.shape, dtype=torch.int32))
     ring.main_count.copy_(torch.randint(0, 12, (24,), dtype=torch.int32))  # some beyond the capacity: lost claims
     ring.side_count.copy_(torch.randint(0, 5, (24,), dtype=torch.int32))
     ring.watermark.fill_(1.5)
@@ -84,3 +85,19 @@ def test_growing_a_pooled_ring_keeps_records_tables_and_free_blocks():
     assert (ring.main_count[0], ring.side_count[1], ring.main_count[4]) == (7, 2, 6)
     with pytest.raises(ValueError, match="arena"):
         ring.grow(pool_nb=8)
+
+
+@pytest.mark.parametrize("pool", [None, (4, 40)], ids=["cells", "pooled"])
+def test_the_header_holds_every_region_s_offset(pool):
+    """_ring reads the layout from the buffer's header: it must name exactly where Ring's own views are."""
+    ring = Ring(3, 8, 0.1, "cpu", main_cap=8, side_cap=4, pool=pool)
+    h = ring.buf[:16].tolist()
+    at = lambda t: t.storage_offset()
+    assert h[0] == at(ring._records[0]) and h[1] == at(ring._records[1])
+    assert (h[2], h[3], h[4], h[5]) == (at(ring.main_count), at(ring.side_count), at(ring.watermark), at(ring.flags))
+    assert all(x % 4 == 0 for x in (h[0], h[1]))  # records on 16-byte boundaries
+    if pool:
+        assert (h[6], h[7], h[8], h[9], h[10], h[11]) == (at(ring.table), at(ring.side_table), at(ring.stack),
+                                                          at(ring.top), at(ring.nblk), at(ring.lost))
+        assert h[12] == (at(ring.log_rec) - h[0]) // 4 and at(ring.log_rec) % 4 == 0
+        assert h[13] == pool_log_cap(4, 40, 8) and len(ring.log_rec) == 24 * h[13]

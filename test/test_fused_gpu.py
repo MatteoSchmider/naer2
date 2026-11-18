@@ -133,7 +133,7 @@ def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n
     assert torch.allclose(consumer.received.cpu().double(), sums, atol=1e-4)
 
 
-@pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])  # pool: PROTOTYPE per-group arenas
+@pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])  # pool: per-group arenas (Ring)
 @pytest.mark.parametrize("consumer_first", [True, False])
 @pytest.mark.parametrize("long_segments", [False, True])
 @pytest.mark.parametrize("uniform", [True, False])

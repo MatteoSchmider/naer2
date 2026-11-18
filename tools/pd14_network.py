@@ -21,6 +21,11 @@ the trajectories part eventually) -- and the rates (Hz) over the whole run,
 the thalamic volley's window and before it.
 time: wall time per round, the path running freely (no readback) through
 `--rounds` rounds after --ms of simulated time (default: into the volley).
+
+Rings (the network path): the populations' default arenas (--block B
+records per block, 0: per-cell runs; --in-flight C: Population.ring_in_flight),
+or per-cell runs at the harness's capacities (--harness-caps: nothing is
+lost) or those scaled to the group size (--scaled-caps).
 """
 
 import argparse

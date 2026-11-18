@@ -5,7 +5,7 @@ transpiler/templates/fused.py).
 
 One ring per target GROUP (the neurons one program owns). Slot k of a
 group's ring covers arrivals in [k * slot_width, (k + 1) * slot_width) and
-lives at index k % N_SLOTS. Each slot holds
+lives at index k % N_SLOTS: its CELL. Each cell holds
   - a main run: records appended in emission order, and
   - a side run: out-of-order records (emission-delayed, or below the
     watermark), kept sorted by emission time by insertion.
@@ -16,12 +16,24 @@ the receive. A record goes to the main runs if e >= the watermark (largest
 e ever appended to a group's main runs) and it isn't emission-delayed (e
 before its source's run window end); otherwise to the side runs.
 
+Where the runs live, two ways:
+  - per-cell runs: every cell its own main_cap + side_cap records,
+    interleaved by cache line across cells (_rec)
+  - pooled (Population's default): every group's runs in one ARENA of
+    fixed-size blocks, a run taking blocks as it fills (its block table)
+    and giving them back when delivered (a free stack per group). A main
+    run keeps POOL_RESERVE blocks for good, fixed by its slot -- in quiet
+    activity a run hardly ever outgrows them, so records go where plain
+    arithmetic says. Past them, the pull writes into the cell's overflow
+    log and moves the records into new blocks once, after its last barrier
+    (fused.py: _append_links, _pool_fixup).
+
 An arrival before the ring position (already delivered) goes into the first
 undelivered slot (late, the timestep quantization); one at or past ring
 position + N_SLOTS is far future (flag 1, not implemented yet); a full main
-run sets flag 0, a full side run flag 3 (its links are lost: the runtime
-doubles that capacity, grow()); a uniform-emission run that would need a
-side run sets flag 2.
+run (pooled: an arena or a cell's log out of room) sets flag 0, a full side
+run flag 3 -- their links are lost, and the runtime grows the ring, grow();
+a uniform-emission run that would need a side run sets flag 2.
 """
 
 import torch
@@ -61,47 +73,32 @@ def _f32(p):
     return p.to(tl.pointer_type(tl.float32))
 
 
+# The buffer's layout lives in one place, Ring._allocate: the header (its first _HEADER words) holds every
+# region's word offset, which _ring reads -- the regions, in this order (pooled: the side records are the
+# arena too, and the tables, free stacks, block counts, lost flag and overflow logs exist):
+_REGIONS = ("main records", "side records", "main counts", "side counts", "watermark", "flags", "main tables",
+            "side tables", "free stacks", "stack tops", "block counts", "lost", "log records")
+_HEADER = 16
+
+
 @triton.jit
 def _ring(ring, n_groups, N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
           POOL_B: tl.constexpr, POOL_NB: tl.constexpr):
-    """Typed pointers into a Ring buffer, see Ring for the layout: the four
-    fields of a record -- time, source word, link index, target -- for the
-    main and the side runs (POOL_B > 0: both in the groups' arenas); the
-    per-cell counts; watermark and flags; then (POOL_B > 0) the cells' main
-    and side block tables, the groups' free stacks and their tops. Field f
-    of the record with index i (see _rec, _run_rec) is at field_ptr + 4 * i."""
-    cells = n_groups * N_SLOTS
-    main_time = ring
-    if POOL_B > 0:
-        side_time = ring  # one arena per group: main and side blocks alike
-        main_count = ring + 4 * n_groups * POOL_NB * POOL_B
-    else:
-        side_time = ring + 4 * cells * MAIN_CAP
-        main_count = side_time + 4 * cells * SIDE_CAP
-    side_count = main_count + cells
-    watermark = side_count + cells
-    flags = watermark + 1
-    table = flags + 4  # _N_FLAGS
-    if POOL_B > 0:
-        side_table = table + cells * POOL_NB
-        stack = side_table + cells * POOL_NB
-    else:
-        side_table = table
-        stack = table
-    top = stack + n_groups * POOL_NB
-    nblk = top + n_groups  # per cell: the blocks its main run holds (pooled)
-    lost = nblk + cells  # set once an arena ran out: tables (and so free stacks) may hold missing blocks (-1)
-    # per group and slot, the overflow log's records (fused.py, _pool_fixup) -- their index from the buffer's
-    # start (a record's place is one index either way), at a word divisible by 4
-    if POOL_B > 0:
-        log_rec = (4 * n_groups * POOL_NB * POOL_B + 2 * cells + 5 + 2 * cells * POOL_NB + n_groups * POOL_NB
-                   + n_groups + cells + 1 + 3) // 4
-    else:
-        log_rec = 0
+    """Typed pointers into a Ring buffer, from its header (Ring._allocate): the four fields of a record -- time,
+    source word, link index, target -- for the main and the side runs (field f of record i at field_ptr + 4 * i,
+    see _rec, _run_rec), the per-cell counts, watermark and flags, and (pooled) the cells' main and side block
+    tables, the groups' free stacks and their tops, the main runs' block counts, the lost flag, the
+    overflow logs' first record (an index from the main records, like any record's) and a cell's log's
+    capacity (pool_log_cap)."""
+    main_time = ring + tl.load(ring + 0)
+    side_time = ring + tl.load(ring + 1)
+    flags = ring + tl.load(ring + 5)
     return (
-        _f32(main_time), main_time + 1, main_time + 2, main_time + 3, main_count,
-        _f32(side_time), side_time + 1, side_time + 2, side_time + 3, side_count,
-        _f32(watermark), flags, table, side_table, stack, top, nblk, lost, log_rec,
+        _f32(main_time), main_time + 1, main_time + 2, main_time + 3, ring + tl.load(ring + 2),
+        _f32(side_time), side_time + 1, side_time + 2, side_time + 3, ring + tl.load(ring + 3),
+        _f32(ring + tl.load(ring + 4)), flags, ring + tl.load(ring + 6), ring + tl.load(ring + 7),
+        ring + tl.load(ring + 8), ring + tl.load(ring + 9), ring + tl.load(ring + 10), ring + tl.load(ring + 11),
+        tl.load(ring + 12), tl.load(ring + 13),
     )
 
 
@@ -117,17 +114,18 @@ def _rec(cell, pos, n_cells):
 
 class Ring:
     """One consumer's rings of arrival slots, one ring per target group
-    (see the module docstring), as one int32 buffer: per (group, slot) cell
-    a main run of MAIN_CAP records and a side run of SIDE_CAP, each one
-    16-byte record (time, (conn << 24) | source, link index, target),
-    interleaved by cache line across cells (see _rec); then main counts,
-    side counts, the watermark (float32) and the flags. Cell of (group g,
-    slot k): g * n_slots + k % n_slots. main / side: the four fields as
-    copies in run order, record pos of cell c at c * cap + pos (for
-    inspection and tests)."""
+    (see the module docstring), as one int32 buffer (layout: _allocate,
+    _REGIONS): the records, each 16 bytes (time, (conn << 24) | source, link
+    index, target) -- per-cell runs or the groups' arenas --, the main and
+    side counts, the watermark (float32) and the flags, and (pooled) the
+    block tables, free stacks, block counts and overflow logs. Cell of
+    (group g, slot k): g * n_slots + k % n_slots. main / side: the four
+    fields as copies in run order, record pos of cell c at c * cap + pos
+    (for inspection and tests)."""
 
     def __init__(self, n_groups: int, n_slots: int, slot_width: float, device,
-                 main_cap: int = DEFAULT_MAIN_CAP, side_cap: int = DEFAULT_SIDE_CAP, pool: tuple[int, int] | None = None):
+                 main_cap: int = DEFAULT_MAIN_CAP, side_cap: int = DEFAULT_SIDE_CAP,
+                 pool: tuple[int, int] | None = None):
         """pool: (block, blocks) -- every group's main and side runs in one arena of `blocks` blocks of
         `block` records, a run taking blocks as it fills (through its block table) and giving them back once
         delivered; a run can grow to the whole arena (main_cap, side_cap ignored). Every main run keeps
@@ -157,51 +155,49 @@ class Ring:
         return self.pool_b * self.pool_nb if self.pool_b else self.main_cap + self.side_cap
 
     def _allocate(self, main_cap: int, side_cap: int, device) -> None:
+        """The buffer: the header, then the regions (_REGIONS) -- record regions on 16-byte boundaries."""
         if self.pool_b:
             main_cap = side_cap = self._run_cap()
         self.main_cap, self.side_cap = main_cap, side_cap
-        cells = self.n_groups * self.n_slots
-        if self.pool_b:
-            m, s = self.n_groups * self.pool_nb * self.pool_b, 0
-            n_table, n_stack = cells * self.pool_nb, self.n_groups * self.pool_nb
-            log_cap = pool_log_cap(self.pool_b, self.pool_nb, self.n_slots)
-            n_top = self.n_groups + cells + 1
-            # (then the log's records: 4 words each, from a word index divisible by 4 -- see _ring)
-            pre = 4 * m + 2 * cells + 1 + _N_FLAGS + 2 * n_table + n_stack + n_top
-            n_top += (-pre) % 4 + 4 * cells * log_cap
-        else:
-            m, s = cells * main_cap, cells * side_cap
-            n_table = n_stack = n_top = 0
-        self.buf = torch.zeros(4 * m + 4 * s + 2 * cells + 1 + _N_FLAGS + 2 * n_table + n_stack + n_top,
-                               device=device, dtype=torch.int32)
-        self._records = (self.buf[:4 * m].view(m, 4), self.buf[4 * m:4 * m + 4 * s].view(s, 4))
-        o = 4 * m + 4 * s
-        self.main_count = self.buf[o:o + cells]
-        self.side_count = self.buf[o + cells:o + 2 * cells]
-        self.watermark = self.buf[o + 2 * cells:o + 2 * cells + 1].view(torch.float32)
-        o += 2 * cells + 1
-        self.flags = self.buf[o:o + _N_FLAGS]
-        o += _N_FLAGS
-        if self.pool_b:
-            self.table = self.buf[o:o + n_table].view(cells, self.pool_nb)
-            self.side_table = self.buf[o + n_table:o + 2 * n_table].view(cells, self.pool_nb)
-            o += 2 * n_table
-            self.stack = self.buf[o:o + n_stack].view(self.n_groups, self.pool_nb)
-            self.top = self.buf[o + n_stack:o + n_stack + self.n_groups]
-            o2 = o + n_stack + self.n_groups
-            self.nblk = self.buf[o2:o2 + cells]
-            self.lost = self.buf[o2 + cells:o2 + cells + 1]  # see _ring
-            lr = o2 + cells + 1
-            lr += (-lr) % 4
-            self.log_rec = self.buf[lr:lr + 4 * cells * log_cap].view(-1, 4)
+        cells, g = self.n_groups * self.n_slots, self.n_groups
+        pooled = bool(self.pool_b)
+        m = g * self.pool_nb * self.pool_b if pooled else cells * main_cap
+        log_cap = pool_log_cap(self.pool_b, self.pool_nb, self.n_slots) if pooled else 0
+        words = {"main records": 4 * m, "side records": 0 if pooled else 4 * cells * side_cap,
+                 "main counts": cells, "side counts": cells, "watermark": 1, "flags": _N_FLAGS,
+                 "main tables": cells * self.pool_nb if pooled else 0,
+                 "side tables": cells * self.pool_nb if pooled else 0,
+                 "free stacks": g * self.pool_nb if pooled else 0, "stack tops": g if pooled else 0,
+                 "block counts": cells if pooled else 0, "lost": 1 if pooled else 0,
+                 "log records": 4 * cells * log_cap}
+        off, o = {}, _HEADER
+        for name in _REGIONS:
+            if name.endswith("records"):
+                o += (-o) % 4
+            off[name] = o
+            o += words[name]
+        if pooled:
+            off["side records"] = off["main records"]  # one arena per group: main and side blocks alike
+        self.buf = torch.zeros(o, device=device, dtype=torch.int32)
+        header = [off[n] for n in _REGIONS[:-1]] + [(off["log records"] - off["main records"]) // 4, log_cap]
+        self.buf[:len(header)] = torch.tensor(header, dtype=torch.int32)
+        view = lambda name, *shape: self.buf[off[name]:off[name] + words[name]].view(*shape)
+        self._records = (view("main records", -1, 4), view("main records" if pooled else "side records", -1, 4))
+        self.main_count, self.side_count = view("main counts", -1), view("side counts", -1)
+        self.watermark = view("watermark", -1).view(torch.float32)
+        self.flags = view("flags", -1)
+        if pooled:
+            self.table, self.side_table = view("main tables", cells, -1), view("side tables", cells, -1)
+            self.stack, self.top = view("free stacks", g, -1), view("stack tops", -1)
+            self.nblk, self.lost = view("block counts", -1), view("lost", -1)
+            self.log_rec = view("log records", -1, 4)
             self.table.fill_(-1)
             self.side_table.fill_(-1)
             # every main run its reserved blocks (slot s of a group: blocks s * R .. (s + 1) * R), the rest free
             R = POOL_RESERVE
             self.table[:, :R] = torch.arange(self.n_slots * R, device=device, dtype=torch.int32).view(
-                self.n_slots, R).repeat(self.n_groups, 1)
+                self.n_slots, R).repeat(g, 1)
             self.nblk.fill_(R)
-            self.stack.zero_()
             free = self.pool_nb - self.n_slots * R
             self.stack[:, :free] = torch.arange(self.n_slots * R, self.pool_nb, device=device, dtype=torch.int32)
             self.top.fill_(free)

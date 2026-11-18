@@ -21,11 +21,13 @@ arguments, then its constexprs (+ the kernel's own, FusedKernel.consts).
               runs of earlier rounds taken in, every slot due by
               deliver_until delivered, update, send, emission
 
-Ring capacity: a run kind (main, side) that overflows -- its claims beyond
-the capacity lose their links -- doubles before the next run. No host sync:
-every run copies its ring's flags into pinned host memory on its stream,
-the next run looks at that copy once it has landed (check() waits for it).
-The overflowing run's lost links are reported with a warning.
+Ring capacity: a ring that ran out -- per-cell runs: a run kind (main,
+side) past its capacity; pooled: a group's arena or a cell's overflow log
+-- lost the links it couldn't take, and grows before the next run (the
+run kind's capacity, or every arena, doubles). No host sync: every run
+copies its ring's flags into pinned host memory on its stream, the next
+run looks at that copy once it has landed (check() waits for it). The
+lost links are reported with a warning.
 
 The launch: the first run per configuration goes through the JIT (and
 compiles); later ones call the compiled kernel's launcher directly (~8 us

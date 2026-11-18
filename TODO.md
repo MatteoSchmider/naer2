@@ -69,16 +69,13 @@ comments; D-n are the decisions below.
     ever overflows) -- derive per population from the same estimate.
   - a run holds at most `ring.POOL_MAX_BLOCKS` = 2047 blocks (the packed
     claim counter's field).
-- **Ring arenas: clean-up**. The implementation grew through several
-  optimizations, each measured (reserve, fixed reserved blocks, the
-  packed claim counter, the per-cell overflow log, the barrier-free
-  freeing) -- consolidate it before sizing: the ring layout is computed
-  twice (`Ring._allocate` and `_ring`, including the log records' index),
-  the general (non-uniform) pull still allocates per record through
-  `_take_block` with barriers, the `lost` path (missing blocks, compacted
-  freeing) is only exercised by the tests, `Population.main_cap` /
-  `side_cap` apply to per-cell rings only, and the tools' options follow
-  the experiments (`tools/pd14_network.py`, `tools/trace_network.py`).
+- **Ring arenas: left from the clean-up** (2026-11-18: the layout lives in
+  `Ring._allocate` alone, its header read by `_ring`; the pooled helpers
+  are one section of `fused.py`). The general (non-uniform) pull still
+  takes blocks one record at a time (`_take_block`, with barriers) -- the
+  baseline path, slow anyway; the `lost` path (missing blocks, compacted
+  freeing) only runs once an arena ran out (tested through the growth
+  test).
 - **Gaps**, each a failing test until closed (the generator raises
   NotImplementedError naming the decision, or the values are wrong), each
   checking the closed behaviour end to end:
