@@ -1,5 +1,8 @@
 # naer2 — status and plan
 
+
+test
+
 Every population runs one fused Gluon kernel per run (pull intake, delivery,
 update, send, emission), generated from its hooks
 (`naer2/transpiler/templates/fused.py` the fixed template -- what limits
