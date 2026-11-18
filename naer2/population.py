@@ -90,17 +90,19 @@ class Population:
         # same tensors), its history, ring and plan of incoming
         # connections.
         # The ring (naer2/ring.py): every group's runs in one arena of
-        # ring_block-record blocks, holding ring_in_flight of the group's
-        # incoming links at once (the largest group's; + per slot its
-        # reserved blocks and a partly used one), doubling when it runs out
-        # (PD14's thalamic volley: 5-11% of a group's incoming links in
-        # flight). main_cap / side_cap: with ring_block None only, per-cell
-        # runs of that many records (None: their defaults).
+        # ring_block-record blocks, starting at ring_in_flight of the group's
+        # incoming links (the largest group's) + per slot its reserved blocks
+        # and a partly used one -- by default the reserves alone: the
+        # runtime sizes the arenas from what the runs need (naer2/runtime.py;
+        # PD14: quiet activity needs little more than the reserves, the
+        # thalamic volley ~4x that). main_cap / side_cap: with ring_block
+        # None only, per-cell runs of that many records (None: their
+        # defaults).
         self._fused = None
         self._runtime = None
         self._connected = False
         self.ring_block: int | None = 256
-        self.ring_in_flight: float = 1 / 8
+        self.ring_in_flight: float = 0.0
         self.main_cap: int | None = None
         self.side_cap: int | None = None
         # the emission history's depth; None: the network's derived one
@@ -164,6 +166,7 @@ class Population:
         if self._summary is None or self._summary[0] != self._run_id:
             if self._runtime is None or self._runtime.run_id == 0:
                 return 0, math.inf  # no kernel ran: nothing emitted
+            self._runtime.settle()  # (a stopped run rerun first)
             n, earliest = self._runtime.history.summary(self._runtime.run_id)
             self._summary = (self._run_id, n, earliest)
         return self._summary[1], self._summary[2]
@@ -293,6 +296,7 @@ class Population:
         is on this population's stream."""
         if self._runtime is None:
             return  # no kernel ran: nothing pending
+        self._runtime.settle()  # (a stopped run rerun first)
         ring = self._runtime.ring
         pending = (ring.main_count + ring.side_count).view(ring.n_groups, ring.n_slots).amax(0).tolist()
         for k in range(ring.ring_pos, ring.ring_pos + ring.n_slots):

@@ -7,6 +7,7 @@ connections' simulation topologies from Fabric.simulation.
 """
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -94,13 +95,14 @@ def test_a_population_without_connections():
 
 
 @pytest.mark.parametrize("ring", ["cells", "arena"])
-def test_a_full_ring_run_doubles_its_capacity(ring):
+def test_a_run_too_large_for_its_ring_stops_and_reruns(ring):
     """cells: main capacity 64 per (group, slot); arena: every group's
     arena at its minimum (4-record blocks: per slot its reserved ones and a
-    partly used one). The first
-    burst overflows it -- a warning, its excess links lost, the capacity
-    doubled before the next run (no host sync: the flags' host copy) -- and
-    a later, smaller burst is delivered exactly."""
+    partly used one). The burst's intake doesn't fit: that run stops with
+    nothing committed, so does every run after it (the source's, the
+    consumer's), the ring grows to the run's need x grow_to once the device
+    is idle, and every stopped run runs again -- every link delivered,
+    exactly, nothing lost, no warning; a later burst too."""
     src, dst, conn = _pair()
     if ring == "cells":
         dst.ring_block, dst.main_cap = None, 64
@@ -108,28 +110,50 @@ def test_a_full_ring_run_doubles_its_capacity(ring):
         dst.ring_block, dst.ring_in_flight = 4, 0.0
     big = torch.rand(300, generator=torch.Generator().manual_seed(2)) < 0.3
     small = torch.rand(300, generator=torch.Generator().manual_seed(3)) < 0.01
-    with pytest.warns(RuntimeWarning, match="main ring run overflowed" if ring == "cells" else "ran out"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         for r in range(8):
             t = round(1.0 + 0.1 * r, 6)
             src.fire_now = (big if r == 0 else small if r == 4 else torch.zeros(300, dtype=torch.bool)).float()
             src.run(t, t + 0.1, round_id=r)
             dst.run(t, t + 0.1, round_id=r)
-            if r == 5:  # the big burst delivered (round 2), the small one not yet (round 6)
-                torch.cuda.synchronize()
-                before = dst.runtime.n_received.cpu().long().clone()
-    dst.check()  # nothing left flagged
-    if ring == "cells":
-        assert dst.runtime.ring.main_cap == 128 and dst.runtime.growths[0][1:] == ("main", 128)
-    else:
-        from naer2.ring import POOL_RESERVE
+            if r == 0:
+                start = dst.runtime.ring.main_cap if ring == "cells" else dst.runtime.ring.pool_nb
+        dst.check()
+    rt = dst.runtime
+    assert rt.stops and rt.growths
+    assert (rt.ring.main_cap if ring == "cells" else rt.ring.pool_nb) > start
+    count, _ = _expected(conn, big | small, 500)
+    assert int(count.sum()) > 0
+    assert torch.equal(rt.n_received.cpu().long(), count)
 
-        n_slots = dst.runtime.ring.n_slots  # the minimum arena: per slot its reserved blocks and a partly used one
-        assert dst.runtime.growths[0][1:] == ("arena", 4 * 2 * (n_slots * (POOL_RESERVE + 1) + 1))
-    count_big, _ = _expected(conn, big, 500)
-    assert int(before.sum()) < int(count_big.sum())  # the overflowing run lost links
-    count_small, _ = _expected(conn, small, 500)
-    assert int(count_small.sum()) > 0
-    assert torch.equal(dst.runtime.n_received.cpu().long() - before, count_small)
+
+def test_a_ring_arena_shrinks_back_and_keeps_what_it_holds():
+    """An arena larger than the runs need (here: started at every incoming
+    link) shrinks once their need stays below a third of it (need x grow_at
+    < half the size) for shrink_window runs -- to grow_to x the need -- and
+    keeps what it holds: a burst taken in before the shrink (2 ms delay) and
+    delivered after it arrives exactly."""
+    src, dst, conn = _pair()
+    conn.delay = 2.0
+    dst.ring_block, dst.ring_in_flight = 4, 1.0
+    burst = torch.rand(300, generator=torch.Generator().manual_seed(3)) < 0.05
+    for r in range(30):
+        t = round(1.0 + 0.1 * r, 6)
+        src.fire_now = (burst if r == 1 else torch.zeros(300, dtype=torch.bool)).float()
+        src.run(t, t + 0.1, round_id=r)
+        dst.run(t, t + 0.1, round_id=r)
+        if r == 0:
+            dst.runtime.shrink_window = 5
+            start = dst.runtime.ring.pool_nb
+    dst.check()
+    rt = dst.runtime
+    shrinks = [r for r in rt.resizes if r[1] < start]
+    assert shrinks and 3 <= shrinks[0][0] < 21  # between the burst's intake and its delivery
+    assert not [g for g in rt.growths if g[1] == "arena"]  # (the burst may outgrow the log: a stop, a rerun)
+    count, _ = _expected(conn, burst, 500)
+    assert int(count.sum()) > 0
+    assert torch.equal(rt.n_received.cpu().long(), count)
 
 
 # ------------------------------------------------------------ gaps (fail until closed)

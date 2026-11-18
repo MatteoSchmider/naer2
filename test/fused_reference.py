@@ -14,7 +14,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
-from naer2.transpiler.templates.fused import _deliver, _emit, _pin_first, _pull, _rand
+from naer2.transpiler.templates.fused import _deliver, _emit, _pin_first, _pull, _rand, _run_done, _run_gate
 from naer2.transpiler.templates.fused_template import DO_NOT_SPECIALIZE, FusedKernel
 
 
@@ -34,13 +34,13 @@ def _receive_none(state, hit, time, w, srcword):
 @gluon.jit(do_not_specialize=list(DO_NOT_SPECIALIZE))
 def pd14_neuron_kernel(
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr,
-    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, k_lo, k_hi, slot_width, round_id, parity,
+    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, k_hi, slot_width, round_id, parity,
     received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, run_id, t_start, t_end, trace_ptr,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
-    N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
+    N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
     COUNT: gl.constexpr, BATCH: gl.constexpr, NSP: gl.constexpr,
-    TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr, POOL_NB: gl.constexpr,
+    TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr,
     T_MEM: gl.constexpr, T_SYN: gl.constexpr, R_MEM: gl.constexpr, T_REF: gl.constexpr, V_THRESH: gl.constexpr,
     V_RESET: gl.constexpr, V_REST: gl.constexpr,
 ):
@@ -57,58 +57,60 @@ def pd14_neuron_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
-    n_ev = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace,
-                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
-                 GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, POOL_NB)
+    if _run_gate(ring, ctl, pid, run_id):  # (see the generated kernels)
+        n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
+                         parity, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
+                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
+        if ok:
+            # receive touches current: the state through delivery
+            state = (gl.load(current_ptr + offs, mask=mask),)
+            if TRACE:
+                state = _pin_first(state)
+                n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
+            state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
+                                   n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_current, GROUP_SIZE, N_SLOTS,
+                                   STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
+                                   TRACE_CAP, POOL_B)
+            (current,) = state
 
-    # receive touches current: the state through delivery
-    state = (gl.load(current_ptr + offs, mask=mask),)
-    if TRACE:
-        state = _pin_first(state)
-        n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
-    state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
-                           n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_current, GROUP_SIZE, N_SLOTS,
-                           MAIN_CAP, SIDE_CAP, STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
-                           TRACE_CAP, POOL_B, POOL_NB)
-    (current,) = state
-
-    # update(): exact propagator integration over dt
-    t_ref_end = gl.load(t_ref_end_ptr + offs, mask=mask)
-    potential = gl.load(potential_ptr + offs, mask=mask)
-    last_time = gl.load(last_time_ptr + offs, mask=mask)
-    time = t_end
-    dt = time - last_time
-    last_time = gl.zeros_like(last_time) + time
-    P_V = gl.exp(-dt / T_MEM)
-    P_I = gl.exp(-dt / T_SYN)
-    P_VI = R_MEM * T_SYN / (T_MEM - T_SYN) * (P_V - P_I)
-    _m0 = mask & (time < t_ref_end)
-    potential = gl.where(_m0, V_RESET, potential)
-    potential = gl.where(~_m0 & mask, V_REST + P_V * (potential - V_REST) + P_VI * current, potential)
-    current = P_I * current
-    # send(): if potential > V_thresh: spike(); potential = V_reset; t_ref_end = time + t_ref
-    fires = mask & (potential > V_THRESH)
-    potential = gl.where(fires, V_RESET, potential)
-    t_ref_end = gl.where(fires, time + T_REF, t_ref_end)
-    gl.store(t_ref_end_ptr + offs, t_ref_end, mask=mask)
-    gl.store(potential_ptr + offs, potential, mask=mask)
-    gl.store(current_ptr + offs, current, mask=mask)
-    gl.store(last_time_ptr + offs, last_time, mask=mask)
-    e = gl.zeros_like(lane).to(gl.float32) + t_start  # bare n2.spike(): the window's start (D-4)
-    n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
-                 TRACE, TRACE_CAP)
+            # update(): exact propagator integration over dt
+            t_ref_end = gl.load(t_ref_end_ptr + offs, mask=mask)
+            potential = gl.load(potential_ptr + offs, mask=mask)
+            last_time = gl.load(last_time_ptr + offs, mask=mask)
+            time = t_end
+            dt = time - last_time
+            last_time = gl.zeros_like(last_time) + time
+            P_V = gl.exp(-dt / T_MEM)
+            P_I = gl.exp(-dt / T_SYN)
+            P_VI = R_MEM * T_SYN / (T_MEM - T_SYN) * (P_V - P_I)
+            _m0 = mask & (time < t_ref_end)
+            potential = gl.where(_m0, V_RESET, potential)
+            potential = gl.where(~_m0 & mask, V_REST + P_V * (potential - V_REST) + P_VI * current, potential)
+            current = P_I * current
+            # send(): if potential > V_thresh: spike(); potential = V_reset; t_ref_end = time + t_ref
+            fires = mask & (potential > V_THRESH)
+            potential = gl.where(fires, V_RESET, potential)
+            t_ref_end = gl.where(fires, time + T_REF, t_ref_end)
+            gl.store(t_ref_end_ptr + offs, t_ref_end, mask=mask)
+            gl.store(potential_ptr + offs, potential, mask=mask)
+            gl.store(current_ptr + offs, current, mask=mask)
+            gl.store(last_time_ptr + offs, last_time, mask=mask)
+            e = gl.zeros_like(lane).to(gl.float32) + t_start  # bare n2.spike(): the window's start (D-4)
+            n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
+                         TRACE, TRACE_CAP)
+            _run_done(ring, pid, run_id)
 
 
 @gluon.jit(do_not_specialize=list(DO_NOT_SPECIALIZE))
 def pd14_poisson_kernel(
     next_spike_ptr,
-    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, k_lo, k_hi, slot_width, round_id, parity,
+    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, k_hi, slot_width, round_id, parity,
     received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, run_id, t_start, t_end, trace_ptr,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
-    N_SLOTS: gl.constexpr, MAIN_CAP: gl.constexpr, SIDE_CAP: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
+    N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
     COUNT: gl.constexpr, BATCH: gl.constexpr, NSP: gl.constexpr,
-    TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr, POOL_NB: gl.constexpr,
+    TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr,
     P_RATE: gl.constexpr, P_START: gl.constexpr, P_STOP: gl.constexpr,
 ):
     LT: gl.constexpr = gl.BlockedLayout([SPT, U], [32, 1], [NUM_WARPS, 1], [1, 0])
@@ -124,31 +126,34 @@ def pd14_poisson_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
-    n_ev = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, k_lo, slot_width, round_id, parity, trace,
-                 n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, MAIN_CAP, SIDE_CAP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
-                 GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, POOL_NB)
-    state = ()  # no receive
-    if TRACE:
-        n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
-    state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
-                           n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_none, GROUP_SIZE, N_SLOTS,
-                           MAIN_CAP, SIDE_CAP, STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
-                           TRACE_CAP, POOL_B, POOL_NB)
+    if _run_gate(ring, ctl, pid, run_id):  # (see the generated kernels)
+        n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
+                         parity, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
+                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
+        if ok:
+            state = ()  # no receive
+            if TRACE:
+                n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
+            state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
+                                   n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_none, GROUP_SIZE, N_SLOTS,
+                                   STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
+                                   TRACE_CAP, POOL_B)
 
-    # update() is a no-op; send():
-    #   if t_start <= time <= t_stop: if next_spike <= time: spike(); next_spike += -log(random()) / rate
-    # random.random() as RandomLoweringTransformer lowers it: tl.rand(t bitcast to int32, offs), t = the
-    # kernel's time (the window end); drawn for every lane, used where the branch holds
-    time = t_end
-    next_spike = gl.load(next_spike_ptr + offs, mask=mask)
-    _r = _rand(time.to(gl.int32, bitcast=True), offs)
-    _m1 = mask & ((P_START <= time) & (time <= P_STOP))
-    fires = _m1 & (next_spike <= time)
-    next_spike = gl.where(fires, next_spike + -gl.log(_r) / P_RATE, next_spike)
-    gl.store(next_spike_ptr + offs, next_spike, mask=mask)
-    e = gl.zeros_like(lane).to(gl.float32) + t_start  # bare n2.spike(): the window's start (D-4)
-    n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
-                 TRACE, TRACE_CAP)
+            # update() is a no-op; send():
+            #   if t_start <= time <= t_stop: if next_spike <= time: spike(); next_spike += -log(random()) / rate
+            # random.random() as RandomLoweringTransformer lowers it: tl.rand(t bitcast to int32, offs), t = the
+            # kernel's time (the window end); drawn for every lane, used where the branch holds
+            time = t_end
+            next_spike = gl.load(next_spike_ptr + offs, mask=mask)
+            _r = _rand(time.to(gl.int32, bitcast=True), offs)
+            _m1 = mask & ((P_START <= time) & (time <= P_STOP))
+            fires = _m1 & (next_spike <= time)
+            next_spike = gl.where(fires, next_spike + -gl.log(_r) / P_RATE, next_spike)
+            gl.store(next_spike_ptr + offs, next_spike, mask=mask)
+            e = gl.zeros_like(lane).to(gl.float32) + t_start  # bare n2.spike(): the window's start (D-4)
+            n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
+                         TRACE, TRACE_CAP)
+            _run_done(ring, pid, run_id)
 
 
 def pd14_neuron_reference(neuron) -> FusedKernel:

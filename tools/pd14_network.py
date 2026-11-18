@@ -98,6 +98,7 @@ def record(path, out, ms, G, harness_caps=False, block=None, in_flight=None):
         _advance(path, obj, r)
         for name, p in _runtimes(path, obj).items():
             rt = _runtime(path, p)
+            rt.settle()  # (a stopped run rerun before its spikes are read)
             h = rt.history
             for run in range(last.get(name, 0) + 1, rt.run_id + 1):  # a network step may hold several rounds
                 runs.setdefault(name, []).append(
@@ -110,7 +111,10 @@ def record(path, out, ms, G, harness_caps=False, block=None, in_flight=None):
     sizes = {name: _runtime(path, p).n for name, p in _runtimes(path, obj).items()}
     rounds = obj[0].round_id if path == "network" else n_rounds
     growths = {name: _runtime(path, p).growths for name, p in _runtimes(path, obj).items()}
-    torch.save(dict(path=path, ms=ms, G=G, runs=runs, sizes=sizes, rounds=rounds, growths=growths), out)
+    resizes = {name: getattr(_runtime(path, p), "resizes", []) for name, p in _runtimes(path, obj).items()}
+    stops = {name: getattr(_runtime(path, p), "stops", []) for name, p in _runtimes(path, obj).items()}
+    torch.save(dict(path=path, ms=ms, G=G, runs=runs, sizes=sizes, rounds=rounds, growths=growths,
+                    resizes=resizes, stops=stops), out)
     print(f"{path}: {rounds} rounds for {ms} ms, {sum(len(v) for v in runs.values())} runs -> {out}")
 
 
@@ -126,6 +130,13 @@ def compare(a_path, b_path):
         grown = {n: g for n, g in x["growths"].items() if g}
         if grown:
             print(f"  {x['path']} ring growths: {grown}")
+        stopped = {n: v for n, v in x.get("stops", {}).items() if v}
+        if stopped:
+            print(f"  {x['path']} runs stopped and rerun: {stopped}")
+        for n, rs in x.get("resizes", {}).items():
+            if rs:
+                print(f"  {x['path']} {n}: {len(rs)} resizes, (run, blocks, log) {rs[:3]} ... {rs[-2:]}, "
+                      f"most blocks {max(r[1] for r in rs)}, log {max(r[2] for r in rs)}")
     ms = min(a["ms"], b["ms"])
     print(f"  {'pop':5s} {'runs':>11s} {'windows':>8s} {'identical up to':>16s} "
           f"{'rate all (Hz)':>17s} {'< 700 ms':>15s} {'700-750 ms':>17s}")
@@ -149,12 +160,12 @@ def timed(path, ms, G, rounds, harness_caps=False, scaled_caps=False, block=None
     t0 = time.time()
     for r in range(n):
         _advance(path, obj, r)
-        if r % 500 == 0:  # bound the host's lead, so a ring growth isn't noticed only inside the timed rounds
+        if r % 500 == 0:  # (as before the runtime bounded the host's lead itself: timings stay comparable)
             torch.cuda.synchronize()
     torch.cuda.synchronize()
     for p in _runtimes(path, obj).values():
-        _runtime(path, p).check()  # a pending growth now, not in the timed rounds
-    for r in range(n, n + 5):  # and its recompile (the capacities are constexprs)
+        _runtime(path, p).check()  # a pending resize now, not in the timed rounds
+    for r in range(n, n + 5):  # (a few warm rounds)
         _advance(path, obj, r)
     n += 5
     torch.cuda.synchronize()

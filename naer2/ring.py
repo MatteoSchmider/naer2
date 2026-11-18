@@ -50,7 +50,9 @@ import triton.language as tl
 # its delay range at once).
 DEFAULT_MAIN_CAP = 8192  # links per (group, slot): PD14 at G=256 needs ~350 quiet, up to ~9.3k in its thalamic volley
 DEFAULT_SIDE_CAP = 2048
-_N_FLAGS = 4  # main run full, far future, uniform contract violated, side run full
+# main run full (links lost: the general pull), far future, uniform contract violated, side run full, a run
+# stopped (the ring too small for it: nothing lost, the host resizes and reruns it)
+_N_FLAGS = 5
 # pooled rings: the blocks every main run keeps -- it starts with them, and keeps them when delivered. PD14 (256-record
 # blocks): a quiet slot ends its life with ~220-360 records, so 2 blocks cover it and a quiet run hardly ever takes
 # a new one (each a barrier in the pull); could follow the network's arrival rate x delay (Little's law) instead
@@ -68,6 +70,14 @@ def pool_log_cap(pool_b: int, pool_nb: int, n_slots: int) -> int:
     return pool_b * pool_nb // 2 // n_slots
 
 
+def _hold_until_done(buf: torch.Tensor) -> None:
+    """A ring's old buffer, released after a grow / resize: the runs queued before it (and the copies) on this
+    stream may still use it -- keep the allocator from reusing it until they are done (it was allocated on
+    another stream, whose pool would otherwise take it back at once)."""
+    if buf.is_cuda:
+        buf.record_stream(torch.cuda.current_stream(buf.device))
+
+
 @triton.jit
 def _f32(p):
     return p.to(tl.pointer_type(tl.float32))
@@ -76,29 +86,34 @@ def _f32(p):
 # The buffer's layout lives in one place, Ring._allocate: the header (its first _HEADER words) holds every
 # region's word offset, which _ring reads -- the regions, in this order (pooled: the side records are the
 # arena too, and the tables, free stacks, block counts, lost flag and overflow logs exist):
-_REGIONS = ("main records", "side records", "main counts", "side counts", "watermark", "flags", "main tables",
-            "side tables", "free stacks", "stack tops", "block counts", "lost", "log records")
-_HEADER = 16
+_REGIONS = ("main records", "side records", "main counts", "side counts", "watermark", "flags", "lost",
+            "group stats", "groups done", "main tables", "side tables", "free stacks", "stack tops", "block counts", "log records")
+# (flags, lost, the group stats and the groups done are contiguous: the run's status, Ring.status, one copy to the
+# host per run)
+_HEADER = 32
 
 
 @triton.jit
-def _ring(ring, n_groups, N_SLOTS: tl.constexpr, MAIN_CAP: tl.constexpr, SIDE_CAP: tl.constexpr,
-          POOL_B: tl.constexpr, POOL_NB: tl.constexpr):
+def _ring(ring, POOL_B: tl.constexpr):
     """Typed pointers into a Ring buffer, from its header (Ring._allocate): the four fields of a record -- time,
     source word, link index, target -- for the main and the side runs (field f of record i at field_ptr + 4 * i,
     see _rec, _run_rec), the per-cell counts, watermark and flags, and (pooled) the cells' main and side block
-    tables, the groups' free stacks and their tops, the main runs' block counts, the lost flag, the
-    overflow logs' first record (an index from the main records, like any record's) and a cell's log's
-    capacity (pool_log_cap)."""
+    tables, the groups' free stacks and their tops, the main runs' block counts, the lost flag, the overflow
+    logs' first record (an index from the main records, like any record's); then the sizes, all runtime
+    values (a ring grows or shrinks without a recompile): a cell's overflow log capacity, the main and side
+    runs' capacities, the arena's blocks per group; and the group stats, two words per group the pull
+    writes every run: pooled, the blocks the group holds after the pull (or would need: a stopped run) and
+    the most any of its cells put into its overflow log; per-cell runs, the longest run. (The groups done,
+    header word 8: _run_gate, _run_done.)"""
     main_time = ring + tl.load(ring + 0)
     side_time = ring + tl.load(ring + 1)
-    flags = ring + tl.load(ring + 5)
     return (
         _f32(main_time), main_time + 1, main_time + 2, main_time + 3, ring + tl.load(ring + 2),
         _f32(side_time), side_time + 1, side_time + 2, side_time + 3, ring + tl.load(ring + 3),
-        _f32(ring + tl.load(ring + 4)), flags, ring + tl.load(ring + 6), ring + tl.load(ring + 7),
-        ring + tl.load(ring + 8), ring + tl.load(ring + 9), ring + tl.load(ring + 10), ring + tl.load(ring + 11),
-        tl.load(ring + 12), tl.load(ring + 13),
+        _f32(ring + tl.load(ring + 4)), ring + tl.load(ring + 5), ring + tl.load(ring + 9), ring + tl.load(ring + 10),
+        ring + tl.load(ring + 11), ring + tl.load(ring + 12), ring + tl.load(ring + 13), ring + tl.load(ring + 6),
+        tl.load(ring + 14), tl.load(ring + 15), tl.load(ring + 16), tl.load(ring + 17), tl.load(ring + 18),
+        ring + tl.load(ring + 7),
     )
 
 
@@ -125,14 +140,17 @@ class Ring:
 
     def __init__(self, n_groups: int, n_slots: int, slot_width: float, device,
                  main_cap: int = DEFAULT_MAIN_CAP, side_cap: int = DEFAULT_SIDE_CAP,
-                 pool: tuple[int, int] | None = None):
+                 pool: tuple[int, int] | None = None, log_cap: int | None = None):
         """pool: (block, blocks) -- every group's main and side runs in one arena of `blocks` blocks of
         `block` records, a run taking blocks as it fills (through its block table) and giving them back once
         delivered; a run can grow to the whole arena (main_cap, side_cap ignored). Every main run keeps
         POOL_RESERVE blocks (it starts with them, and keeps them when delivered), so an arena needs more than
-        n_slots x POOL_RESERVE blocks. None: every cell its own main_cap + side_cap records (see _rec)."""
+        n_slots x POOL_RESERVE blocks. log_cap: records a cell's overflow log takes per run (default:
+        pool_log_cap). None: every cell its own main_cap + side_cap records (see _rec)."""
         self.n_groups, self.n_slots, self.slot_width = n_groups, n_slots, slot_width
         self.pool_b, self.pool_nb = pool or (0, 1)
+        self.log_cap = (log_cap if log_cap is not None else pool_log_cap(self.pool_b, self.pool_nb, n_slots)) \
+            if self.pool_b else 0
         if self.pool_b:
             if self.pool_b % 4 or self.pool_nb <= n_slots * POOL_RESERVE:
                 raise ValueError("a pool block is a positive multiple of 4 records, and an arena more blocks than "
@@ -154,21 +172,23 @@ class Ring:
         """Records per group (pooled), else per cell (main + side)."""
         return self.pool_b * self.pool_nb if self.pool_b else self.main_cap + self.side_cap
 
-    def _allocate(self, main_cap: int, side_cap: int, device) -> None:
-        """The buffer: the header, then the regions (_REGIONS) -- record regions on 16-byte boundaries."""
+    def _allocate(self, main_cap: int, side_cap: int, device, zero_records: bool = True) -> None:
+        """The buffer: the header, then the regions (_REGIONS) -- record regions on 16-byte boundaries.
+        zero_records False: the records left as they come (a grow / resize copies its own over them; past the
+        counts, nothing reads a record), every other region zeroed."""
         if self.pool_b:
             main_cap = side_cap = self._run_cap()
         self.main_cap, self.side_cap = main_cap, side_cap
         cells, g = self.n_groups * self.n_slots, self.n_groups
         pooled = bool(self.pool_b)
         m = g * self.pool_nb * self.pool_b if pooled else cells * main_cap
-        log_cap = pool_log_cap(self.pool_b, self.pool_nb, self.n_slots) if pooled else 0
+        log_cap = self.log_cap if pooled else 0
         words = {"main records": 4 * m, "side records": 0 if pooled else 4 * cells * side_cap,
                  "main counts": cells, "side counts": cells, "watermark": 1, "flags": _N_FLAGS,
                  "main tables": cells * self.pool_nb if pooled else 0,
                  "side tables": cells * self.pool_nb if pooled else 0,
                  "free stacks": g * self.pool_nb if pooled else 0, "stack tops": g if pooled else 0,
-                 "block counts": cells if pooled else 0, "lost": 1 if pooled else 0,
+                 "block counts": cells if pooled else 0, "lost": 1, "group stats": 2 * g, "groups done": g,
                  "log records": 4 * cells * log_cap}
         off, o = {}, _HEADER
         for name in _REGIONS:
@@ -178,18 +198,30 @@ class Ring:
             o += words[name]
         if pooled:
             off["side records"] = off["main records"]  # one arena per group: main and side blocks alike
-        self.buf = torch.zeros(o, device=device, dtype=torch.int32)
-        header = [off[n] for n in _REGIONS[:-1]] + [(off["log records"] - off["main records"]) // 4, log_cap]
+        if zero_records:
+            self.buf = torch.zeros(o, device=device, dtype=torch.int32)
+        else:
+            self.buf = torch.empty(o, device=device, dtype=torch.int32)
+            rec_end = max(off["main records"] + words["main records"], off["side records"] + words["side records"])
+            self.buf[:off["main records"]].zero_()
+            self.buf[rec_end:off["log records"]].zero_()
+        header = [off[n] for n in _REGIONS[:-1]] + [(off["log records"] - off["main records"]) // 4, log_cap,
+                                                     main_cap, side_cap, self.pool_nb]
         self.buf[:len(header)] = torch.tensor(header, dtype=torch.int32)
         view = lambda name, *shape: self.buf[off[name]:off[name] + words[name]].view(*shape)
         self._records = (view("main records", -1, 4), view("main records" if pooled else "side records", -1, 4))
         self.main_count, self.side_count = view("main counts", -1), view("side counts", -1)
         self.watermark = view("watermark", -1).view(torch.float32)
         self.flags = view("flags", -1)
+        self.lost = view("lost", -1)
+        # the run's status: flags, lost, group stats, groups done -- contiguous (see _REGIONS)
+        self.status = self.buf[off["flags"]:off["groups done"] + words["groups done"]]
+        self.stats = view("group stats", g, 2)
+        self.done = view("groups done", -1)
         if pooled:
             self.table, self.side_table = view("main tables", cells, -1), view("side tables", cells, -1)
             self.stack, self.top = view("free stacks", g, -1), view("stack tops", -1)
-            self.nblk, self.lost = view("block counts", -1), view("lost", -1)
+            self.nblk = view("block counts", -1)
             self.log_rec = view("log records", -1, 4)
             self.table.fill_(-1)
             self.side_table.fill_(-1)
@@ -202,57 +234,122 @@ class Ring:
             self.stack[:, :free] = torch.arange(self.n_slots * R, self.pool_nb, device=device, dtype=torch.int32)
             self.top.fill_(free)
 
-    def grow(self, main_cap: int | None = None, side_cap: int | None = None, pool_nb: int | None = None) -> None:
-        """Larger run capacities (pooled: a larger arena, pool_nb blocks per group), keeping what the ring
-        holds: a record's place (_rec; pooled: its block, a group-local id) doesn't depend on the capacity,
-        so the records, tables and free stacks copy over; the counts are clamped to what was written (an
-        overflowing run's claims beyond its capacity were lost), the watermark and flags carried along. buf
-        is a new buffer: whoever holds its address (a kernel launch's arguments) takes it again."""
+    def grow(self, main_cap: int | None = None, side_cap: int | None = None) -> None:
+        """Per-cell runs: larger run capacities, keeping what the ring holds -- a record's place (_rec) doesn't
+        depend on the capacity, so each run kind's records copy over as one block; the counts are clamped to
+        what was written (an overflowing run's claims beyond its capacity were lost), the watermark and
+        flags carried along. buf is a new buffer: whoever holds its address (a launch's arguments) takes it
+        again. (Pooled rings: resize.)"""
+        if self.pool_b:
+            raise ValueError("a pooled ring changes size through resize()")
         old_buf, (main_rec, side_rec) = self.buf, self._records
         main_count, side_count = self.main_count.clone(), self.side_count.clone()
-        watermark, flags = self.watermark.clone(), self.flags.clone()
+        watermark, flags, lost, done = self.watermark.clone(), self.flags.clone(), self.lost.clone(), self.done.clone()
         old_main, old_side = self.main_cap, self.side_cap
-        if self.pool_b:
-            old_nb = self.pool_nb
-            if pool_nb is None or pool_nb < old_nb:
-                raise ValueError("a pooled ring grows by its arena: pool_nb >= the current blocks per group")
-            table, side_table, stack, top = self.table.clone(), self.side_table.clone(), self.stack.clone(), \
-                self.top.clone()
-            nblk, lost = self.nblk.clone(), self.lost.clone()
-            self.pool_nb = pool_nb
-            self._allocate(0, 0, old_buf.device)
-            g, b = self.n_groups, self.pool_b
-            self._records[0].view(g, pool_nb * b, 4)[:, :old_nb * b] = main_rec.view(g, old_nb * b, 4)
-            self.table[:, :old_nb] = table
-            self.side_table[:, :old_nb] = side_table
-            # every group's free blocks: the old ones still free, then the new ids
-            free = torch.arange(pool_nb, device=old_buf.device, dtype=torch.int32)
-            keep = torch.arange(old_nb, device=old_buf.device)[None, :] < top[:, None]
-            self.stack.zero_()
-            self.stack[:, :old_nb] = torch.where(keep, stack, 0)
-            idx = top[:, None].long() + torch.arange(pool_nb - old_nb, device=old_buf.device)[None, :]
-            self.stack.scatter_(1, idx, free[old_nb:].expand(g, -1).contiguous())
-            self.top.copy_(top + (pool_nb - old_nb))
-            self.nblk.copy_(nblk)
-            self.lost.copy_(lost)
-            self.main_count.copy_(main_count.clamp(max=old_main))
-            self.side_count.copy_(side_count.clamp(max=old_side))
-        else:
-            main_cap, side_cap = main_cap or old_main, side_cap or old_side
-            if main_cap % 4 or side_cap % 4 or main_cap < old_main or side_cap < old_side:
-                raise ValueError("capacities only grow, in multiples of 4")
-            self._allocate(main_cap, side_cap, old_buf.device)
-            self._records[0][:len(main_rec)] = main_rec
-            self._records[1][:len(side_rec)] = side_rec
-            self.main_count.copy_(main_count.clamp(max=old_main))
-            self.side_count.copy_(side_count.clamp(max=old_side))
+        main_cap, side_cap = main_cap or old_main, side_cap or old_side
+        if main_cap % 4 or side_cap % 4 or main_cap < old_main or side_cap < old_side:
+            raise ValueError("capacities only grow, in multiples of 4")
+        self._allocate(main_cap, side_cap, old_buf.device, zero_records=False)
+        self._records[0][:len(main_rec)] = main_rec
+        self._records[1][:len(side_rec)] = side_rec
+        self.main_count.copy_(main_count.clamp(max=old_main))
+        self.side_count.copy_(side_count.clamp(max=old_side))
         self.watermark.copy_(watermark)
         self.flags.copy_(flags)
-        if old_buf.is_cuda:
-            # the old buffer is released here, but the runs queued before the growth (and the copies above) on
-            # this stream may still be using it: keep the allocator from reusing it until they are done (it was
-            # allocated on another stream, whose pool would otherwise take it back at once)
-            old_buf.record_stream(torch.cuda.current_stream(old_buf.device))
+        self.lost.copy_(lost)
+        self.done.copy_(done)
+        _hold_until_done(old_buf)
+
+    def resize(self, pool_nb: int | None = None, log_cap: int | None = None) -> None:
+        """Pooled: the arenas to pool_nb blocks per group and the overflow logs to log_cap records per cell
+        (between runs: the logs are empty), keeping what the ring holds. Growing (or keeping) the arena:
+        every block keeps its id -- the records copy over as they are (one copy of the old arena), the tables
+        too, the new ids join the free stacks. Shrinking: the blocks in use -- every main run's first nblk,
+        every side run's first ceil(count / block) -- are renumbered: the reserve keeps its fixed ids, the
+        rest follow it in order; their records copy over, the tables are remapped, the free stacks hold every
+        other id. All on the device, in stream order (no host sync). A shrink below the blocks in use loses
+        the ones that don't fit: marked missing, the lost and main-full flags set (the runtime never asks
+        for one). buf is a new buffer (see grow)."""
+        if not self.pool_b:
+            raise ValueError("resize() is for pooled rings (per-cell runs: grow())")
+        pool_nb, log_cap = pool_nb or self.pool_nb, log_cap or self.log_cap
+        g, S, B, R = self.n_groups, self.n_slots, self.pool_b, POOL_RESERVE
+        if pool_nb <= S * R:
+            raise ValueError("an arena needs more blocks than its slots' reserves")
+        dev, cells, nb = self.buf.device, g * S, self.pool_nb
+        if pool_nb >= nb:
+            self._grow_arena(pool_nb, log_cap)
+            return
+        old_buf, rec = self.buf, self._records[0].view(g * nb, B, 4)
+        keep = dict(main_count=self.main_count.clone(), side_count=self.side_count.clone(),
+                    watermark=self.watermark.clone(), flags=self.flags.clone(), lost=self.lost.clone(),
+                    nblk=self.nblk.clone(), done=self.done.clone())
+        table, side_table = self.table.long(), self.side_table.long()
+        col = torch.arange(nb, device=dev)
+        group = torch.arange(cells, device=dev) // S
+        main_used = (col[None, :] < keep["nblk"].long()[:, None]) & (table >= 0)
+        side_used = (col[None, :] < ((keep["side_count"].long() + B - 1) // B)[:, None]) & (side_table >= 0)
+        used = torch.zeros(g * nb + 1, dtype=torch.bool, device=dev)  # (+1: where the unused entries go)
+        dump = g * nb
+        for t, u in ((table, main_used), (side_table, side_used)):
+            used.index_fill_(0, torch.where(u, group[:, None] * nb + t.clamp(min=0), dump).flatten(), True)
+        used = used[:dump].view(g, nb)
+        reserve = col[None, :] < S * R
+        movable = used & ~reserve
+        new_id = torch.where(reserve, col[None, :], S * R + torch.cumsum(movable.long(), 1) - 1)  # [g, nb]
+        fits = new_id < pool_nb
+        dropped = (used & ~fits).any()
+        self.pool_nb, self.log_cap = pool_nb, log_cap
+        self._allocate(0, 0, dev)
+        # the blocks' records, through a scratch row for the ones that don't move
+        dst = torch.where(used & fits, torch.arange(g, device=dev)[:, None] * pool_nb + new_id, g * pool_nb)
+        moved = torch.zeros(g * pool_nb + 1, B, 4, dtype=rec.dtype, device=dev)
+        moved.index_copy_(0, dst.flatten(), rec)
+        self._records[0].view(g * pool_nb, B, 4).copy_(moved[:g * pool_nb])
+        del moved
+        # the tables through the new ids (entries past what a run holds: none)
+        remap = torch.where(fits, new_id, -1)  # [g, nb]
+        n = min(nb, pool_nb)
+        for old_t, u, new_t in ((table, main_used, self.table), (side_table, side_used, self.side_table)):
+            ids = torch.gather(remap[group], 1, old_t.clamp(min=0))
+            new_t[:, :n] = torch.where(u, ids, -1)[:, :n].to(torch.int32)
+        # the free stacks: every id not in use, in order
+        in_use = torch.zeros(g, pool_nb + 1, dtype=torch.bool, device=dev)
+        in_use.scatter_(1, torch.where(used & fits, new_id, pool_nb), True)
+        in_use = in_use[:, :pool_nb]
+        self.stack.copy_(torch.argsort(in_use.to(torch.int8), dim=1, stable=True).to(torch.int32))
+        self.top.copy_((pool_nb - in_use.sum(1)).to(torch.int32))
+        # (a run can't hold more blocks than the arena has: past them, its records are lost)
+        keep["nblk"].clamp_(max=min(pool_nb, POOL_MAX_BLOCKS))
+        for k in ("main_count", "side_count"):
+            keep[k].clamp_(max=self.main_cap)
+        for name, v in keep.items():
+            getattr(self, name).copy_(v)
+        self.lost.copy_(torch.maximum(self.lost, dropped.to(torch.int32)))
+        self.flags[0] = torch.maximum(self.flags[0], dropped.to(torch.int32))
+        _hold_until_done(old_buf)
+
+    def _grow_arena(self, pool_nb: int, log_cap: int) -> None:
+        """resize() to at least as many blocks: every block keeps its id (see resize)."""
+        g, B, nb, dev = self.n_groups, self.pool_b, self.pool_nb, self.buf.device
+        old_buf = self.buf
+        old = dict(main_count=self.main_count, side_count=self.side_count, watermark=self.watermark,
+                   flags=self.flags, lost=self.lost, nblk=self.nblk, done=self.done)  # views of the old buffer
+        old_rec, old_top = self._records[0].view(g, nb * B * 4), self.top
+        old_tables = (self.table, self.side_table, self.stack)
+        self.pool_nb, self.log_cap = pool_nb, log_cap
+        self._allocate(0, 0, dev, zero_records=False)
+        self._records[0].view(g, pool_nb * B * 4)[:, :nb * B * 4].copy_(old_rec)
+        for old_t, new_t in zip(old_tables, (self.table, self.side_table, self.stack)):
+            new_t[:, :nb].copy_(old_t)  # (the tables' entries past nb: -1, none held)
+        extra = pool_nb - nb
+        if extra:  # the new ids onto every free stack, above what it holds
+            at = old_top.long()[:, None] + torch.arange(extra, device=dev)
+            self.stack.scatter_(1, at, torch.arange(nb, pool_nb, device=dev, dtype=torch.int32).expand(g, -1))
+        self.top.copy_(old_top + extra)
+        for name, v in old.items():
+            getattr(self, name).copy_(v)
+        _hold_until_done(old_buf)
 
     def cell(self, group: int, slot: int) -> int:
         return group * self.n_slots + slot % self.n_slots
@@ -281,7 +378,7 @@ class Ring:
                             self.side_table if self.pool_b else None)
 
     def check(self) -> None:
-        main_full, far, uniform, side_full = self.flags.tolist()
+        main_full, far, uniform, side_full, _stopped = self.flags.tolist()
         if main_full or side_full:
             if self.pool_b:
                 raise RuntimeError(f"a group's ring arena ran out ({self.pool_nb} blocks of {self.pool_b} records)")
