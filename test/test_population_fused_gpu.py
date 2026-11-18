@@ -102,28 +102,34 @@ def test_a_run_too_large_for_its_ring_stops_and_reruns(ring):
     nothing committed, so does every run after it (the source's, the
     consumer's), the ring grows to the run's need x grow_to once the device
     is idle, and every stopped run runs again -- every link delivered,
-    exactly, nothing lost, no warning; a later burst too."""
+    exactly, nothing lost, no warning; the rounds after it too (each rerun
+    with its own commands)."""
     src, dst, conn = _pair()
     if ring == "cells":
         dst.ring_block, dst.main_cap = None, 64
     else:
         dst.ring_block, dst.ring_in_flight = 4, 0.0
-    big = torch.rand(300, generator=torch.Generator().manual_seed(2)) < 0.3
-    small = torch.rand(300, generator=torch.Generator().manual_seed(3)) < 0.01
+    # the burst, then a different pattern every round right after it: the runs stopped behind the burst's
+    # intake are rerun with the commands they were launched with, not the later ones
+    pattern = {r: torch.rand(300, generator=torch.Generator().manual_seed(2 + r)) < (0.3 if r == 0 else 0.01)
+               for r in (0, 1, 2, 4)}
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", RuntimeWarning)  # (a lost link warns)
         for r in range(8):
             t = round(1.0 + 0.1 * r, 6)
-            src.fire_now = (big if r == 0 else small if r == 4 else torch.zeros(300, dtype=torch.bool)).float()
+            src.fire_now = pattern.get(r, torch.zeros(300, dtype=torch.bool)).float()
             src.run(t, t + 0.1, round_id=r)
             dst.run(t, t + 0.1, round_id=r)
             if r == 0:
                 start = dst.runtime.ring.main_cap if ring == "cells" else dst.runtime.ring.pool_nb
+                for rt in (src.runtime, dst.runtime):  # a stop noticed late: only once the status slots run out
+                    judge = rt._judge_pending
+                    rt._judge_pending = lambda stream, wait, judge=judge: judge(stream, wait) if wait else None
         dst.check()
     rt = dst.runtime
     assert rt.stops and rt.growths
     assert (rt.ring.main_cap if ring == "cells" else rt.ring.pool_nb) > start
-    count, _ = _expected(conn, big | small, 500)
+    count = sum(_expected(conn, p, 500)[0] for p in pattern.values())
     assert int(count.sum()) > 0
     assert torch.equal(rt.n_received.cpu().long(), count)
 

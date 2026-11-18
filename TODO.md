@@ -60,7 +60,23 @@ comments; D-n are the decisions below.
     and the ring doubles.
   - LIMITATION: host readbacks of device state go through
     `PopulationRuntime.settle()` (a stopped run rerun first) -- anything
-    reading a history or ring directly on the host must call it.
+    reading a history or ring directly on the host must call it. A rerun
+    reads the state tensors its launch read (the journal keeps them):
+    replacing a state tensor between runs is safe (Population attrs do),
+    writing into one in place isn't without a settle() first.
+- **Host limits** (2026-11-18). PD14's quiet rounds at G=256 are host-bound
+  on the 780M (~550 us of host time per round, 9 runs: ~60 us each --
+  status staging ~1/3, the launch ~1/4, the scheduler's Python ~1/5,
+  stream fork / join; the GPU's own floor somewhere around 230-400 us,
+  hard to pin down: the APU's GPU shares its power budget with the CPU).
+  Platform agnostic: nothing below torch / Triton (no HIP calls). Next:
+  the status written by the kernel straight into pinned host memory (no
+  copy, no event); then a measurement that holds up (more rounds, repeats,
+  the RX 6600 to separate the GPU from the CPU); then the scheduler's
+  Python. Structural, later: ONE launch per round for all populations --
+  Network collecting its runtimes into a bundle (a new class) that
+  launches every population's groups in one grid (the launch floor is
+  ~11 us per launch, ~100 us per PD14 round).
 - **Ring arenas: left from the clean-up** (2026-11-18: the layout lives in
   `Ring._allocate` alone, its header read by `_ring`; the pooled helpers
   are one section of `fused.py`). The general (non-uniform) pull still

@@ -578,8 +578,24 @@ def _run_gate(ring, ctl, pid, run_id):
 
 @gluon.jit
 def _run_done(ring, pid, run_id):
-    """Program pid's group finished run run_id (its last store)."""
+    """Program pid's group finished run run_id (in the ring: what a rerun skips)."""
     gl.store(ring + gl.load(ring + 8) + pid, run_id)
+
+
+@gluon.jit
+def _run_status(status, ring, pid, run_id, finished):
+    """Program pid's last stores: its group's part of the run's status, straight into the run's pinned host
+    slot (PopulationRuntime: no copy, no event) -- the blocks it holds and the most it logged (the pull's
+    group stats), its ring's lost bits (main 1, side 2: the general pull), and run_id if it finished the run,
+    -run_id if it stopped (or skipped: a run stopped before it). Plain stores, done last: the host decides
+    from the done words alone whether to rerun (and then reads the ring itself); the rest only sizes."""
+    st = ring + gl.load(ring + 7) + 2 * pid
+    fl = ring + gl.load(ring + 5)
+    at = status + 4 * pid
+    gl.store(at, gl.load(st))
+    gl.store(at + 1, gl.load(st + 1))
+    gl.store(at + 2, gl.load(fl) | (gl.load(fl + 3) << 1))
+    gl.store(at + 3, gl.where(finished, run_id, -run_id))
 
 
 # ------------------------------------------------- delivery helpers

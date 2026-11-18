@@ -21,12 +21,13 @@ arguments, then its constexprs (+ the kernel's own, FusedKernel.consts).
               runs of earlier rounds taken in, every slot due by
               deliver_until delivered, update, send, emission
 
-Ring size, without a host sync: every run copies its ring's status
-(Ring.status: flags, and pooled the groups' stats) into one of
-status_slots pinned host slots on its stream; later runs judge every copy
-that has landed, in run order, and a run whose slot is still in flight
-waits for it -- so a size follows the runs at most status_slots behind
-(check() judges them all).
+Ring size, without a host sync: every run's kernel writes its status
+straight into one of status_slots pinned host slots (per group: the
+blocks it holds, the most it logged, lost bits, done -- fused.py:
+_run_status; no copy, no event); later runs judge every slot that has
+landed, in run order, and a run whose slot is still pending waits for it
+-- so a size follows the runs at most status_slots behind (check() judges
+them all).
   - per-cell runs: a run kind (main, side) past its capacity lost the
     links it couldn't take; its capacity doubles (Ring.grow)
   - pooled: the arenas (blocks per group) and overflow logs (records per
@@ -50,15 +51,17 @@ selects the compiled variant and dropped when the buffers change.
 import collections
 import contextlib
 import math
+import time
 import warnings
 import weakref
 
+import numpy as np
 import torch
 import triton
 from triton import knobs
 
 from .history import EmissionHistory
-from .ring import _N_FLAGS, POOL_MAX_BLOCKS, POOL_RESERVE, Ring
+from .ring import POOL_MAX_BLOCKS, POOL_RESERVE, Ring
 from .trace import Trace
 from .transpiler.templates.fused import FUSED_TRACE_TAGS, PULL, WALK, FusedPlan
 
@@ -224,11 +227,13 @@ class PopulationRuntime:
         self.log = torch.zeros(1 + 5 * max(log_cap, 1), device=self.device, dtype=torch.int32)
         self._launchers = {}  # new buffers (their sizes are part of the AMD backend's specialization)
         self._judge_pending(None, wait=True)  # (the old ring's)
-        self._status_host = torch.zeros(self.status_slots, len(self.ring.status), dtype=torch.int32,
-                                        pin_memory=self.device.type == "cuda")
-        self._status_np = self._status_host.numpy()  # (judged per run: numpy, a few us less than torch ops)
-        self._status_events = [torch.cuda.Event() for _ in range(self.status_slots)] \
-            if self.device.type == "cuda" else []
+        # the runs' status, written by the kernel straight into pinned host memory: per slot, per group
+        # [blocks held, most logged, lost bits, done] (fused.py: _run_status)
+        cuda = self.device.type == "cuda"
+        self._status_host = torch.zeros(self.status_slots, self.n_groups, 4, dtype=torch.int32, pin_memory=cuda)
+        self._status_np = self._status_host.numpy()
+        self._status_args = [self._status_host[i] for i in range(self.status_slots)] if cuda \
+            else [self.overrun] * self.status_slots
         # the most blocks / log records any run needed, and the runs judged, since the last shrink check
         self._window = [0, 0, 0]
 
@@ -239,24 +244,29 @@ class PopulationRuntime:
         send, emit. stream: a torch.cuda.Stream to launch on (default: the
         current one)."""
         self._judge_pending(stream, wait=False)
+        cuda = self.device.type == "cuda"
+        if cuda:
+            while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
+                self._judge(self._pending.popleft())
         self.run_id += 1
         w = self.ring.slot_width
         k_lo = self.ring.ring_pos
         k_hi = int(((deliver_until if deliver_until is not None else t_end) + 1e-6) // w) - 1
+        # (the state tensors as launched: a rerun reads what this launch reads, whatever replaces them later)
         params = (t_start, t_end, k_lo, k_hi, round_id if round_id is not None else self.run_id, self.run_id,
-                  num_warps)
+                  num_warps, tuple(self.state[a] for a in self.kernel.attrs))
         self._launch(params, stream)
         self.ring.ring_pos = max(k_lo, k_hi + 1)
-        if self.device.type == "cuda":
+        if cuda:
             self._launches.journal[(id(self), self.run_id)] = (self, params)
-            self._stage_status(stream)
+            self._pending.append(self.run_id)
 
     def _launch(self, params, stream) -> None:
         """One run's kernel launch (run(); a rerun: _Launches.recover)."""
-        t_start, t_end, k_lo, k_hi, round_id, run_id, num_warps = params
-        args = [self.state[a] for a in self.kernel.attrs] + [
+        t_start, t_end, k_lo, k_hi, round_id, run_id, num_warps, state = params
+        args = list(state) + [
             self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, self._launches.ctl,
-            k_lo, k_hi, self.ring.slot_width, round_id, run_id % 2,
+            self._status_args[run_id % self.status_slots], k_lo, k_hi, self.ring.slot_width, round_id, run_id % 2,
             self.received, self.n_received, self.log, self.log_cap,
             self.history.buf, self.history.cap, run_id, t_start, t_end,
             self.trace.buf if self.trace is not None else self.log]
@@ -264,7 +274,7 @@ class PopulationRuntime:
         key = (num_warps, self.waves_per_eu, self.count_received, self.batch, self.stream_block,
                self.unroll, self.log_cap > 0)
         launch = self._launchers.get(key)
-        aligned = all(not (t.data_ptr() & 15) for t in self.state.values())  # the specialization every call meets
+        aligned = all(not (t.data_ptr() & 15) for t in state)  # the specialization every call meets
         if launch is not None and aligned:
             launch(args, stream.cuda_stream if stream is not None else None)
         else:
@@ -278,52 +288,49 @@ class PopulationRuntime:
 
     # ---- the ring's status and size (see the module docstring)
 
-    def _stage_status(self, stream) -> None:
-        """The run's ring status into its pinned host slot, on its stream (the slot's previous run judged first:
-        waited for if still in flight)."""
-        while len(self._pending) >= self.status_slots:
-            self._judge(self._pending.popleft())
-        slot = self.run_id % self.status_slots
-        event = self._status_events[slot]  # (free: its slot's previous run judged above)
-        if stream is None:
-            self._status_host[slot].copy_(self.ring.status, non_blocking=True)
-            event.record()
-        else:
-            with torch.cuda.stream(stream):
-                self._status_host[slot].copy_(self.ring.status, non_blocking=True)
-            event.record(stream)
-        self._pending.append((self.run_id, slot, event))
+    def _landed(self, run_id: int) -> bool:
+        """Every group of run run_id wrote its done word (finished or stopped) into the run's host slot."""
+        return bool((np.abs(self._status_np[run_id % self.status_slots, :, 3]) == run_id).all())
+
+    def _wait_landed(self, run_id: int) -> None:
+        """Until run run_id's status has landed: polling the host slot a little, then waiting for the device
+        (its kernels done, their stores visible) -- a kernel that didn't write raises, it doesn't hang."""
+        deadline = time.perf_counter() + 2e-3
+        while not self._landed(run_id):
+            if time.perf_counter() > deadline:
+                torch.cuda.synchronize()
+                if not self._landed(run_id):
+                    raise RuntimeError(f"run {run_id}'s kernel finished without writing its status")
+                return
 
     def _judge_pending(self, stream, wait: bool) -> None:
-        """Every staged status that has landed (wait: every one), in run order."""
-        while self._pending and (wait or self._pending[0][2].query()):
+        """Every pending run whose status has landed (wait: every one), in run order."""
+        while self._pending and (wait or self._landed(self._pending[0])):
             self._judge(self._pending.popleft())
 
-    def _judge(self, staged) -> None:
-        """One run's status. Not every group done -- this run stopped (its ring too small), or another one
-        before it did: _Launches.recover. Done: the run's launch is complete, and the ring follows its need
-        (pooled: the most blocks any group holds, the most records any cell logged; per-cell: the longest
-        run) -- see the module docstring. The general pull's lost links (a full side run, or a main run /
-        arena out of room: it takes room one record at a time and can't stop) double that size."""
-        run_id, slot, event = staged
-        event.synchronize()
-        status, ring = self._status_np[slot], self.ring
-        g = self.n_groups
-        stats = status[_N_FLAGS + 1:_N_FLAGS + 1 + 2 * g]
-        if status[4] or status[_N_FLAGS + 1 + 2 * g:].min() < run_id:
+    def _judge(self, run_id: int) -> None:
+        """One run's status (waited for). Not every group finished -- this run stopped (its ring too small), or
+        another one before it did: _Launches.recover. Finished: the run's launch is complete, and the ring
+        follows its need (pooled: the most blocks any group holds, the most records any cell logged;
+        per-cell: the longest run) -- see the module docstring. The general pull's lost links (a full side
+        run, or a main run / arena out of room: it takes room one record at a time and can't stop) double
+        that size."""
+        self._wait_landed(run_id)
+        status, ring = self._status_np[run_id % self.status_slots], self.ring
+        if (status[:, 3] < 0).any():
             self._launches.recover()
             return
         self._launches.journal.pop((id(self), run_id), None)
-        main_full, side_full = int(status[0]), int(status[3])
+        main_full, side_full = bool((status[:, 2] & 1).any()), bool((status[:, 2] & 2).any())
         if not ring.pool_b:
-            longest = int(stats[0::2].max())
+            longest = int(status[:, 0].max())
             main_cap = ring.main_cap
             if longest * self.grow_at > main_cap or main_full:
                 main_cap = max(-(-math.ceil(longest * self.grow_to) // 4) * 4, 2 * main_cap if main_full else 0)
             if main_cap != ring.main_cap or side_full:
                 self._grow_cells(main_cap, 2 * ring.side_cap if side_full else None, run_id, main_full or side_full)
             return
-        blocks, most = int(stats[0::2].max()), int(stats[1::2].max())
+        blocks, most = int(status[:, 0].max()), int(status[:, 1].max())
         if main_full:  # (the general pull: the arena ran out, links lost)
             blocks = max(blocks, 2 * ring.pool_nb)
         w = self._window
