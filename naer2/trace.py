@@ -1,11 +1,13 @@
 """
-In-kernel tracing (AMD RDNA2/RDNA3), for development: external profilers
-don't work alongside Triton here (rocprofv3 crashes), so kernels stamp
-themselves when compiled with a TRACE constexpr (and compile it out without).
+In-kernel tracing, for development: external profilers don't work alongside
+Triton here (rocprofv3 crashes), so kernels stamp themselves when compiled
+with a TRACE constexpr (and compile it out without). AMD (RDNA2 / RDNA3+)
+and NVIDIA: the stamps are inline assembly per backend (_ASM).
 
-Per program, a header -- wall-clock start and end (the 100 MHz REALTIME
-counter, comparable across programs and kernels), event count -- then
-(tag << 24 | aux, shader cycle) events; cycles are 20 bit, decoded as deltas
+Per program, a header -- wall-clock start and end (10 ns ticks: AMD's 100
+MHz REALTIME counter, NVIDIA's %globaltimer / 10; comparable across programs
+and kernels), event count -- then (tag << 24 | aux, cycle) events; cycles
+are 20 bit (AMD: SHADER_CYCLES; NVIDIA: %clock, masked), decoded as deltas
 mod 2^20. A stamp taken after pin(x) / pin_s(x) is after x is computed or
 loaded. Tags are each kernel's own (decode() takes their names).
 
@@ -24,40 +26,59 @@ TRACE_WORDS = 6  # header words: realtime start (int64), realtime end (int64), e
 TRACE_HDR = tl.constexpr(TRACE_WORDS)
 
 
-def _realtime_asm() -> str:
-    """REALTIME: s_memrealtime on RDNA2 (gfx10), s_sendmsg_rtn_b64 on RDNA3+
-    (gfx11 dropped s_memrealtime)."""
-    arch = torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else ""
-    if arch.startswith("gfx10"):
-        return "s_memrealtime $0\ns_waitcnt lgkmcnt(0)"
-    return "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\ns_waitcnt lgkmcnt(0)"
+def _asm() -> dict:
+    """The stamps' inline assembly for this process's backend: cycles, realtime (10 ns ticks), pin (a
+    32-bit identity move), pin_s (one moved into a uniform register), each (asm, constraints)."""
+    if torch.version.hip:
+        arch = torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else ""
+        # REALTIME: s_memrealtime on RDNA2 (gfx10), s_sendmsg_rtn_b64 on RDNA3+ (gfx11 dropped s_memrealtime)
+        rt = ("s_memrealtime $0\ns_waitcnt lgkmcnt(0)" if arch.startswith("gfx10")
+              else "s_sendmsg_rtn_b64 $0, sendmsg(MSG_RTN_GET_REALTIME)\ns_waitcnt lgkmcnt(0)")
+        return dict(cycles=("s_getreg_b32 $0, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", "=s"), realtime=(rt, "=s"),
+                    pin=("v_mov_b32 $0, $1", "=v,v"), pin_s=("v_readfirstlane_b32 $0, $1", "=s,v"))
+    return dict(cycles=("mov.u32 $0, %clock;", "=r"), realtime=("mov.u64 $0, %globaltimer;", "=l"),
+                pin=("mov.b32 $0, $1;", "=r,r"), pin_s=("mov.b32 $0, $1;", "=r,r"))
 
 
-REALTIME_ASM = tl.constexpr(_realtime_asm())
+_ASM = _asm()
+CYCLES_ASM, CYCLES_C = tl.constexpr(_ASM["cycles"][0]), tl.constexpr(_ASM["cycles"][1])
+REALTIME_ASM, REALTIME_C = tl.constexpr(_ASM["realtime"][0]), tl.constexpr(_ASM["realtime"][1])
+PIN_ASM, PIN_C = tl.constexpr(_ASM["pin"][0]), tl.constexpr(_ASM["pin"][1])
+PIN_S_ASM, PIN_S_C = tl.constexpr(_ASM["pin_s"][0]), tl.constexpr(_ASM["pin_s"][1])
+NV = tl.constexpr(not torch.version.hip)  # NVIDIA: %clock is 32 bit, %globaltimer in ns
 
 
 @triton.jit
 def cycles():
-    return tl.inline_asm_elementwise("s_getreg_b32 $0, hwreg(HW_REG_SHADER_CYCLES, 0, 20)", "=s", [],
-                                     dtype=tl.int32, is_pure=False, pack=1)
+    c = tl.inline_asm_elementwise(CYCLES_ASM, CYCLES_C, [], dtype=tl.int32, is_pure=False, pack=1)
+    if NV:
+        c = c & 0xFFFFF
+    return c
 
 
 @triton.jit
 def realtime():
-    return tl.inline_asm_elementwise(REALTIME_ASM, "=s", [], dtype=tl.int64, is_pure=False, pack=1)
+    t = tl.inline_asm_elementwise(REALTIME_ASM, REALTIME_C, [], dtype=tl.int64, is_pure=False, pack=1)
+    if NV:
+        t = t // 10
+    return t
 
 
 @triton.jit
 def pin(x):
-    """x, but only once it is ready (an opaque identity move)."""
-    return tl.inline_asm_elementwise("v_mov_b32 $0, $1", "=v,v", [x], dtype=x.dtype, is_pure=False, pack=1)
+    """x, but only once it is ready (an opaque identity move; 32-bit values)."""
+    w = x.to(tl.int32, bitcast=True)
+    w = tl.inline_asm_elementwise(PIN_ASM, PIN_C, [w], dtype=tl.int32, is_pure=False, pack=1)
+    return w.to(x.dtype, bitcast=True)
 
 
 @triton.jit
 def pin_s(x):
-    """pin for a (uniform) 32-bit scalar, kept in an SGPR so nothing
+    """pin for a (uniform) 32-bit scalar, kept in a uniform register (AMD: an SGPR) so nothing
     downstream turns divergent."""
-    return tl.inline_asm_elementwise("v_readfirstlane_b32 $0, $1", "=s,v", [x], dtype=x.dtype, is_pure=False, pack=1)
+    w = x.to(tl.int32, bitcast=True)
+    w = tl.inline_asm_elementwise(PIN_S_ASM, PIN_S_C, [w], dtype=tl.int32, is_pure=False, pack=1)
+    return w.to(x.dtype, bitcast=True)
 
 
 @triton.jit

@@ -320,9 +320,10 @@ class PopulationRuntime:
             launch(args, stream.cuda_stream if stream is not None else None)
         else:
             consts = self._constexprs(num_warps)
+            # waves_per_eu: an AMD backend option (the CUDA backend rejects it)
+            amd = {"waves_per_eu": self.waves_per_eu} if torch.version.hip else {}
             with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
-                compiled = self.kernel.kernel[(self.n_groups,)](*args, **consts, num_warps=num_warps,
-                                                                waves_per_eu=self.waves_per_eu)
+                compiled = self.kernel.kernel[(self.n_groups,)](*args, **consts, num_warps=num_warps, **amd)
             if aligned:
                 self._launchers[key] = _direct_launch(compiled, self.n_groups,
                                                       tuple(consts[c] for c in self._constexpr_names))
