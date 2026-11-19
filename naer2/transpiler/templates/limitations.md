@@ -107,3 +107,20 @@ interleaving got the locality instead).
   (12 CUs) at G=256 is best at 4 warps (~425 us, ~470 at 8) --
   `runtime._warp_cap`: 8 warps from 12 multiprocessors (RDNA: WGPs) up,
   else 4.
+
+## The RTX 4090 (2026-11-19, PD14 quiet, G=256)
+
+Traced per program (`tools/pd14_phases.py`; kernels: `tools/pd14_kernels.py`): pull ~8-11 us, delivery 3-6,
+update + send ~1.3, ~3 us per kernel of launch and scheduling (T, no inputs: 3 us a program, 6.3 a kernel).
+
+- **The append's tiles were the pull's cost** -- ~1 us of dependent steps each (segments, mean, claim,
+  targets, store), and a block of 32 spikes took one tile per 4 of its spikes' segments: up to ~20 a spike
+  (a segment per delay bucket, mostly 1-2 links), so 5 tiles for ~200 segments. Packing the block's
+  (spike, segment) pairs densely, one lane each (`_append_links`), cut the pull ~30% (I_4 10.4 -> 7.2 us,
+  the kernels' sum 187 -> 164 us). Wider column tiles (MSEG 8 / 16) were slower: every spike's columns
+  loaded and claimed, mostly empty.
+- **The fix-up's log moves, one pass over all slots** (a scan, a binary search per lane, instead of two
+  reductions per slot for ~80 slots): the tail of growing runs, slowest programs 36-40 -> 28-30 us.
+- **Tried, no gain:** software-pipelining the append's link loop (prefetching the next four links' loads:
+  hardly more than one link iteration a tile); prefetching delivery's next stream block during the walk
+  (slightly slower: little to overlap with a short walk, more work).
