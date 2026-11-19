@@ -122,5 +122,27 @@ update + send ~1.3, ~3 us per kernel of launch and scheduling (T, no inputs: 3 u
 - **The fix-up's log moves, one pass over all slots** (a scan, a binary search per lane, instead of two
   reductions per slot for ~80 slots): the tail of growing runs, slowest programs 36-40 -> 28-30 us.
 - **Tried, no gain:** software-pipelining the append's link loop (prefetching the next four links' loads:
-  hardly more than one link iteration a tile); prefetching delivery's next stream block during the walk
-  (slightly slower: little to overlap with a short walk, more work).
+  hardly more than one link iteration a tile -- with packed tiles ~2.1 on average, still no gain: an
+  iteration is bound by its own work, not its loads' latency); prefetching delivery's next stream block
+  during the walk (slightly slower: little to overlap with a short walk, more work); four 32-bit record
+  stores instead of the converted 128-bit one (within noise).
+- **Delivery's walk split by target warp** (a stable partition of each staged block, each warp walking its
+  own list): a full block 2.3 -> 2.05 us, a 22-link one 0.2 -> 1.37 us -- the partition (a one-hot
+  cumsum, four scatters, a barrier, reductions) costs ~1.2 us a block, the old walk ~9 ns a link, and most
+  quiet blocks are short. Delivery is bound by its fixed per-block costs, not the walk.
+- **Not tried, by the numbers:** balancing links within a packed tile -- link iterations per tile 1: 25%,
+  2: 50%, 3: 17%, 4-6: 8% (~2.1 on average); a second scan and search per tile (~0.8 us, like the tile
+  setup) to save ~1.1 iterations of ~0.35 us.
+- **The tile setup** (0.77 us: the lane's spike by a 5-step binary search over LDS, then 8 per-spike LDS
+  gathers): one packed [8, SPK] table read with one gather didn't compile (Gluon: a 2-D shared gather along
+  axis 1 asserts in LinearLayout; rows of a 2-D shared buffer by .index fail on rank); counting the
+  spike's first pair in registers ([T, SPK] compares) was slower (0.94 us) -- the layout conversions into
+  and out of the [T, SPK] layout go through LDS with barriers, dearer than the gathers.
+- **One header chain** (the per-connection last-read / overrun reductions from the per-(connection, slot)
+  header loads, not a second plan -> history -> tag chain): ~2% on the pull -- the two chains had been
+  issued together already.
+- **Layout conversions are the hidden cost in Gluon:** a `convert_layout` between distributions goes
+  through LDS with a barrier; replacing a few LDS gathers with register work that needs conversions loses.
+- **Measuring GPU busy time:** `tools/pd14_busy.py` (the trace's per-program wall clock, per-round trace
+  slices, free-running). RTX 4090, G=256: 105 us busy a round, no overlap between kernels, the longest
+  15 us (23 max) -- while the profiler's kernel times are ~25 us: ~10 us a kernel outside the programs.

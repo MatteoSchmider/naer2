@@ -839,30 +839,15 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     #   every hook runs at delivery, in delivery order (strict per-link order)
     ci = gl.arange(0, MAX_CONNS, layout=LV)
     cv = ci < n_conns
-    hbuf_c = gl.load(hist_addr + ci, mask=cv, other=0)
     last_c = gl.load(last_read + parity * n_conns + ci, mask=cv, other=0)
-    newest_c = last_c
-    oldest_c = gl.zeros_like(last_c) + 2147483647
-    for jj in gl.static_range(SK):  # per connection: its newest and oldest fresh run (last-read, overrun)
-        tag = gl.load((hbuf_c.to(gl.pointer_type(gl.int32)) + 8 * jj).to(gl.pointer_type(gl.int64)),
-                      mask=cv, other=0)  # run id and round, read whole
-        rid = (tag & 0xFFFFFFFF).to(gl.int32)
-        rnd = (tag >> 32).to(gl.int32)
-        f = cv & (rid > last_c) & (rnd < round_id)
-        newest_c = gl.where(f, gl.maximum(newest_c, rid), newest_c)
-        oldest_c = gl.where(f, gl.minimum(oldest_c, rid), oldest_c)
-    gl.store(last_read + (1 - parity) * n_conns + ci, newest_c, mask=cv)  # idempotent across programs
-    if gl.max((cv & (oldest_c < 2147483647) & (oldest_c > last_c + 1)).to(gl.int32), axis=0) > 0:
-        gl.atomic_max(oflags, 1)  # a run fell out of the history before this consumer read it
-    # per (connection, slot): the fresh runs, taken in in order of their
-    # (earliest) emission time -- under uniform sources a run's spikes
-    # share one e but runs differ, and main runs must grow in e
+    # per (connection, slot): its run's header -- one chain (plan -> history -> header) for everything below
     cj = gl.arange(0, MAX_CJ, layout=LV)
     c_of = cj // KP
     j_of = cj % KP
     vj = (c_of < n_conns) & (j_of < SK)
     hbuf = gl.load(hist_addr + c_of, mask=vj, other=0)
     hcap = gl.load(hcap_p + c_of, mask=vj, other=0)
+    lastj = gl.load(last_read + parity * n_conns + c_of, mask=vj, other=0)
     hdr = hbuf.to(gl.pointer_type(gl.int32)) + 8 * j_of
     tag = gl.load(hdr.to(gl.pointer_type(gl.int64)), mask=vj, other=0)  # run id and round, read whole
     rid = (tag & 0xFFFFFFFF).to(gl.int32)
@@ -870,8 +855,19 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     cnt = gl.load(hdr + 2, mask=vj, other=0)
     wend = gl.load((hdr + 3).to(gl.pointer_type(gl.float32)), mask=vj, other=0.0)
     early = gl.load((hdr + 4).to(gl.pointer_type(gl.float32)), mask=vj, other=float("inf"))
-    lastj = gl.load(last_read + parity * n_conns + c_of, mask=vj, other=0)
-    fresh = vj & (rid > lastj) & (rnd < round_id) & (cnt > 0)
+    # per connection: its newest and oldest run newer than last read (the last-read update, the overrun
+    # check), reduced over its slots
+    newer = vj & (rid > lastj) & (rnd < round_id)
+    newest_c = gl.convert_layout(gl.max(gl.reshape(gl.where(newer, rid, 0), [MAX_CONNS, KP]), axis=1), LV)
+    oldest_c = gl.convert_layout(gl.min(gl.reshape(gl.where(newer, rid, 2147483647), [MAX_CONNS, KP]), axis=1),
+                                 LV)
+    newest_c = gl.maximum(newest_c, last_c)
+    gl.store(last_read + (1 - parity) * n_conns + ci, newest_c, mask=cv)  # idempotent across programs
+    if gl.max((cv & (oldest_c < 2147483647) & (oldest_c > last_c + 1)).to(gl.int32), axis=0) > 0:
+        gl.atomic_max(oflags, 1)  # a run fell out of the history before this consumer read it
+    # the fresh runs, taken in in order of their (earliest) emission time -- under uniform sources a run's
+    # spikes share one e but runs differ, and main runs must grow in e
+    fresh = newer & (cnt > 0)
     n_spk = gl.where(fresh, gl.minimum(cnt, hcap), 0)
     key = gl.where(fresh, early, float("inf"))
     key_r = gl.convert_layout(key, gl.SliceLayout(0, LKC))

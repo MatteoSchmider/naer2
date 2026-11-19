@@ -115,11 +115,19 @@ if LEVEL >= 3:  # inside the append, per tile: the steps' durations, median over
                 for a_, b_ in zip(order_, order_[1:]):
                     dur[b_].append(seq[b_] - seq[a_])
                 dur["tile"].append(seq.get("a:stored", seq["start"]) - seq["start"])
-                tiles.append(sum(1 for t2, _, _ in ev[i:i + 200] if t2 == "a:targets"))
+                n_it = 0
+                for t2, _, _ in ev[i + 1:]:
+                    if t2 == "a:targets":
+                        n_it += 1
+                    elif t2 in ("a:segments", "appended", "pulled"):
+                        break
+                tiles.append(n_it)
     print(f"  inside the append (last round), per tile, median ({unit}): " + ", ".join(
         f"{st}: {us(statistics.median(dur[st])).strip()}" for st in steps + ("tile",) if dur[st]))
-    print(f"  {len(dur['tile'])} tiles; target/store iterations per tile: median "
-          f"{statistics.median([sum(1 for _ in [0])]) if False else ''}(see a:targets counts)")
+    import collections
+    hist = collections.Counter(tiles)
+    print(f"  {len(dur['tile'])} tiles; link iterations per tile (count: tiles): "
+          + ", ".join(f"{k}: {v}" for k, v in sorted(hist.items())))
 if LEVEL >= 2:  # the slowest program of the slowest population: its event sequence
     n = max(pops, key=lambda n: worst[n][0])
     ev = worst[n][1]

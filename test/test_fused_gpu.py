@@ -119,9 +119,11 @@ def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n
         lo = due_until[r - 1] + 1 if r else -10**9
         want = sorted((k, e, c, s, tg) for k, e, c, s, tg, _ in pending if lo <= k <= due_until[r])
         assert sorted(delivered) == want, f"run {r}"
-        for grp in range(consumer.n_groups):
-            order = [(k, e) for k, e, c, s, tg in delivered if tg // group_size == grp]
-            assert order == sorted(order), f"run {r}, group {grp}: not in slot then emission order"
+        # per target neuron, its links in slot then emission order (the walk's guarantee: a neuron's links in
+        # their order; links of different neurons in parallel, per warp -- the log interleaves them)
+        for tg in sorted({tg for *_, tg in delivered}):
+            order = [(k, e) for k, e, c, s, t in delivered if t == tg]
+            assert order == sorted(order), f"run {r}, target {tg}: not in slot then emission order"
     assert any(delivered_by_run), "nothing was delivered"
     sums = torch.zeros(n_targets, dtype=torch.float64)
     counts = torch.zeros(n_targets, dtype=torch.int64)
