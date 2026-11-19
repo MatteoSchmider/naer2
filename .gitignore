@@ -5,3 +5,4 @@
 /.venv
 /.vscode
 *.pyc
+/cloud/instance.env
