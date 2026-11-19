@@ -39,13 +39,21 @@ comments; D-n are the decisions below.
   (`w = gl.load(atp + l)`, in delivery, kernel of 57 programs: E_6) -- a
   staged ring record within the slot's count holding garbage (connection
   or link index). Gone with `PYTORCH_NO_CUDA_MEMORY_CACHING=1` (3/3), under
-  compute-sanitizer memcheck (0 errors: serialized); keeping old ring
-  buffers alive doesn't help. Suspect: a position below a count never
-  written -- uninitialized arena memory since the copy-once growth
-  (`Ring._grow_arena`: `torch.empty`). initcheck (caching off) reported an
-  uninitialized 8-byte host `.item()` read so far; its full report is the
-  next step (`compute-sanitizer --tool initcheck --launch-skip 62000`).
-  Also fixed on the way: a resize now syncs after its work too (the
+  compute-sanitizer memcheck (0 errors: serialized) -- both add syncs
+  (cudaFree), so a race. Ruled out (each still faults, `tools/pd14_volley.py`
+  flags): ring buffers freed and reused (`--keep-old`), uninitialized arena
+  memory from the copy-once growth (`--zero-growth`), the warp count
+  (`--warps=4`). Instrumented staging (2026-11-19, reverted): the faulting
+  record lies inside the arena, its connection id is valid (< n_conns) and
+  its link index plausible (0 <= l < 2^26) -- so either the link index is
+  wrong for its connection (a record written from a garbage spike: a
+  source neuron id out of range in the pull would give a garbage segment,
+  hence link index) or the connection's attr pointer table (`s_atp`) is.
+  initcheck is too slow here (> 30 min, only host `.item()` reports).
+  Next: validate in the pull -- every spike's source neuron < its
+  connection's n_src, every segment / link index within its topology --
+  and in `_emit_spikes` the history entries (the G=64 bug was there). Also
+  fixed on the way: a resize now syncs after its work too (the
   populations' next runs, on their own streams, didn't wait for it).
 
 - **Ring sizing** (2026-11-18). Every group's main and side runs live in

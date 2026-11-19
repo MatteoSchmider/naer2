@@ -1,5 +1,7 @@
 """PD14 through the thalamic volley on the current device (from the repo root: python tools/pd14_volley.py G
-[--profile] [--keep-old]; on a cloud instance: cloud/remote py tools/pd14_volley.py G ...).
+[--profile] [--keep-old] [--zero-growth] [--warps=N]; on a cloud instance: cloud/remote run 'python
+tools/pd14_volley.py G ...'). Diagnostics: --keep-old never frees a ring's old buffer, --zero-growth
+zero-fills grown rings, --warps=N overrides the device's warp cap.
 Runs to 730 ms freely (no syncs), reports a fault if one happens; with --profile, the volley's first 200 rounds
 (700.5-720.5 ms) under the profiler: per population, median and slowest kernel."""
 import os
@@ -20,6 +22,14 @@ if "--keep-old" in sys.argv:  # never free a ring's old buffer (diagnostic)
     KEEP_OLD = []
     _hold = RG._hold_until_done
     RG._hold_until_done = lambda buf: (KEEP_OLD.append(buf), _hold(buf))[1]
+if "--zero-growth" in sys.argv:  # every ring buffer zero-filled, also when grown (diagnostic)
+    from naer2 import ring as RG
+    _alloc = RG.Ring._allocate
+    RG.Ring._allocate = lambda self, main_cap, side_cap, device, zero_records=True: _alloc(
+        self, main_cap, side_cap, device, zero_records=True)
+for a in sys.argv:
+    if a.startswith("--warps="):  # the warp cap (diagnostic): runtime._warp_cap overridden
+        R._warp_cap = lambda device, _w=int(a.split("=")[1]): _w
 PROFILE = "--profile" in sys.argv
 t0 = time.time()
 obj = P._network(G)
