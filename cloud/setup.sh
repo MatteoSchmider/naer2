@@ -8,6 +8,7 @@
 #
 # What it does:
 #   - gcc from apt: Triton compiles a small C launcher for every kernel it builds
+#   - on NVIDIA, compute-sanitizer and cuda-gdb for the image's CUDA toolkit (NVIDIA's apt packages)
 #   - uv (pip) and, through it, Python 3.12 (naer2 uses PEP 695 `type` statements) in .venv
 #   - cloud/requirements.txt into .venv: torch from TORCH_INDEX (default CUDA 12.8), Triton 3.9 over the
 #     version torch pins (naer2's kernels are Gluon)
@@ -31,6 +32,26 @@ if ! command -v gcc >/dev/null; then
     apt-get install -y -qq gcc libc6-dev >/dev/null
 fi
 gcc --version | head -1
+
+step "CUDA debugging tools (compute-sanitizer, cuda-gdb)"
+# NVIDIA: the packages for the image's CUDA toolkit (/usr/local/cuda-X.Y), from NVIDIA's apt repository --
+# memcheck / initcheck for illegal or uninitialized accesses, cuda-gdb for GPU core dumps
+# (CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1); Triton's kernels carry line info, so both name the fused.py line
+cuda_dir="$(ls -d /usr/local/cuda-[0-9]*.[0-9]* 2>/dev/null | sort -V | tail -1 || true)"
+if [ -n "$cuda_dir" ] && command -v nvidia-smi >/dev/null; then
+    ver="${cuda_dir##*/cuda-}"; pkg="${ver/./-}"
+    if [ ! -x "$cuda_dir/bin/compute-sanitizer" ] || [ ! -x "$cuda_dir/bin/cuda-gdb" ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq "cuda-sanitizer-$pkg" "cuda-gdb-$pkg" >/dev/null 2>&1 \
+            || { apt-get update -qq && apt-get install -y -qq "cuda-sanitizer-$pkg" "cuda-gdb-$pkg" >/dev/null 2>&1; } \
+            || echo "(not installable here: cuda-sanitizer-$pkg / cuda-gdb-$pkg -- skipped)"
+    fi
+    for tool in compute-sanitizer cuda-gdb; do
+        [ -x "$cuda_dir/bin/$tool" ] && echo "$tool: $cuda_dir/bin/$tool"
+    done
+else
+    echo "(no CUDA toolkit in /usr/local or no NVIDIA GPU: skipped)"
+fi
 
 step "uv"
 if ! command -v uv >/dev/null; then

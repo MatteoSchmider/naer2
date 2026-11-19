@@ -46,7 +46,9 @@ remote() {  # remote COMMAND-STRING [ssh flags...]: in the repo, the venv's bin 
 sync() {
     remote "command -v rsync >/dev/null || { DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync >/dev/null; }" >/dev/null
-    rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
+    # (--no-owner --no-group: the files belong to the remote user, else git there refuses the repo as
+    # "dubious ownership")
+    rsync -az --no-owner --no-group --delete -e "ssh ${SSH_OPTS[*]}" \
         --exclude .git --exclude .venv --exclude __pycache__ --exclude .pytest_cache --exclude .rocprofv3 \
         --exclude .claude --exclude .vscode --exclude cloud/instance.env \
         --out-format='  %n' "$REPO/" "$TARGET:$REMOTE_DIR/" | grep -v '/$' || true
@@ -69,6 +71,8 @@ if [ ! -d "$dir/.git" ]; then
     git clone -q "$url" "$dir"
 fi
 cd "$dir"
+# (files synced by an older cloud/remote may belong to another uid: git refuses those repos without this)
+git config --global --get-all safe.directory | grep -qx "$dir" || git config --global --add safe.directory "$dir"
 git fetch -q origin || echo "(fetch failed: staying on what is there)"
 if git cat-file -e "$commit^{commit}" 2>/dev/null; then
     git checkout -q -f --detach "$commit"

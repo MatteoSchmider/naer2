@@ -31,6 +31,23 @@ comments; D-n are the decisions below.
 
 ## Open work
 
+- **Illegal address in PD14's volley on the RTX 4090** (2026-11-19, open, next).
+  G=256 / 8 warps, free-running (no syncs): faults in most runs between
+  rounds ~7025 and ~7110, after the volley's onset (resizes, one
+  stop-and-rerun). A GPU core dump (cuda-gdb, `CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`)
+  puts it at `fused.py` `_stage_records`, the per-link weight load
+  (`w = gl.load(atp + l)`, in delivery, kernel of 57 programs: E_6) -- a
+  staged ring record within the slot's count holding garbage (connection
+  or link index). Gone with `PYTORCH_NO_CUDA_MEMORY_CACHING=1` (3/3), under
+  compute-sanitizer memcheck (0 errors: serialized); keeping old ring
+  buffers alive doesn't help. Suspect: a position below a count never
+  written -- uninitialized arena memory since the copy-once growth
+  (`Ring._grow_arena`: `torch.empty`). initcheck (caching off) reported an
+  uninitialized 8-byte host `.item()` read so far; its full report is the
+  next step (`compute-sanitizer --tool initcheck --launch-skip 62000`).
+  Also fixed on the way: a resize now syncs after its work too (the
+  populations' next runs, on their own streams, didn't wait for it).
+
 - **Ring sizing** (2026-11-18). Every group's main and side runs live in
   one arena of 256-record blocks (`naer2/ring.py`; `fused.py`:
   `_append_links`, `_pool_fixup`, `_free_blocks`), sized at runtime
