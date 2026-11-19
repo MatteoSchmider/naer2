@@ -30,6 +30,49 @@ if "--zero-growth" in sys.argv:  # every ring buffer zero-filled, also when grow
 for a in sys.argv:
     if a.startswith("--warps="):  # the warp cap (diagnostic): runtime._warp_cap overridden
         R._warp_cap = lambda device, _w=int(a.split("=")[1]): _w
+BLK = []  # TEMP: staging's block ids past the group's arena (ring header words 19..24), read before resizes
+_apply = R.PopulationRuntime._apply_wanted
+def _apply_blk(self):
+    if self._wanted is not None:
+        w = self.ring.buf[19:32].tolist()
+        if w[0] or w[6] or w[7]:
+            BLK.append((self.n, self.run_id, w))
+    return _apply(self)
+R.PopulationRuntime._apply_wanted = _apply_blk
+INV = []  # TEMP: arena invariant (held blocks + free stack = every id once, per group), checked before resizes
+def _check_arena(rt, when):
+    ring = rt.ring
+    if not ring.pool_b or len(INV) >= 2:
+        return
+    g, S, nb, B = ring.n_groups, ring.n_slots, ring.pool_nb, ring.pool_b
+    table, side, stack = ring.table.cpu(), ring.side_table.cpu(), ring.stack.cpu()
+    nblk, scount, top = ring.nblk.cpu(), ring.side_count.cpu(), ring.top.cpu()
+    for grp in range(g):
+        ids = []
+        for c in range(grp * S, (grp + 1) * S):
+            ids += [(int(x), f"main cell {c}") for x in table[c, :int(nblk[c])]]
+            ids += [(int(x), f"side cell {c}") for x in side[c, :-(-int(scount[c]) // B)]]
+        ids += [(int(x), "free") for x in stack[grp, :int(top[grp])]]
+        seen = {}
+        dups = []
+        for i, where in ids:
+            if i in seen:
+                dups.append((i, seen[i], where))
+            seen[i] = where
+        missing = sorted(set(range(nb)) - set(seen))
+        if dups or missing:
+            INV.append((rt.n, when, grp, dups[:4], missing[:8], len(ids), nb))
+            return
+_apply2 = R.PopulationRuntime._apply_wanted
+def _apply_inv(self):
+    if self._wanted is None:
+        return _apply2(self)
+    nb0 = self.ring.pool_nb
+    _check_arena(self, f"{self.run_id}, before resizing from {nb0}")
+    out = _apply2(self)
+    _check_arena(self, f"{self.run_id}, after resizing {nb0} -> {self.ring.pool_nb}")
+    return out
+R.PopulationRuntime._apply_wanted = _apply_inv
 PROFILE = "--profile" in sys.argv
 t0 = time.time()
 obj = P._network(G)
@@ -62,6 +105,28 @@ try:
 except Exception as e:
     print(f"FAULT near round {r}: {type(e).__name__}: {str(e).splitlines()[0][:140]}")
     sys.exit(1)
+for nm_, p_ in pops.items():
+    w = P._runtime("network", p_).ring.buf[19:32].tolist()
+    if w[0] or w[6] or w[7]:
+        BLK.append((P._runtime("network", p_).n, "end", w))
+for n_, when, grp, dups, missing, n_ids, nb in INV:
+    print(f"  ARENA INVARIANT broken (n={n_}, run {when}): group {grp}, {n_ids} ids for {nb} "
+          f"blocks; duplicates (id, first, second) {dups}; missing {missing}")
+if not INV:
+    print("  arena invariant held at every resize checked")
+for n_, when, w in BLK[:8]:
+    print(f"  STAGING (n={n_}, at {when}): blocks past arena {w[0]}; link index out of its connection {w[6]}, "
+          f"LDS attr pointer != plan's {w[7]}; first: source word {w[9]:#x} link {w[10]} of {w[11]}, "
+          f"position {w[12] >> 16} of count {w[12] & 0xFFFF}")
+import struct  # TEMP: the pull validation's counters (runtime.overrun words 1..)
+for nm, p in pops.items():
+    o = P._runtime("network", p).overrun.tolist()
+    if o[1] or o[2] or o[3]:
+        e = struct.unpack("f", struct.pack("i", o[15]))[0]
+        print(f"  PULL CHECK {nm}: bad spikes {o[1]}, bad segment ranges {o[2]}, bad link ranges {o[3]}; first: "
+              f"group {o[5]} round {o[6]} conn {o[7]} slot {o[8]} index {o[9]}: source {o[10]} of {o[11]}, "
+              f"segments [{o[12]}, {o[13]}) of {o[14]}, e {e:.4f}, e-group spikes {o[16]}; links: lo {o[17]} "
+              f"n {o[18]} segment {o[19]}")
 resizes = sum(len(P._runtime("network", p).resizes) for p in pops.values())
 warps = P._runtime("network", list(net.populations)[0])._warps(None)
 print(f"no fault through round 7305 ({torch.cuda.get_device_name(0)}, G={G}, {warps} warps): volley's first 200 "

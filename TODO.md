@@ -50,9 +50,24 @@ comments; D-n are the decisions below.
   source neuron id out of range in the pull would give a garbage segment,
   hence link index) or the connection's attr pointer table (`s_atp`) is.
   initcheck is too slow here (> 30 min, only host `.item()` reports).
-  Next: validate in the pull -- every spike's source neuron < its
-  connection's n_src, every segment / link index within its topology --
-  and in `_emit_spikes` the history entries (the G=64 bug was there). Also
+  Since (2026-11-19, instrumentation in `tools/pd14_volley_debug.patch`:
+  `git apply` it, run `tools/pd14_volley.py 256`): the pull writes only
+  valid records (spikes, segment ranges, link ranges all checked: none
+  bad); staging finds MIXED records -- a valid connection id with a link
+  index past that connection's links (34-588 per run, near the end of
+  their slot's count) -- and masking them stops the fault (3/3 clean).
+  The arena invariant (per group: every block id once among the held
+  blocks and the free stack) broke once, before a resize in E_23: block 0
+  (cell 0's reserve) in cell 14's table several times, ids 212-219
+  nowhere -- so a fix-up popped stack positions holding 0 instead of
+  those ids, and two slots then wrote one block (hence the mixed
+  records). Not the log move's 4 word stores (a 128-bit move: still
+  mixed), not `Ring._grow_arena` on the CPU (300 random growths keep the
+  invariant). Checking the invariant before AND after every resize slows
+  rounds to ~16 ms and the race doesn't show. Next: find what puts zeros
+  (or stale ids) at live stack positions -- a check on the device, cheap
+  enough to keep the timing (e.g. the fix-up verifying each popped id
+  against the group's tables, or a per-group bitmap of held ids). Also
   fixed on the way: a resize now syncs after its work too (the
   populations' next runs, on their own streams, didn't wait for it).
 

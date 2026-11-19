@@ -1,0 +1,193 @@
+diff --git a/naer2/runtime.py b/naer2/runtime.py
+index 0c82a3d..5f9711f 100644
+--- a/naer2/runtime.py
++++ b/naer2/runtime.py
+@@ -210,7 +210,7 @@ class PopulationRuntime:
+         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
+         self.batch = PULL["batch"]
+         self.trace = None
+-        self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
++        self.overrun = torch.zeros(32, device=self.device, dtype=torch.int32)  # TEMP debug words 1..
+         self._launchers = {}
+         self._launches = _launches(self.device)
+         self._launches.runtimes.add(self)
+diff --git a/naer2/transpiler/templates/fused.py b/naer2/transpiler/templates/fused.py
+index 3133f11..c4394c6 100644
+--- a/naer2/transpiler/templates/fused.py
++++ b/naer2/transpiler/templates/fused.py
+@@ -412,8 +412,14 @@ def _pool_fixup(s_cnt, cnt0, rec0, table, stack, log_rec, ovf_cap, top0, g, sl,
+                     blk = gl.load(table + cs * nb + gl.minimum(p // POOL_B, nb - 1), mask=m, other=0)
+                     dst = 4 * ((g * nb + blk) * POOL_B + p % POOL_B)
+                     src = 4 * (log_rec + cs * ovf_cap + (p - h))
+-                    for f in gl.static_range(4):
+-                        gl.store(rec0 + dst + f, gl.load(rec0 + src + f, mask=m), mask=m)
++                    # TEST: one 128-bit load and store per record (a row of 4 words in one thread)
++                    LR4: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [NUM_WARPS, 1], [1, 0])
++                    col4 = gl.arange(0, 4, layout=gl.SliceLayout(0, LR4))
++                    src2 = gl.multiple_of(gl.convert_layout(src, gl.SliceLayout(1, LR4)), 4)
++                    dst2 = gl.multiple_of(gl.convert_layout(dst, gl.SliceLayout(1, LR4)), 4)
++                    m2 = gl.convert_layout(m, gl.SliceLayout(1, LR4))[:, None] & (col4[None, :] < 4)
++                    words = gl.load(rec0 + src2[:, None] + col4[None, :], mask=m2)
++                    gl.store(rec0 + dst2[:, None] + col4[None, :], words, mask=m2)
+             gl.barrier()
+             new_top = top0 - gl.sum(want, axis=0)
+     used = gl.where(fits, nb - new_top, nb - top0 + total)
+@@ -473,7 +479,7 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
+                   N_SLOTS: gl.constexpr, main_cap, LP2: gl.constexpr, LM: gl.constexpr,
+                   SPK: gl.constexpr, MSEG: gl.constexpr,
+                   TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
+-                  POOL_B: gl.constexpr, nb):
++                  POOL_B: gl.constexpr, nb, nl_dbg, oflags):
+     """A block of spikes (uniform sources): every segment [a, b) of the
+     ones going to the main runs claims a range of its slot's run in group
+     g's ring -- the per-slot link counts live in LDS (s_cnt), the program
+@@ -494,6 +500,17 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
+         gb = gl.load(seg_gb[:, None] + seg, mask=ok, other=0)
+         lo_l = gl.load(seg_start[:, None] + seg, mask=ok, other=0)
+         n_l = gl.load(seg_start[:, None] + seg + 1, mask=ok, other=0) - lo_l
++        # TEMP debug: every segment's links within its connection's
++        bad_l = ok & ((lo_l < 0) | (n_l < 0) | (lo_l + n_l > (nl_dbg + gl.zeros_like(s))[:, None]))
++        if gl.max(gl.max(bad_l.to(gl.int32), axis=1), axis=0) > 0:
++            gl.atomic_add(oflags + 3 + gl.zeros_like(lo_l), 1, mask=bad_l)
++            claim = gl.atomic_add(oflags + 4, 1)
++            if claim == 0:
++                gl.store(oflags + 17, gl.max(gl.max(gl.where(bad_l, lo_l, -(1 << 30)), axis=1), axis=0))
++                gl.store(oflags + 18, gl.max(gl.max(gl.where(bad_l, n_l, -(1 << 30)), axis=1), axis=0))
++                gl.store(oflags + 19, gl.max(gl.max(gl.where(bad_l, seg, -(1 << 30)), axis=1), axis=0))
++        ok = ok & ~bad_l
++        n_l = gl.where(ok, n_l, 0)
+         if TRACE >= 3:
+             gb = pin(gb)
+             n_l = pin(n_l)
+@@ -684,7 +701,7 @@ def _walk(r_tgt, r_w, r_src, r_e, nq, state, received, n_received, lane, mask, u
+ @gluon.jit
+ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, table, STREAM: gl.constexpr,
+                    NUM_WARPS: gl.constexpr, LOG: gl.constexpr, STAGE_E: gl.constexpr, N_SLOTS: gl.constexpr,
+-                   main_cap, POOL_B: gl.constexpr, nb):
++                   main_cap, POOL_B: gl.constexpr, nb, dbg, attr_ref, nlnk_p):
+     """Links b0 .. b0 + STREAM of a slot's main run staged in LDS for the
+     walk: each record ONE 128-bit load, split into its fields in registers,
+     the weight by link index through the connection's attribute pointer (a
+@@ -697,6 +714,20 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, t
+     qv = q < nm
+     rec, ok = _run_rec(cell, q, n_cells, table, N_SLOTS, POOL_B, nb, POOL_RESERVE)
+     qv = qv & ok
++    if POOL_B > 0:  # TEMP debug: a block id past the group's own arena (ring header word 19: count; 20..: first)
++        blkv = _table_blk(table, cell, q, N_SLOTS, POOL_B, nb, POOL_RESERVE)
++        badb = qv & (blkv >= nb)
++        if gl.max(badb.to(gl.int32), axis=0) > 0:
++            claim = gl.atomic_add(dbg + 19, 1)
++            if claim == 0:
++                qb = gl.min(gl.where(badb, q, 1 << 30), axis=0)
++                sel = badb & (q == qb)
++                gl.store(dbg + 20, cell)
++                gl.store(dbg + 21, qb)
++                gl.store(dbg + 22, nm)
++                gl.store(dbg + 23, gl.max(gl.where(sel, blkv, -(1 << 30)), axis=0))
++                gl.store(dbg + 24, nb)
++        qv = qv & ~badb
+     at = gl.multiple_of(4 * rec, 4)
+     col = gl.arange(0, 4, layout=gl.SliceLayout(0, LR))
+     words = gl.load(rec0 + at[:, None] + col[None, :], mask=qv[:, None] & (col[None, :] < 4), other=0)
+@@ -710,7 +741,26 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, t
+     #   connection's block pointer (D-7): its variant's attrs into the stage's attr slots; here: the weight
+     # The load is unconditional -- a connection whose receive reads no per-link attr still needs a
+     #   valid attr block (or a constexpr that skips the load), else this reads past its topology
+-    atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
++    atp_raw = s_atp.gather(srcw >> 24, 0)
++    atp = atp_raw.to(gl.pointer_type(gl.float32))
++    if POOL_B > 0:  # TEMP debug: the record's link index within its connection, the LDS pointer = the plan's
++        cn = (srcw >> 24) & 0xFF
++        nl_c = gl.load(nlnk_p + cn, mask=qv, other=1 << 30)
++        ref = gl.load(attr_ref + cn, mask=qv, other=0)
++        bad_l = qv & ((l < 0) | (l >= nl_c))
++        bad_p = qv & ~bad_l & (atp_raw != ref)
++        if gl.max((bad_l | bad_p).to(gl.int32), axis=0) > 0:
++            gl.atomic_add(dbg + 25 + gl.zeros_like(q), 1, mask=bad_l)
++            gl.atomic_add(dbg + 26 + gl.zeros_like(q), 1, mask=bad_p)
++            claim = gl.atomic_add(dbg + 27, 1)
++            if claim == 0:
++                qb = gl.min(gl.where(bad_l | bad_p, q, 1 << 30), axis=0)
++                sel = (bad_l | bad_p) & (q == qb)
++                gl.store(dbg + 28, gl.max(gl.where(sel, srcw, -(1 << 30)), axis=0))
++                gl.store(dbg + 29, gl.max(gl.where(sel, l, -(1 << 30)), axis=0))
++                gl.store(dbg + 30, gl.max(gl.where(sel, nl_c, -1), axis=0))
++                gl.store(dbg + 31, qb * 65536 + gl.minimum(nm, 65535))
++        qv = qv & ~bad_l & ~bad_p
+     w = gl.load(atp + l, mask=qv, other=0.0)
+     # GAP (forward): the transpiled edge forward goes here, on link lanes (one record per lane, rooted
+     #   at qv -- the old template's lane_mask="_lk_valid"), its assigned attrs stored back at l before staging,
+@@ -878,6 +928,10 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
+         tab_dfirst = _table(j_dfirst.to(gl.int64), SM)
+         tab_dwords = _table(j_dwords.to(gl.int64), SM)
+         tab_W = _table(gl.load(dwords_p + c_of, mask=vj, other=0), SM)
++        # TEMP debug: per pair, its connection's sources, segments, links (the pull's validation)
++        tab_dn = _table(nsrc_j, SM)
++        tab_dg = _table(gl.load(t_seg_p + c_of, mask=vj, other=0), SM)
++        tab_dl = _table(gl.load(t_lnk_p + c_of, mask=vj, other=0), SM)
+         tab_first = gl.allocate_shared_memory(gl.int32, [MAX_CJ], SM)  # per e-group: each pair's first spike
+     if UNIFORM_SOURCES:
+         # this group's per-slot link counts, in LDS for the pull's appends (it is their only writer)
+@@ -951,6 +1005,33 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
+                     if TRACE >= 2:
+                         b = pin(b)
+                         n_ev = mark(trace, n_ev, 12, gl.sum((b > a).to(gl.int32), axis=0), TRACE_CAP)
++                    # TEMP debug: the spike's source in range, its segments within its topology
++                    dn = tab_dn.gather(cj_t, 0)
++                    dg = tab_dg.gather(cj_t, 0)
++                    bad_s = tv & ((s < 0) | (s >= dn))
++                    bad_g = tv & ~bad_s & ((a < 0) | (b < a) | (b > dg))
++                    bad = bad_s | bad_g
++                    if gl.max(bad.to(gl.int32), axis=0) > 0:
++                        gl.atomic_add(oflags + 1 + gl.zeros_like(t), 1, mask=bad_s)
++                        gl.atomic_add(oflags + 2 + gl.zeros_like(t), 1, mask=bad_g)
++                        claim = gl.atomic_add(oflags + 4, 1)
++                        if claim == 0:
++                            tb = gl.min(gl.where(bad, t, 1 << 30), axis=0)
++                            sel = bad & (t == tb)
++                            gl.store(oflags + 5, pid)
++                            gl.store(oflags + 6, round_id)
++                            gl.store(oflags + 7, gl.max(gl.where(sel, cj_t // KP, -1), axis=0))
++                            gl.store(oflags + 8, gl.max(gl.where(sel, cj_t % KP, -1), axis=0))
++                            gl.store(oflags + 9, gl.max(gl.where(sel, t - f_t, -1), axis=0))
++                            gl.store(oflags + 10, gl.max(gl.where(sel, s, -(1 << 30)), axis=0))
++                            gl.store(oflags + 11, gl.max(gl.where(sel, dn, -1), axis=0))
++                            gl.store(oflags + 12, gl.max(gl.where(sel, a, -(1 << 30)), axis=0))
++                            gl.store(oflags + 13, gl.max(gl.where(sel, b, -(1 << 30)), axis=0))
++                            gl.store(oflags + 14, gl.max(gl.where(sel, dg, -1), axis=0))
++                            gl.store(oflags + 15, gl.max(gl.where(sel, e, -1.0), axis=0).to(gl.int32, bitcast=True))
++                            gl.store(oflags + 16, n_tot)
++                    tv = tv & ~bad
++                    b = gl.where(bad, a, b)
+                     main = tv & (e >= wmark) & (e < wend_t)
+                     has = b > a
+                     violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
+@@ -960,7 +1041,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
+                                          main_time, main_src, main_lo, main_n,
+                                          flags, trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap,
+                                          LP2, LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B,
+-                                         nb)
++                                         nb, tab_dl.gather(cj_t, 0), oflags)
+                     if TRACE >= 2:
+                         n_ev = mark(trace, n_ev, 13, gl.sum(gl.where(main, b - a, 0), axis=0), TRACE_CAP)
+                 wmark = gl.maximum(wmark, e_max)  # later e-groups are compared against this one
+@@ -1011,7 +1092,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
+                     n_ev = _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, ltp_r, s_cnt, pid,
+                                          k_lo, slot_width, n_cells, main_time, main_src, main_lo, main_n, flags,
+                                          trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap, LP2,
+-                                         LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B, nb)
++                                         LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B, nb,
++                                         1 << 30, oflags)
+                 wmark = gl.maximum(wmark, e_max)  # the next run (later e) is compared against this one
+                 gl.barrier()  # the run's appends are in before the next run's (main runs grow in e)
+             else:
+@@ -1190,7 +1272,8 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane,
+             # the slot's link records are its stream: STREAM links at a time
+             for b0 in range(0, nm, STREAM):
+                 nq = _stage_records(main_src - 1, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, table,
+-                                    STREAM, NUM_WARPS, LOG, STAGE_E, N_SLOTS, main_cap, POOL_B, nb)
++                                    STREAM, NUM_WARPS, LOG, STAGE_E, N_SLOTS, main_cap, POOL_B, nb, ring,
++                                    attr_addr, _t_lnk_p)
+                 if TRACE:
+                     n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
+                 state, received, n_received = _walk(
