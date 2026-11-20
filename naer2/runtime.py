@@ -209,6 +209,7 @@ class PopulationRuntime:
         self.stream_block, self.unroll = WALK["stream"], WALK["unroll"]
         self.waves_per_eu = 0
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
+        self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
         self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
@@ -371,7 +372,7 @@ class PopulationRuntime:
             self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
             self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log]
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
-        key = (num_warps, self.waves_per_eu, self.count_received, self.batch, self.stream_block,
+        key = (num_warps, self.waves_per_eu, self.maxnreg, self.count_received, self.batch, self.stream_block,
                self.unroll, self.log_cap > 0)
         launch = self._launchers.get(key)
         aligned = all(not (t.data_ptr() & 15) for t in state)  # the specialization every call meets
@@ -380,7 +381,9 @@ class PopulationRuntime:
         else:
             consts = self._constexprs(num_warps)
             # waves_per_eu: an AMD backend option (the CUDA backend rejects it)
-            amd = {"waves_per_eu": self.waves_per_eu} if torch.version.hip else {}
+            # maxnreg: the NVIDIA backend's (fewer registers: more programs resident, maybe spills)
+            amd = {"waves_per_eu": self.waves_per_eu} if torch.version.hip else (
+                {"maxnreg": self.maxnreg} if self.maxnreg else {})
             with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
                 compiled = self.kernel.kernel[(self.n_groups,)](*args, **consts, num_warps=num_warps, **amd)
             if aligned:
