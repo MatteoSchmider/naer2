@@ -14,8 +14,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
-from naer2.transpiler.templates.fused import (_deliver, _emit, _pin_first, _pull, _rand, _run_done, _run_gate,
-                                              _run_status)
+from naer2.transpiler.templates.fused import (_deliver, _emit, _pin_first, _pull, _rand, _run_done, _run_entry,
+                                              _run_gate, _run_status, _gate_skip, _ev_close)
 from naer2.transpiler.templates.fused_template import DO_NOT_SPECIALIZE, FusedKernel
 
 
@@ -35,8 +35,8 @@ def _receive_none(state, hit, time, w, srcword):
 @gluon.jit(do_not_specialize=list(DO_NOT_SPECIALIZE))
 def pd14_neuron_kernel(
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr,
-    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, k_lo, k_hi, slot_width, round_id, parity,
-    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, run_id, t_start, t_end, trace_ptr,
+    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
+    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
@@ -58,8 +58,15 @@ def pd14_neuron_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
+    run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
+    parity = run_id % 2
+    status_run = status + (run_id % n_status) * (4 * n_groups)
+    if gated != 0:
+        k_lo = gl.load(ev + parity * (2 + n_groups))
+    skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
+                      MAX_CONNS, NUM_WARPS)
     fin = gl.to_tensor(0)
-    if _run_gate(ring, ctl, pid, run_id):  # (see the generated kernels)
+    if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                          parity, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
                          NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
@@ -101,15 +108,16 @@ def pd14_neuron_kernel(
             n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
                          TRACE, TRACE_CAP)
             _run_done(ring, pid, run_id)
+            _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B)
             fin = fin + 1
-    _run_status(status, ring, pid, run_id, fin > 0)
+    _run_status(status_run, ring, pid, run_id, fin > 0)
 
 
 @gluon.jit(do_not_specialize=list(DO_NOT_SPECIALIZE))
 def pd14_poisson_kernel(
     next_spike_ptr,
-    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, k_lo, k_hi, slot_width, round_id, parity,
-    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, run_id, t_start, t_end, trace_ptr,
+    n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
+    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
@@ -130,8 +138,15 @@ def pd14_poisson_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
+    run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
+    parity = run_id % 2
+    status_run = status + (run_id % n_status) * (4 * n_groups)
+    if gated != 0:
+        k_lo = gl.load(ev + parity * (2 + n_groups))
+    skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
+                      MAX_CONNS, NUM_WARPS)
     fin = gl.to_tensor(0)
-    if _run_gate(ring, ctl, pid, run_id):  # (see the generated kernels)
+    if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                          parity, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
                          NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
@@ -159,8 +174,9 @@ def pd14_poisson_kernel(
             n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
                          TRACE, TRACE_CAP)
             _run_done(ring, pid, run_id)
+            _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B)
             fin = fin + 1
-    _run_status(status, ring, pid, run_id, fin > 0)
+    _run_status(status_run, ring, pid, run_id, fin > 0)
 
 
 def pd14_neuron_reference(neuron) -> FusedKernel:

@@ -443,7 +443,7 @@ class Population:
         n_slots = math.ceil(longest / w) + math.ceil(window / w) + 3
         caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
         self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, n_slots),
-                              **caps)
+                              min_delays=[self._min_delay(c) for c in self.incoming], **caps)
         self._connected = True
 
     def run(self, t_start: float, t_end: float, deliver_until: float | None = None, round_id: int | None = None,

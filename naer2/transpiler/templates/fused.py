@@ -124,7 +124,8 @@ class FusedPlan:
     one source, the directory's pair count and words per source, and the
     last-read run ids (double-buffered by the consumer's run parity)."""
 
-    def __init__(self, histories: list[EmissionHistory], topologies: list[SimulationTopology], n_groups: int, device):
+    def __init__(self, histories: list[EmissionHistory], topologies: list[SimulationTopology], n_groups: int, device,
+                 min_delays: list[float] | None = None):
         n = len(histories)
         if n > 256:
             raise ValueError("a consumer can take at most 256 incoming connections (8-bit connection id)")
@@ -137,7 +138,7 @@ class FusedPlan:
                 raise ValueError("every incoming topology must use the consumer's group layout")
         self.n_conns, self.histories, self.topologies = n, histories, topologies
         self.K = histories[0].K if histories else 3
-        plan = torch.zeros(20 * n, dtype=torch.int32)
+        plan = torch.zeros(21 * n, dtype=torch.int32)
         links = [t.link_addresses() for t in topologies]
         dirs = [t.directory() for t in topologies]
         plan[: 10 * n].view(torch.int64)[:] = torch.tensor(
@@ -150,6 +151,9 @@ class FusedPlan:
             [d[1] for d in dirs], [d[2] for d in dirs],
         )):
             plan[(10 + i) * n:(11 + i) * n] = torch.tensor(values, dtype=torch.int32)
+        # per connection its minimum delay as the host schedules with it (a gated run's due time: _gate_skip)
+        plan[20 * n:21 * n] = torch.tensor(min_delays if min_delays is not None else [0.0] * n,
+                                           dtype=torch.float32).view(torch.int32)
         self.plan = plan.to(device)
 
 
@@ -593,6 +597,115 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
 
 
 # ------------------------------------------------- stopping and rerunning a run
+
+
+# one run's entry in a schedule (naer2/schedule.py: RUN_WORDS int32 words), what a launch would otherwise pass
+# as arguments: run id, round id, the slots it delivers (k_lo .. k_hi), its window (t_start, t_end), gated
+RUN_WORDS = gl.constexpr(8)
+
+
+@gluon.jit
+def _run_entry(sched, sched_i):
+    """Entry sched_i of a run schedule: (run_id, round_id, k_lo, k_hi, t_start, t_end, gated) -- read by every
+    program before anything else (the schedule: device memory for a planned window, pinned host memory for a
+    direct run; naer2/schedule.py)."""
+    e = sched + RUN_WORDS * sched_i
+    run_id = gl.load(e)
+    round_id = gl.load(e + 1)
+    k_lo = gl.load(e + 2)
+    k_hi = gl.load(e + 3)
+    t_start = gl.load((e + 4).to(gl.pointer_type(gl.float32)))
+    t_end = gl.load((e + 5).to(gl.pointer_type(gl.float32)))
+    gated = gl.load(e + 6)
+    return run_id, round_id, k_lo, k_hi, t_start, t_end, gated
+
+
+# A runtime's event state, [2, EV_HDR + n_groups] int32 double-buffered by run parity (run r reads row r % 2,
+# every program writes row (r + 1) % 2: no program reads what another of the same run writes): the ring's
+# delivery position (word 0), the runs made (word 1: a skipped gated run doesn't count), and per group its
+# first slot still holding records (word EV_HDR + g; INT_MAX: none) -- what a gated run decides on, and where
+# it delivers from (a skipped run delivers nothing: the host can't advance the position for it).
+EV_HDR = gl.constexpr(2)
+EV_NONE = gl.constexpr(2147483647)
+
+
+@gluon.jit
+def _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK: gl.constexpr,
+               KP: gl.constexpr, MAX_CONNS: gl.constexpr, NUM_WARPS: gl.constexpr):
+    """Whether a gated run (an event-driven population's planned launch: Network.plan) has nothing due at its
+    time t_start, as the host would decide it (Population._next_run_time): due is the earliest of (A) every
+    fresh source run with spikes -- its earliest emission + its connection's minimum delay (intake's) -- and
+    (B) the end of the first slot still holding records after the population's last run (any group's:
+    _note_pending_arrivals'). Every program decides alike (from the same headers and event state). An
+    ungated run never skips."""
+    skip = gated != 0
+    if gated != 0:
+        LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        MAX_CJ: gl.constexpr = MAX_CONNS * KP
+        (hist_addr, _ta, _lt, _aa, _da, _hc, _ts, _tg, _tb, _tl, _dp, _dw, last_read) = _fused_plan(plan, n_conns)
+        cj = gl.arange(0, MAX_CJ, layout=LV)
+        c_of = cj // KP
+        j_of = cj % KP
+        vj = (c_of < n_conns) & (j_of < SK)
+        hbuf = gl.load(hist_addr + c_of, mask=vj, other=0)
+        hdr = hbuf.to(gl.pointer_type(gl.int32)) + 8 * j_of
+        tag = gl.load(hdr.to(gl.pointer_type(gl.int64)), mask=vj, other=0)
+        rid = (tag & 0xFFFFFFFF).to(gl.int32)
+        rnd = (tag >> 32).to(gl.int32)
+        cnt = gl.load(hdr + 2, mask=vj, other=0)
+        early = gl.load((hdr + 4).to(gl.pointer_type(gl.float32)), mask=vj, other=float("inf"))
+        lastj = gl.load(last_read + (run_id % 2) * n_conns + c_of, mask=vj, other=0)
+        dmin = gl.load((plan + 20 * n_conns + c_of).to(gl.pointer_type(gl.float32)), mask=vj, other=0.0)
+        fresh = vj & (rid > lastj) & (rnd < round_id) & (cnt > 0)
+        due = gl.min(gl.where(fresh, early + dmin, float("inf")), axis=0)
+        evp = ev + (run_id % 2) * (EV_HDR + n_groups)
+        first = gl.to_tensor(EV_NONE)
+        gi = gl.arange(0, 32 * NUM_WARPS, layout=LV)
+        for g0 in range(0, n_groups, 32 * NUM_WARPS):
+            v = gl.load(evp + EV_HDR + g0 + gi, mask=g0 + gi < n_groups, other=EV_NONE)
+            first = gl.minimum(first, gl.min(v, axis=0))
+        due = gl.minimum(due, gl.where(first < EV_NONE, (first + 1).to(gl.float32) * slot_width, float("inf")))
+        skip = due > t_start + 1e-6 * gl.maximum(gl.abs(t_start), 1.0)
+    return skip
+
+
+@gluon.jit
+def _gate_carry(plan, n_conns, ev, pid, run_id, n_groups, MAX_CONNS: gl.constexpr, NUM_WARPS: gl.constexpr):
+    """A skipped gated run: what the next run reads carried over unchanged -- the last-read run ids (the
+    sources' runs stay unread) and the event state (this program's group's, and the delivery position)."""
+    LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+    (_ha, _ta, _lt, _aa, _da, _hc, _ts, _tg, _tb, _tl, _dp, _dw, last_read) = _fused_plan(plan, n_conns)
+    ci = gl.arange(0, MAX_CONNS, layout=LV)
+    cv = ci < n_conns
+    p = run_id % 2
+    gl.store(last_read + (1 - p) * n_conns + ci, gl.load(last_read + p * n_conns + ci, mask=cv), mask=cv)
+    src = ev + p * (EV_HDR + n_groups)
+    dst = ev + (1 - p) * (EV_HDR + n_groups)
+    gl.store(dst, gl.load(src))
+    gl.store(dst + 1, gl.load(src + 1))
+    gl.store(dst + EV_HDR + pid, gl.load(src + EV_HDR + pid))
+
+
+@gluon.jit
+def _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS: gl.constexpr, NSP: gl.constexpr,
+              NUM_WARPS: gl.constexpr, POOL_B: gl.constexpr):
+    """A run done: the event state for the next run -- the delivery position past this run's slots, and this
+    group's first slot still holding records (after delivery: later per-link arrivals of spikes taken in)."""
+    LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+    (_mt, _ms, _ml, _mn, main_count, _st, _ss, _sl, _sn, side_count, _wm, _fl, _tb, _stb, _sk, _tp, _nb, _lo,
+     _lr, _oc, _mc, _sc, _nbk, _sts) = _ring(ring, POOL_B)
+    rp = gl.maximum(k_lo, k_hi + 1)
+    sl = gl.arange(0, NSP, layout=LV)
+    live = sl < N_SLOTS
+    k = rp + sl
+    cell = pid * N_SLOTS + k % N_SLOTS
+    c = gl.load(main_count + cell, mask=live, other=0) + gl.load(side_count + cell, mask=live, other=0)
+    first = gl.min(gl.where(live & (c > 0), k, EV_NONE), axis=0)
+    src = ev + (run_id % 2) * (EV_HDR + n_groups)
+    dst = ev + (1 - run_id % 2) * (EV_HDR + n_groups)
+    gl.store(dst, rp)
+    gl.store(dst + 1, gl.load(src + 1) + 1)
+    gl.store(dst + EV_HDR + pid, first)
 
 
 @gluon.jit

@@ -77,6 +77,27 @@ def test_later_per_link_arrivals_are_scheduled_from_the_ring():
     _delivered(B, conn, fires)
 
 
+@pytest.mark.parametrize("mode", ["planned", "graph"])
+@pytest.mark.parametrize("delay", ["0.5", "0.5 and 2.5"])
+def test_planned_windows_gate_an_event_driven_consumer(delay, mode):
+    """The same consumer through Network.run_planned / run_graph (a captured window replayed; after one
+    step, every runtime built): its launches
+    are gated -- one at every time an arrival could be due -- and its kernel runs only those with something
+    due (fused.py: _gate_skip); every link arrives, exactly, among many gated launches that skipped."""
+    d = 0.5 if delay == "0.5" else (lambda c: torch.where(torch.rand(c.shape) < 0.5, 0.5, 2.5))
+    stepped, _, B_step, _, _ = _net(d)  # the same network stepped: how many runs B makes there
+    stepped.step(4.0)
+    network, A, B, conn, fires = _net(d)
+    network.step(0.05)  # the first round (t = 0): every runtime built
+    gated = sum(1 for launch in network.plan(until=4.0) for pop, *_, g in launch if pop is B and g)
+    (network.run_planned if mode == "planned" else network.run_graph)(until=4.0)
+    A.check()
+    B.check()
+    _delivered(B, conn, fires)
+    made = B.runtime.runs_made()
+    assert made == B_step.runtime.runs_made() and made < 1 + gated  # (the first round's run + those due)
+
+
 def test_tensors_move_to_the_network_device_lazily():
     network, A, B, _, _ = _net(0.5)
     assert A.fire_now.device.type == "cpu"

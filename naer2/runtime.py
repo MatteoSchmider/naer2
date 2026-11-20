@@ -62,6 +62,7 @@ from triton import knobs
 
 from .history import EmissionHistory
 from .ring import POOL_MAX_BLOCKS, POOL_RESERVE, Ring
+from .schedule import RUN_WORDS, write_entry
 from .trace import Trace
 from .transpiler.templates.fused import FUSED_TRACE_TAGS, PULL, WALK, FusedPlan
 
@@ -236,26 +237,41 @@ class PopulationRuntime:
         return self.kernel.uniform_emission
 
     def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
-                main_cap: int | None = None, side_cap: int | None = None, pool: tuple[int, int] | None = None):
-        """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs."""
+                main_cap: int | None = None, side_cap: int | None = None, pool: tuple[int, int] | None = None,
+                min_delays: list[float] | None = None):
+        """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs.
+        min_delays: per connection its minimum delay as the host schedules with it (a gated run's due time;
+        default 0)."""
         caps = {k: v for k, v in (("main_cap", main_cap), ("side_cap", side_cap)) if v}
         self.ring = Ring(self.n_groups, n_slots, slot_width, self.device, pool=pool, **caps)
         self.wmark = torch.full((self.n_groups,), -math.inf, device=self.device)
-        self.plan = FusedPlan([s.history for s in sources], topologies, self.n_groups, self.device)
+        self.plan = FusedPlan([s.history for s in sources], topologies, self.n_groups, self.device,
+                              min_delays=min_delays)
+        # the event state (fused.py: _gate_skip, _ev_close): per run parity the delivery position, the runs
+        # made, per group its first slot still holding records
+        self.ev = torch.full((2, 2 + self.n_groups), 2147483647, device=self.device, dtype=torch.int32)
+        self.ev[:, :2] = 0
         self.uniform_sources = all(s.uniform_emission for s in sources)
         self.log_cap = log_cap
         self.log = torch.zeros(1 + 5 * max(log_cap, 1), device=self.device, dtype=torch.int32)
         self._launchers = {}  # new buffers (their sizes are part of the AMD backend's specialization)
         self._judge_pending(None, wait=True)  # (the old ring's)
-        # the runs' status, written by the kernel straight into pinned host memory: per slot, per group
-        # [blocks held, most logged, lost bits, done] (fused.py: _run_status)
-        cuda = self.device.type == "cuda"
-        self._status_host = torch.zeros(self.status_slots, self.n_groups, 4, dtype=torch.int32, pin_memory=cuda)
-        self._status_np = self._status_host.numpy()
-        self._status_args = [self._status_host[i] for i in range(self.status_slots)] if cuda \
-            else [self.overrun] * self.status_slots
+        self._alloc_slots(self.status_slots)
         # the most blocks / log records any run needed, and the runs judged, since the last shrink check
         self._window = [0, 0, 0]
+
+    def _alloc_slots(self, n: int) -> None:
+        """n slots of the runs' status, written by the kernel straight into pinned host memory -- per slot,
+        per group [blocks held, most logged, lost bits, done] (fused.py: _run_status), a run's slot its run
+        id mod n -- and as many of the direct schedule (run()'s entries, read by the kernel from pinned host
+        memory too: naer2/schedule.py). The runs still pending are judged first."""
+        self._judge_pending(None, wait=True)
+        cuda = self.device.type == "cuda"
+        self.status_slots = n
+        self._status_host = torch.zeros(n, self.n_groups, 4, dtype=torch.int32, pin_memory=cuda)
+        self._status_np = self._status_host.numpy()
+        self._sched_host = torch.zeros(n, RUN_WORDS, dtype=torch.int32, pin_memory=cuda)
+        self._sched_np = self._sched_host.numpy()
 
     def run(self, t_start, t_end, deliver_until=None, round_id=None, num_warps=None, stream=None):
         """One run over [t_start, t_end) in round `round_id` (default: the
@@ -271,12 +287,12 @@ class PopulationRuntime:
             while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
                 self._judge(self._pending.popleft())
         self.run_id += 1
-        w = self.ring.slot_width
-        k_lo = self.ring.ring_pos
-        k_hi = int(((deliver_until if deliver_until is not None else t_end) + 1e-6) // w) - 1
+        k_lo, k_hi = self.ring.ring_pos, self.delivers_until(deliver_until if deliver_until is not None else t_end)
+        slot = self.run_id % self.status_slots  # (free: its previous run judged above)
+        write_entry(self._sched_np[slot], self.run_id, round_id if round_id is not None else self.run_id, k_lo,
+                    k_hi, t_start, t_end)
         # (the state tensors as launched: a rerun reads what this launch reads, whatever replaces them later)
-        params = (t_start, t_end, k_lo, k_hi, round_id if round_id is not None else self.run_id, self.run_id,
-                  num_warps, tuple(self.state[a] for a in self.kernel.attrs))
+        params = (self._sched_host, slot, self.run_id, num_warps, tuple(self.state[a] for a in self.kernel.attrs))
         self._launch(params, stream)
         self.ring.ring_pos = max(k_lo, k_hi + 1)
         if cuda:
@@ -302,15 +318,58 @@ class PopulationRuntime:
                              f"(at most {most}: a replicated layout loses spikes, see PopulationRuntime._warps)")
         return num_warps
 
+    def runs_made(self) -> int:
+        """The runs this runtime's kernels made (a skipped gated run doesn't count; a sync)."""
+        return int(self.ev[(self.run_id + 1) % 2, 1]) if self.run_id else 0
+
+    def sync_ring_pos(self) -> None:
+        """The ring's delivery position from the device (after planned gated runs: only their kernels know
+        which ran; a sync)."""
+        self.ring.ring_pos = int(self.ev[(self.run_id + 1) % 2, 0])
+
+    def delivers_until(self, t: float) -> int:
+        """The last ring slot a run delivering up to time t delivers (its slots end by t)."""
+        return int((t + 1e-6) // self.ring.slot_width) - 1
+
+    def launch_entry(self, sched: torch.Tensor, i: int, run_id: int, stream=None, num_warps=None,
+                     bookkeeping: bool = True) -> None:
+        """A planned run: entry i of a schedule (naer2/schedule.py) -- everything the run needs besides
+        this runtime's own buffers is in it; run_id is the entry's (for the status bookkeeping).
+        bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay, note_run)."""
+        if not bookkeeping:
+            self._launch((sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs)),
+                         stream)
+            return
+        if self.device.type == "cuda":
+            while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
+                self._judge(self._pending.popleft())
+        params = (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs))
+        self._launch(params, stream)
+        if self.device.type == "cuda":
+            self._launches.journal[(id(self), run_id)] = (self, params)
+            self._pending.append(run_id)
+
+    def note_run(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None) -> None:
+        """A replayed graph's run: the bookkeeping launch_entry does (its status pending, its journal entry:
+        a rerun after a stop launches it directly)."""
+        params = (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs))
+        self._launches.journal[(id(self), run_id)] = (self, params)
+        self._pending.append(run_id)
+
+    def make_room(self, n: int) -> None:
+        """Status slots for n more runs: the oldest pending runs judged (waited for) until n fit."""
+        while self._pending and len(self._pending) + n > self.status_slots:
+            self._judge(self._pending.popleft())
+
     def _launch(self, params, stream) -> None:
-        """One run's kernel launch (run(); a rerun: _Launches.recover)."""
-        t_start, t_end, k_lo, k_hi, round_id, run_id, num_warps, state = params
+        """One run's kernel launch: entry sched_i of schedule sched (run(): the direct schedule; a planned
+        window: naer2/schedule.py; a rerun: _Launches.recover)."""
+        sched, sched_i, run_id, num_warps, state = params
         args = list(state) + [
             self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, self._launches.ctl,
-            self._status_args[run_id % self.status_slots], k_lo, k_hi, self.ring.slot_width, round_id, run_id % 2,
-            self.received, self.n_received, self.log, self.log_cap,
-            self.history.buf, self.history.cap, run_id, t_start, t_end,
-            self.trace.buf if self.trace is not None else self.log]
+            self._status_host if self.device.type == "cuda" else self.overrun, self.status_slots, sched, sched_i,
+            self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
+            self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log]
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
         key = (num_warps, self.waves_per_eu, self.count_received, self.batch, self.stream_block,
                self.unroll, self.log_cap > 0)
