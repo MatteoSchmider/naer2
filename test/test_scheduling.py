@@ -80,15 +80,17 @@ def stand_ins(monkeypatch):
 
     def update(self, t, **kw):
         try:
-            original_update(self, t, **kw)
+            return original_update(self, t, **kw)
         except _Ran:
-            pass
+            return self._window
 
     original_intake = Population._intake
 
-    def intake(self, t):  # real intake, plus noting what was taken for the kernel stand-in
+    def intake(self, t, planning=False):  # real intake, plus noting what was taken for the kernel stand-in
         before = dict(self._read_run)
-        original_intake(self, t)
+        original_intake(self, t, planning=planning)
+        if planning:
+            return
         for conn in self.incoming:
             if self._read_run.get(conn) != before.get(conn):
                 taken.setdefault(conn, []).append(conn._source._window[0])
@@ -121,6 +123,53 @@ def test_every_kind_of_population_runs_exactly_when_and_as_far_as_it_may(stand_i
 
     names = {pop: name for name, pop in pops.items()}
     got: dict[float, list[str]] = {}
+    for start, pop, end in stand_ins:
+        got.setdefault(round(start, 6), []).append(f"{names[pop]}->{round(end, 6)}")
+    assert {t: sorted(r) for t, r in got.items()} == EXPECTED
+
+
+def _every_kind(pops=None):
+    pops = {}
+    for name, node, timestep in [
+        ("A", counter, 0.2), ("B", counter, 0.3), ("C", delay_probe, None),
+        ("D", delay_probe, None), ("U", counter, None), ("Z", delay_probe, None),
+        ("E1", delay_probe, None), ("E2", delay_probe, None),
+    ]:
+        pops[name] = node() * 2
+        pops[name].timestep = timestep
+    p = pops
+    (p["B"] >> all_to_all >> p["C"]).fabric.delay = 0.5
+    (p["B"] >> all_to_all >> p["D"]).fabric.delay = torch.tensor([0.5, 0.9, 0.5, 0.9])
+    (p["A"] >> all_to_all >> p["U"]).fabric.delay = 0.1
+    p["C"] >> all_to_all >> p["Z"]
+    (p["E1"] >> all_to_all >> p["E2"]).fabric.delay = 0.3
+    (p["E2"] >> all_to_all >> p["E1"]).fabric.delay = 0.3
+    return pops, p["A"].network + p["B"].network + p["E1"].network
+
+
+def test_a_plan_is_step_s_runs_ahead_of_time(stand_ins):
+    """Network.plan (a dry run, no kernels) on every kind of population, then step() on the same network:
+    the clocked and update() populations run exactly as planned; every run of an event-driven one starts at
+    one of its planned (gated) launches -- and planning changed nothing step() then does."""
+    pops, network = _every_kind()
+    names = {pop: name for name, pop in pops.items()}
+    launches = network.plan(max_launches=1000, until=1.3 + 1e-9)
+    planned = {}
+    for launch in launches:
+        for pop, start, end, gated in launch:
+            assert gated == pop._is_event_driven
+            planned.setdefault(names[pop], []).append((round(start, 6), round(end, 6)))
+    network.step(1.3)
+    ran = {}
+    for start, pop, end in stand_ins:
+        ran.setdefault(names[pop], []).append((round(start, 6), round(end, 6)))
+    for name in ("A", "B", "U"):
+        assert ran[name] == planned[name], name
+    for name in ("C", "D", "Z", "E1", "E2"):
+        starts = {s for s, _ in planned[name]}
+        assert {s for s, _ in ran[name]} <= starts, name
+    # (planning left the scheduling untouched: step() ran exactly what the earlier test expects)
+    got = {}
     for start, pop, end in stand_ins:
         got.setdefault(round(start, 6), []).append(f"{names[pop]}->{round(end, 6)}")
     assert {t: sorted(r) for t, r in got.items()} == EXPECTED

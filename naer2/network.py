@@ -118,6 +118,56 @@ class Network:
                 if pop._ins:
                     pop._intake(self.t)
 
+    def plan(self, max_launches: int = 1000, until: float | None = None) -> list[list[tuple]]:
+        """A dry run of step(): the next launches without running any kernel -- each launch one round, the
+        list of (population, t_start, t_end, gated) its runs; at most max_launches of them, or up to network
+        time `until`. The network's and its populations' scheduling state are as before afterwards.
+
+        Exact for clocked and update() populations: their run times and windows follow from timesteps and
+        minimum delays alone. An event-driven population's runs depend on its arrivals -- data: it gets a
+        GATED launch at every time an arrival could make a run due (Population._possible_run_times: per
+        source run, its start + the minimum delay, and the end of every slot its arrivals can land in), its
+        window ending at its input bound as step() computes it; its kernel is to skip when nothing is due
+        then (not implemented yet). Every run step() makes is among them, at the same time; the window ends
+        of a population whose sources are event-driven too are conservative (their pending arrivals unknown,
+        every possible one assumed)."""
+        pops = list(self.populations)
+        for pop in pops:
+            pop._check_schedulable()
+            pop._prepare_step()
+        if not self._planned:
+            self._plan_histories(pops)
+            self._planned = True
+        saved = [(pop, pop._schedule_state()) for pop in pops]
+        t0, round0 = self.t, self.round_id
+        launches = []
+        try:
+            while len(launches) < max_launches:
+                for pop in pops:
+                    pop._reset_horizon()
+                for _ in range(len(pops) + 1):
+                    if not any([pop._relax_horizon() for pop in pops]):
+                        break
+                t_next = min([pop._next_run_time() for pop in pops] + ([until] if until is not None else []))
+                if t_next == math.inf or (until is not None and t_next >= until - _EPS):
+                    break
+                self.t = t_next
+                self.round_id += 1
+                launch = []
+                for pop in pops:
+                    window = pop._execute_update_kernel(self.t, launch=False)
+                    if window is not None:
+                        launch.append((pop, window[0], window[1], pop._is_event_driven))
+                launches.append(launch)
+                for pop in pops:
+                    if pop._ins:
+                        pop._intake(self.t, planning=True)
+        finally:
+            for pop, state in saved:
+                pop._restore_schedule(state)
+            self.t, self.round_id = t0, round0
+        return launches
+
     def _plan_histories(self, pops) -> None:
         """The emission histories' depth K, once, before the first round: a
         source's history must keep every run its slowest consumer hasn't

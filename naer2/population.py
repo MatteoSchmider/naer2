@@ -75,6 +75,7 @@ class Population:
         self._bound: float = math.inf
         self._run_times: list[float] = []
         self._min_delays: dict = {}
+        self._max_delays: dict = {}
         # Intake bookkeeping: _run_id counts this population's runs (0 =
         # never run); _read_run[conn] is the source run intake last read
         # from conn, so a source is read once per run even when rounds
@@ -184,7 +185,7 @@ class Population:
             self._summary = (self._run_id, n, earliest)
         return self._summary[1], self._summary[2]
 
-    def _intake(self, t: float) -> None:
+    def _intake(self, t: float, planning: bool = False) -> None:
         """End of every round (Network.step): take in what every source that
         ran since this population last read it emitted. Host side: read
         each source once per run, and for an event-driven population
@@ -198,11 +199,50 @@ class Population:
             read[conn] = source._run_id
             if not self._is_event_driven:
                 continue  # its own clock or its inputs' horizon runs it: no summary needed
+            if planning:  # (Network.plan: every time an arrival of this source run could make a run due)
+                self._run_times.extend(r for r in self._possible_run_times(conn, source, min_delay)
+                                       if not any(_same_time(r, q) for q in self._run_times))
+                continue
             n, earliest = source._emission_summary()  # a host sync (TODO.md, D-13)
             if n:
                 self._run_times.append(earliest + min_delay)
         # (The spikes themselves: the fused kernel's pull takes them in at
         # this population's next run, straight from the sources' histories.)
+
+    def _possible_run_times(self, conn, source, min_delay: float) -> list[float]:
+        """(Network.plan) Every time a spike of the source's last run [ts, te) through conn could make this
+        event-driven population's run due, without knowing its spikes: ts + the minimum delay (intake's,
+        exact for a source emitting at its window's start), and the end of every slot an arrival in
+        [ts + min delay, te + max delay] can land in (_note_pending_arrivals')."""
+        ts, te = source._window
+        w = self._slot_width()
+        k0 = math.floor((ts + min_delay) / w + 1e-9)
+        k1 = math.floor((te + self._max_delay(conn)) / w + 1e-9)
+        return [ts + min_delay] + [round((k + 1) * w, 12) for k in range(k0, k1 + 1)]
+
+    def _max_delay(self, conn) -> float:
+        """Largest delay on `conn` (0.0 if it has none), cached (as _min_delay)."""
+        if conn not in self._max_delays:
+            d = getattr(conn.fabric, "delay", None)
+            if d is None:
+                self._max_delays[conn] = 0.0
+            elif isinstance(d, torch.Tensor):
+                m = float(d.max())
+                self._max_delays[conn] = float(f"{m:.7g}") if d.dtype in (torch.float32, torch.float16,
+                                                                          torch.bfloat16) else m
+            else:
+                self._max_delays[conn] = float(d)
+        return self._max_delays[conn]
+
+    def _schedule_state(self) -> tuple:
+        """Everything Network.step's scheduling changes (Network.plan restores it)."""
+        return (self.last_update, self._run_id, getattr(self, "_window", None), self._horizon, self._bound,
+                list(self._run_times), dict(self._read_run), self._summary)
+
+    def _restore_schedule(self, state: tuple) -> None:
+        (self.last_update, self._run_id, self._window, self._horizon, self._bound, run_times, read_run,
+         self._summary) = state
+        self._run_times, self._read_run = run_times, read_run
 
     def _check_schedulable(self) -> None:
         """An update() population needs a clock: its own timestep, or
@@ -282,12 +322,14 @@ class Population:
             return arrival
         return math.inf
 
-    def _execute_update_kernel(self, t: float, stream=None) -> None:
+    def _execute_update_kernel(self, t: float, stream=None, launch: bool = True) -> tuple[float, float] | None:
         """Offered every round's time t by Network.step(); runs only if t is
         this population's own next run time. The run's window ends at
-        t + timestep for a clocked population, else at its input bound."""
+        t + timestep for a clocked population, else at its input bound.
+        Returns the run's window (None: not this round); launch False: the
+        bookkeeping only, no kernel (Network.plan)."""
         if not _same_time(self._next_run_time(), t):
-            return
+            return None
         self.last_update = t
         self._run_id += 1
         window_end = t + self.timestep if self.timestep is not None else self._bound
@@ -298,7 +340,9 @@ class Population:
             r for r in self._run_times if r > window_end and not _same_time(r, window_end)
         ]
 
-        self.run(t, window_end, round_id=self.network.round_id, stream=stream)
+        if launch:
+            self.run(t, window_end, round_id=self.network.round_id, stream=stream)
+        return t, window_end
 
     def _note_pending_arrivals(self) -> None:
         """An event-driven population runs when an arrival is due: its ring
