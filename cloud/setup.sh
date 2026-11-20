@@ -49,6 +49,17 @@ if [ -n "$cuda_dir" ] && command -v nvidia-smi >/dev/null; then
     for tool in compute-sanitizer cuda-gdb; do
         [ -x "$cuda_dir/bin/$tool" ] && echo "$tool: $cuda_dir/bin/$tool"
     done
+    # Nsight Systems (nsys: timelines of a graph replay -- kernels, their gaps), the newest in the repository
+    if ! command -v nsys >/dev/null; then
+        export DEBIAN_FRONTEND=noninteractive
+        nsys_pkg="$(apt-cache search '^nsight-systems-20' 2>/dev/null | awk '{print $1}' | sort -V | tail -1)"
+        if [ -n "$nsys_pkg" ] && apt-get install -y -qq "$nsys_pkg" >/dev/null 2>&1; then
+            ln -sf "$(ls -d /opt/nvidia/nsight-systems/*/bin | sort -V | tail -1)/nsys" /usr/local/bin/nsys
+        else
+            echo "(nsight-systems not installable here: skipped)"
+        fi
+    fi
+    command -v nsys >/dev/null && echo "nsys: $(nsys --version)"
 else
     echo "(no CUDA toolkit in /usr/local or no NVIDIA GPU: skipped)"
 fi

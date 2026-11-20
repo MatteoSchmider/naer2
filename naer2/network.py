@@ -239,7 +239,7 @@ class Network:
         sig = schedule.signature()
         graph = self._graphs.get(sig)
         if graph is None or not graph.valid(schedule):
-            graph = self._graphs[sig] = WindowGraph(self, schedule)
+            graph = self._graphs[sig] = WindowGraph(self, schedule, barrier=getattr(self, "graph_barrier", False))
             self._captures = getattr(self, "_captures", 0) + 1
         graph.replay(schedule)
         schedule.commit()

@@ -25,8 +25,12 @@ class WindowGraph:
     entries stay as they were until the window after next (its statuses judged by then -- a stopped run's
     rerun reads them)."""
 
-    def __init__(self, network, schedule):
+    def __init__(self, network, schedule, barrier: bool = False):
+        """barrier: a tiny kernel on the capture stream between rounds -- every round's kernels before it,
+        every next round's kernels after it (9 + 9 edges a round, not 9 x 9: what a graph is instantiated
+        from, its edges -- torch has no empty node to stand in)."""
         device = network.device
+        self._bar = torch.zeros(1, dtype=torch.int32, device=device) if barrier else None
         self.addresses = {key: self._addresses(rt) for key, rt in self._runtimes(schedule).items()}
         self.buffers, self.staging, self.graphs = [], [], []
         torch.cuda.synchronize()
@@ -39,6 +43,8 @@ class WindowGraph:
                         (pop, lambda stream, pop=pop, i=i, run_id=run_id, b=buffers: pop._runtime.launch_entry(
                             b[id(pop._runtime)], i, run_id, stream, bookkeeping=False))
                         for pop, i, run_id in runs)
+                    if barrier:
+                        self._bar.add_(1)
             self.buffers.append(buffers)
             self.staging.append({key: torch.from_numpy(rows.copy()).pin_memory() for key, rows in schedule.rows.items()})
             self.graphs.append(graph)

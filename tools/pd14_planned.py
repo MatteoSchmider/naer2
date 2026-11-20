@@ -2,7 +2,7 @@
 scheduling) or Network.run_graph (each window replayed from a captured graph) against Network.step: the same
 rounds either way, then every population's state compared.
 
-    python tools/pd14_planned.py {step,planned,graph} OUT.pt [--rounds=1000] [--window=1000] [--G=256] [--warmup=5] [--rdna2]
+    python tools/pd14_planned.py {step,planned,graph} OUT.pt [--rounds=1000] [--window=1000] [--G=256] [--warmup=5] [--barrier] [--rdna2]
     python tools/pd14_planned.py compare A.pt B.pt
 (each mode in its own process; on a cloud instance through cloud/remote run)
 """
@@ -39,6 +39,7 @@ if sys.argv[1] == "compare":
 mode, out = sys.argv[1], sys.argv[2]
 obj = P._network(G)
 net = obj[0]
+net.graph_barrier = "--barrier" in sys.argv  # (graph mode: a barrier kernel between rounds, naer2/graph.py)
 pops = P._runtimes("network", obj)
 for p in pops.values():
     p.count_received = True  # (the links each population received: compared as activity)
