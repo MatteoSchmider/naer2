@@ -223,10 +223,12 @@ class FusedKernelTemplate:
     def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e) -> str:
         args = ",\n    ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS)
                               + [f"{c}: gl.constexpr" for c in CONSTEXPRS])
-        load_state = "".join(f"    {a} = gl.load({a}_ptr + offs, mask=mask)\n" for a in state_attrs)
+        # every node attr loaded first thing in the program, with the pull's first reads (none depends on the
+        # run's entry; the population's previous run wrote them): their latency under the pull, not before
+        # delivery or update -- PD14 on the 4090: ~0.8 us a round (limitations.md)
+        early = "".join(f"    {a} = gl.load({a}_ptr + offs, mask=mask)\n" for a in state_attrs + later)
         state_tuple = f"({', '.join(state_attrs)},)" if state_attrs else "()"
         unpack = f"    ({', '.join(state_attrs)},) = state\n" if state_attrs else ""
-        load_later = "".join(f"    {a} = gl.load({a}_ptr + offs, mask=mask)\n" for a in later)
         final_src = "".join("    " + line + "\n" for stmt in final for line in ast.unparse(stmt).splitlines())
         stores = "".join(f"    gl.store({a}_ptr + offs, {a}, mask=mask)\n" for a in attrs)
         flush = "".join(f"    _emit_spikes(_fire{k}, _e{k}, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)\n"
@@ -235,8 +237,8 @@ class FusedKernelTemplate:
                   parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
                   GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
 if ok:
-    # the node attrs receive touches: the state through delivery
-{load_state}    state = {state_tuple}
+    # the node attrs receive touches (loaded first thing): the state through delivery
+    state = {state_tuple}
     if TRACE:
         state = _pin_first(state)
         n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
@@ -245,8 +247,6 @@ if ok:
                            STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
                            TRACE_CAP, POOL_B)
 {unpack}
-    # the node attrs only update / send touch
-{load_later}
     t = t_end
     time = t_end
     # update, then send
@@ -288,7 +288,7 @@ def fused_kernel(
     lane = gl.arange(0, GROUP_SIZE, layout=LN)
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
-
+{early}
     # a run stopped (a ring too small: the host reruns what started after), or this group done already (the
     # rerun): nothing to do -- see _run_gate, _pull
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)

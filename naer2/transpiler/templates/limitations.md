@@ -194,3 +194,9 @@ what limits a round is the slowest of its ~309 programs running side by side, no
   of a loop over every fresh run with two reductions each, and no all-pairs rank for the batched pull: the
   epilogue before the fix-up's barrier 0.5-1.3 -> ~0.15 us (E_6, I_6: 9 connections, the most fresh runs);
   a round ~0.3 us (6 pairs, within single-run noise).
+- **The node state loaded first thing** (every attr, the receive's and update's alike, with the pull's first
+  reads): update + send 1.37 -> 1.10 us in every population; a round ~0.35 us (6 pairs, 4 faster; within
+  single-run noise -- the 780M too noisy to tell). Registers 120 -> 124, spills 12 -> 2 bytes.
+- **Pipelining the pull's spike blocks** (the next block's spikes -- binary search, nodes, times -- loaded
+  before this block's segments and appends): no gain alone, and slower with the early node state (most
+  programs have one block in quiet rounds; with two, the block's own work bounds it, as the link loop's).

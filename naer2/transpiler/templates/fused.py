@@ -996,6 +996,29 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
 
 
 @gluon.jit
+def _spike_block(t0, n_tot, tab_first, tab_node, tab_time, LK: gl.constexpr, SPK: gl.constexpr,
+                 MAX_CJ: gl.constexpr, LOG_CJ: gl.constexpr):
+    """Spikes t0 .. t0 + SPK of an e-group's stream: each spike's (connection, slot) pair -- the last whose
+    first spike is at or before it, a binary search over the LDS table (first[0] = 0; pairs without spikes
+    here start where the next one does, so never the last one) -- and its node and time from the history.
+    Returns (t, tv, cj_t, s, e)."""
+    t = t0 + gl.arange(0, SPK, layout=LK)
+    tv = t < n_tot
+    cj_t = gl.zeros_like(t)
+    f_t = gl.zeros_like(t)
+    for st in gl.static_range(LOG_CJ):
+        probe = cj_t + (MAX_CJ >> (st + 1))
+        v = tab_first.gather(probe, 0)
+        le = v <= t
+        cj_t = gl.where(le, probe, cj_t)
+        f_t = gl.where(le, v, f_t)
+    i = (t - f_t).to(gl.int64)
+    s = gl.load((tab_node.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.int32)), mask=tv, other=0)
+    e = gl.load((tab_time.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.float32)), mask=tv, other=0.0)
+    return t, tv, cj_t, s, e
+
+
+@gluon.jit
 def _pull_headers(plan, n_conns, SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr,
                   NUM_WARPS: gl.constexpr):
     """What the pull reads first -- per connection its last-read run ids (both parities: the run's isn't known
@@ -1151,24 +1174,9 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
             tab_first.store(g_first)
             gl.barrier()
             for t0 in range(0, n_tot, SPK):
-                t = t0 + gl.arange(0, SPK, layout=LK)
-                tv = t < n_tot
-                # each spike's pair: the last whose first spike is at or before it (pairs
-                # without spikes here start where the next one does, so never the last one),
-                # a binary search over the LDS table (first[0] = 0)
-                cj_t = gl.zeros_like(t)
-                f_t = gl.zeros_like(t)
-                for st in gl.static_range(LOG_CJ):
-                    probe = cj_t + (MAX_CJ >> (st + 1))
-                    v = tab_first.gather(probe, 0)
-                    le = v <= t
-                    cj_t = gl.where(le, probe, cj_t)
-                    f_t = gl.where(le, v, f_t)
-                i = (t - f_t).to(gl.int64)
-                s = gl.load((tab_node.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.int32)), mask=tv,
-                            other=0)
-                e = gl.load((tab_time.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.float32)), mask=tv,
-                            other=0.0)
+                # (loading the next block's spikes here, before this block's appends -- a pipeline over the
+                # blocks -- was no faster on the 4090: limitations.md)
+                t, tv, cj_t, s, e = _spike_block(t0, n_tot, tab_first, tab_node, tab_time, LK, SPK, MAX_CJ, LOG_CJ)
                 if TRACE >= 2:
                     s = pin(s)
                     e = pin(e)

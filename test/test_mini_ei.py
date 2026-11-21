@@ -88,12 +88,14 @@ def test_receive_reads_the_staged_weight_on_the_delivered_lanes(src_E):
     assert "return (current,)" in recv
 
 
-def test_receive_state_loaded_before_delivery_the_rest_after(src_E):
-    deliver = src_E.index("state, n_ev = _deliver(")
-    assert src_E.index("current = gl.load(current_ptr + offs, mask=mask)") < deliver
-    for attr in ("potential", "t_ref_end", "last_time"):
-        assert src_E.index(f"{attr} = gl.load({attr}_ptr + offs, mask=mask)") > deliver
+def test_node_state_loaded_first_thing_once(src_E):
+    # every node attr loaded before the run's gate (with the pull's first reads: their latency under the
+    # pull), once -- the receive's and the ones only update / send touch alike
+    gate = src_E.index("if _run_gate(")
     for attr in ("potential", "current", "t_ref_end", "last_time"):
+        load = f"{attr} = gl.load({attr}_ptr + offs, mask=mask)"
+        assert src_E.index(load) < gate
+        assert src_E.count(load) == 1
         assert f"gl.store({attr}_ptr + offs, {attr}, mask=mask)" in src_E
 
 
