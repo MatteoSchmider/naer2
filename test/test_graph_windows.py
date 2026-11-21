@@ -40,10 +40,10 @@ def _run(small: bool, fuse: bool):
 
 
 @pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fused"])
-def test_gap_a_stop_inside_a_captured_window_is_rerun(fuse):
-    """GAP (TODO.md, resizing in planned and captured windows): fails before window bookkeeping and after --
-    the rerun ends in a consumer's history overrun, and the next capture fails; windows need rings that fit
-    (PD14: after its warm-up) until stops inside them are handled."""
+def test_a_stop_inside_a_captured_window_is_rerun(fuse):
+    """(Before every replay the window two turns back is judged, PopulationRuntime.judge_windows: its capture
+    turn's buffers are the next window's -- rerun from a later window's entries, a stopped run made a
+    consumer fall behind its source's history.)"""
     state, received, _ = _run(small=False, fuse=fuse)
     state_s, received_s, rt = _run(small=True, fuse=fuse)
     assert rt.stops and rt.growths, "E's ring stopped a run and grew"

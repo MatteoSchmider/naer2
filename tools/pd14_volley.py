@@ -1,7 +1,9 @@
 """PD14 through the thalamic volley on the current device (from the repo root: python tools/pd14_volley.py G
-[--profile] [--keep-old] [--zero-growth] [--warps=N]; on a cloud instance: cloud/remote run 'python
-tools/pd14_volley.py G ...'). Diagnostics: --keep-old never frees a ring's old buffer, --zero-growth
-zero-fills grown rings, --warps=N overrides the device's warp cap.
+[--profile] [--keep-old] [--zero-growth] [--warps=N] [--check-arena] [--staging]; on a cloud instance:
+cloud/remote run 'python tools/pd14_volley.py G ...'; not on the 780M: it drives the display, and a fault there
+takes it down). Diagnostics: --keep-old never frees a ring's old buffer, --zero-growth zero-fills grown rings,
+--warps=N overrides the device's warp cap, --check-arena checks the arena invariant at every resize and
+--staging reads staging's counters (tools/pd14_volley_debug.patch) -- both sync there, which hides the race.
 Runs to 730 ms freely (no syncs), reports a fault if one happens; with --profile, the volley's first 200 rounds
 (700.5-720.5 ms) under the profiler: per population, median and slowest kernel."""
 import os
@@ -38,7 +40,8 @@ def _apply_blk(self):
         if w[0] or w[6] or w[7]:
             BLK.append((self.n, self.run_id, w))
     return _apply(self)
-R.PopulationRuntime._apply_wanted = _apply_blk
+if "--staging" in sys.argv:  # (diagnostic, needs tools/pd14_volley_debug.patch: syncs at every resize)
+    R.PopulationRuntime._apply_wanted = _apply_blk
 INV = []  # TEMP: arena invariant (held blocks + free stack = every id once, per group), checked before resizes
 def _check_arena(rt, when):
     ring = rt.ring
@@ -72,7 +75,9 @@ def _apply_inv(self):
     out = _apply2(self)
     _check_arena(self, f"{self.run_id}, after resizing {nb0} -> {self.ring.pool_nb}")
     return out
-R.PopulationRuntime._apply_wanted = _apply_inv
+CHECK_ARENA = "--check-arena" in sys.argv  # (diagnostic: copies the arenas' tables at every resize -- a sync
+if CHECK_ARENA:                           # that hides the race, TODO.md)
+    R.PopulationRuntime._apply_wanted = _apply_inv
 PROFILE = "--profile" in sys.argv
 t0 = time.time()
 obj = P._network(G)
@@ -112,7 +117,7 @@ for nm_, p_ in pops.items():
 for n_, when, grp, dups, missing, n_ids, nb in INV:
     print(f"  ARENA INVARIANT broken (n={n_}, run {when}): group {grp}, {n_ids} ids for {nb} "
           f"blocks; duplicates (id, first, second) {dups}; missing {missing}")
-if not INV:
+if CHECK_ARENA and not INV:
     print("  arena invariant held at every resize checked")
 for n_, when, w in BLK[:8]:
     print(f"  STAGING (n={n_}, at {when}): blocks past arena {w[0]}; link index out of its connection {w[6]}, "
@@ -121,7 +126,7 @@ for n_, when, w in BLK[:8]:
 import struct  # TEMP: the pull validation's counters (runtime.overrun words 1..)
 for nm, p in pops.items():
     o = P._runtime("network", p).overrun.tolist()
-    if o[1] or o[2] or o[3]:
+    if len(o) > 19 and (o[1] or o[2] or o[3]):  # (only with tools/pd14_volley_debug.patch applied)
         e = struct.unpack("f", struct.pack("i", o[15]))[0]
         print(f"  PULL CHECK {nm}: bad spikes {o[1]}, bad segment ranges {o[2]}, bad link ranges {o[3]}; first: "
               f"group {o[5]} round {o[6]} conn {o[7]} slot {o[8]} index {o[9]}: source {o[10]} of {o[11]}, "

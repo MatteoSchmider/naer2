@@ -15,8 +15,8 @@ One entry is RUN_WORDS int32 words:
     their ring positions advanced on the host, in device memory, uploaded once
   - a captured window (naer2/graph.py): the same entries copied into a graph's own buffers before replay
 
-Resizing a ring is left out of planned windows for now: a run too large for its ring stops (and is rerun
-once the window's statuses are judged, the ring grown -- between windows).
+A run too large for its ring inside a planned or captured window stops (and every run after it), and is rerun
+once the window's statuses are judged, the ring grown (runtime._Launches.recover).
 """
 
 import math

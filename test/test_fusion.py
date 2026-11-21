@@ -63,7 +63,7 @@ def test_rounds_not_every_population_runs_launch_per_population():
     def run(fuse):
         torch.manual_seed(0)
         network, pops = build()
-        pops["E"].timestep, pops["I"].timestep = 0.1, 0.2  # (both given: the history depth from them)
+        pops["I"].timestep = 0.2  # (E's unset: the network's resolution, for the history depth too)
         for pop in pops.values():
             pop.count_received = True
             pop.potential = torch.normal(-52.0, 4.0, pop.potential.shape)

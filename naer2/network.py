@@ -295,6 +295,9 @@ class Network:
             if rt.status_slots < 2 * n:
                 rt._alloc_slots(1 << math.ceil(math.log2(2 * n)))
             rt.make_room(n)
+            # the window two turns back judged: its capture turn's buffers are this window's next
+            # (status slots rounded up could otherwise leave it pending, its entries overwritten)
+            rt.judge_windows(keep=1)
         if not hasattr(self, "_graphs"):
             self._graphs = {}
         sig = schedule.signature()
@@ -321,8 +324,9 @@ class Network:
         """The emission histories' depth K, once, before the first round: a
         source's history must keep every run its slowest consumer hasn't
         read yet -- the most runs it makes between two of that consumer's
-        reads, + 2 (naer2/history.py). From the timesteps where both are
-        known: 2 + ceil(consumer timestep / source timestep); else 3 (every
+        reads, + 2 (naer2/history.py). From the timesteps: 2 + ceil(consumer
+        timestep / source timestep), an unset one taken as the network's
+        resolution (the finest a population runs at); at least 3 (every
         population running every round) -- at least EVENT_DRIVEN_DEPTH with
         an event-driven consumer anywhere (it reads whenever an arrival is
         due: no cadence to derive from). One K for the whole network (a
@@ -336,8 +340,8 @@ class Network:
         for pop in pops:
             for conn in pop.incoming:
                 src = conn._source
-                if pop.timestep and src.timestep:
-                    depth = max(depth, 2 + math.ceil(pop.timestep / src.timestep - 1e-9))
+                reads, runs = pop.timestep or self.resolution, src.timestep or self.resolution
+                depth = max(depth, 2 + math.ceil(reads / runs - 1e-9))
         for pop in pops:
             pop._derived_depth = depth
 

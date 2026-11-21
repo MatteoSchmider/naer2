@@ -391,6 +391,14 @@ class PopulationRuntime:
         part.window.parts[id(self)] = part
         self._pending.append(part)
 
+    def judge_windows(self, keep: int = 1) -> None:
+        """Replayed windows pending at most `keep` (judged, waited for, oldest first, with any runs before
+        them): a capture turn's buffers (its entries, its statuses) are the window's until it is judged, and
+        every other window reuses them (naer2/graph.py) -- a window two turns back must be judged before the
+        next replay writes its entries."""
+        while sum(isinstance(p, _WindowPart) for p in self._pending) > keep:
+            self._judge(self._pending.popleft())
+
     def _n_pending(self) -> int:
         return sum(len(p) if isinstance(p, _WindowPart) else 1 for p in self._pending)
 

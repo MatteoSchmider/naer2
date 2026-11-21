@@ -18,8 +18,10 @@ slot: its index), and the window's last node copies them into pinned host memory
 with host-bound stores outstanding stalls the kernels still running for ~15-20 us (PD14 on the 4090, a
 round's GPU time 65 -> 33 us; tools/pd14_graph_gpu.py --slowest, --status-device).
 
-Ring resizing stays outside a window: a run too large for its ring stops (and is rerun once the window's
-statuses are judged, the ring grown); a resized ring's new buffer means a new capture.
+A run too large for its ring stops (and every run after it), and is rerun once its window is judged -- through
+its population's own kernel, from the window's entries, the ring grown; a resized ring's new buffer means a
+new capture. A window is judged before the window after next replays (PopulationRuntime.judge_windows): the
+two captures' buffers alternate, a window's are its own until then.
 """
 
 import gc
