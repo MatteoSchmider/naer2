@@ -42,12 +42,10 @@ class RandomLoweringTransformer(StmtTransformer):
         DIFFERENT random.random() calls in the same hook from returning the
         same value.
 
-    GAP (TODO.md, test_gap_populations_draw_their_own_random_numbers): seed
-    is derived only from t (plus the call-site salt), with no population
-    identity folded in, so two different populations' kernels draw
-    IDENTICAL numbers for the same lane index at the same t — randomness
-    only differs within one population's own kernel, not network-wide. The
-    fix: each population owning its own public seed.
+      - the population's own seed (Population.seed, the kernel's `seed`
+        argument) in the key's high 32 bits: two populations draw their own
+        streams (different by default, the same when their seeds are set
+        equal) -- test_populations_draw_their_own_random_numbers.
 
     ALSO NOT HANDLED: `offs` is GROUP_SIZE-shaped (one lane per neuron);
     nothing here checks which lane space the surrounding code actually runs
@@ -63,8 +61,11 @@ class RandomLoweringTransformer(StmtTransformer):
     def _seed_expr(self) -> str:
         salt = self._call_site
         self._call_site += 1
-        base = "t.to(tl.int32, bitcast=True)"
-        return base if salt == 0 else f"({base} ^ {salt * 0x9E3779B1})"
+        # a 64-bit Philox key: the population's seed (the kernel's `seed` argument, Population.seed) in the
+        # high 32 bits, the time's bits (XOR the call site's salt) in the low ones -- no two populations'
+        # streams meet, whatever their times
+        low = "t.to(tl.int32, bitcast=True)" if salt == 0 else f"(t.to(tl.int32, bitcast=True) ^ {salt * 0x9E3779B1})"
+        return f"((seed.to(tl.int64) << 32) | ({low}.to(tl.int64) & 0xFFFFFFFF))"
 
     @staticmethod
     def _is_random(func: ast.expr) -> bool:

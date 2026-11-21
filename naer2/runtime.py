@@ -234,6 +234,7 @@ class PopulationRuntime:
         self.waves_per_eu = 0
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
+        self.seed = 0  # random.*'s stream (the population's own seed: Population.seed)
         self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
@@ -410,7 +411,7 @@ class PopulationRuntime:
             self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, self._launches.ctl,
             status, self.status_slots, sched, sched_i,
             self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
-            self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log]
+            self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log, self.seed]
         return args, num_warps, all(not (t.data_ptr() & 15) for t in state)
 
     def _launch(self, params, stream) -> None:

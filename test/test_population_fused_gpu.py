@@ -165,17 +165,15 @@ def test_a_ring_arena_shrinks_back_and_keeps_what_it_holds():
 # ------------------------------------------------------------ gaps (fail until closed)
 
 
-def test_gap_populations_draw_their_own_random_numbers():
-    """TODO.md (RNG seed): random.random() lowers to a draw seeded from the
-    run's time and the lane's neuron index only -- two populations draw the
-    same numbers for the same lane at the same time. Each population owning
-    a public seed gives them their own streams (different by default, the
-    same when set equal)."""
+def test_populations_draw_their_own_random_numbers():
+    """random.random() draws from the population's own stream (Population.seed:
+    RandomLoweringTransformer) -- two populations different by default, the
+    same when their seeds are set equal."""
     A = PD14_poisson(rate=0.5, t_start=1.0, t_stop=2.0) * 500
     B = PD14_poisson(rate=0.5, t_start=1.0, t_stop=2.0) * 500
     for pop in (A, B):
         pop.run(1.0, 1.1, round_id=0)  # every neuron fires at the start, then draws its next spike
-    assert not torch.equal(A.next_spike, B.next_spike)  # equal today: the same draws
+    assert not torch.equal(A.next_spike, B.next_spike)
     C = PD14_poisson(rate=0.5, t_start=1.0, t_stop=2.0) * 500
     C.seed = A.seed
     C.run(1.0, 1.1, round_id=0)

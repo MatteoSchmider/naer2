@@ -22,6 +22,8 @@ Ring resizing stays outside a window: a run too large for its ring stops (and is
 statuses are judged, the ring grown); a resized ring's new buffer means a new capture.
 """
 
+import gc
+
 import numpy as np
 import torch
 
@@ -53,24 +55,17 @@ class WindowGraph:
                       for key, rows in schedule.rows.items()}
             status_host = {key: torch.zeros(st.shape, dtype=torch.int32).pin_memory() for key, st in status.items()}
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                if barrier:  # (one root node: the first round's kernels after it, as every later round's)
-                    self._bar.add_(1)
-                for runs in schedule.launches:
-                    if fused is not None and fused.covers([pop._runtime for pop, _, _ in runs]):
-                        by_rt = {id(pop._runtime): (i, run_id) for pop, i, run_id in runs}
-                        fused.launch([rt.entry_params(buffers[id(rt)], *by_rt[id(rt)], status=status[id(rt)])
-                                      for rt in fused.runtimes], torch.cuda.current_stream())
-                        continue
-                    network._concurrently(
-                        (pop, lambda stream, pop=pop, i=i, run_id=run_id, b=buffers, st=status:
-                         pop._runtime.launch_entry(b[id(pop._runtime)], i, run_id, stream, bookkeeping=False,
-                                                   status=st[id(pop._runtime)]))
-                        for pop, i, run_id in runs)
-                    if barrier:
-                        self._bar.add_(1)
-                for key, st in status.items():  # (after every run: the round's join, or the last barrier)
-                    status_host[key].copy_(st, non_blocking=True)
+            if fused is not None:  # (its kernel compiled before the capture, not inside it)
+                runs = next((r for r in schedule.launches if fused.covers([p._runtime for p, _, _ in r])), None)
+                if runs is not None:
+                    fused.ensure_compiled(self._fused_params(fused, runs, buffers, status))
+            collecting = gc.isenabled()
+            gc.disable()  # (no garbage collection mid-capture: it may free CUDA objects -- a graph, a stream)
+            try:
+                self._capture(network, schedule, graph, buffers, status, status_host, barrier, fused)
+            finally:
+                if collecting:
+                    gc.enable()
             self.status.append(status)
             self.status_pinned.append(status_host)
             self.status_host.append({key: h.numpy() for key, h in status_host.items()})
@@ -78,6 +73,33 @@ class WindowGraph:
             self.staging.append({key: torch.from_numpy(rows.copy()).pin_memory() for key, rows in schedule.rows.items()})
             self.graphs.append(graph)
         self._turn = 0
+
+    @staticmethod
+    def _fused_params(fused, runs, buffers, status) -> list:
+        """A fused round's runs' launch params, in the fused kernel's runtime order."""
+        by_rt = {id(pop._runtime): (i, run_id) for pop, i, run_id in runs}
+        return [rt.entry_params(buffers[id(rt)], *by_rt[id(rt)], status=status[id(rt)]) for rt in fused.runtimes]
+
+    def _capture(self, network, schedule, graph, buffers, status, status_host, barrier, fused) -> None:
+        """One capture of the window into graph: every round's runs (a fused round one kernel, else each
+        population's on its stream, joined -- the barrier kernel between rounds), then the statuses' copy to
+        the host."""
+        with torch.cuda.graph(graph):
+            if barrier:  # (one root node: the first round's kernels after it, as every later round's)
+                self._bar.add_(1)
+            for runs in schedule.launches:
+                if fused is not None and fused.covers([pop._runtime for pop, _, _ in runs]):
+                    fused.launch(self._fused_params(fused, runs, buffers, status), torch.cuda.current_stream())
+                    continue
+                network._concurrently(
+                    (pop, lambda stream, pop=pop, i=i, run_id=run_id, b=buffers, st=status:
+                     pop._runtime.launch_entry(b[id(pop._runtime)], i, run_id, stream, bookkeeping=False,
+                                               status=st[id(pop._runtime)]))
+                    for pop, i, run_id in runs)
+                if barrier:
+                    self._bar.add_(1)
+            for key, st in status.items():  # (after every run: the round's join, or the last barrier)
+                status_host[key].copy_(st, non_blocking=True)
 
     @staticmethod
     def _addresses(rt) -> tuple:

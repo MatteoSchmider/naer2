@@ -24,7 +24,8 @@ from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.commanded import PD14_commanded
 from test.networks.PD14.net import build, description
 
-RATE = dict(E_23=0.0, I_23=2.2, E_4=5.0, I_4=6.0, E_5=8.5, I_5=8.5, E_6=1.7, I_6=7.6)  # Hz
+# Hz: PD14's settled rates through Network.step (4000-5000 ms, the L4e -> L2/3e projection doubled, 2026-11-21)
+RATE = dict(E_23=0.81, I_23=2.74, E_4=4.21, I_4=5.60, E_5=7.18, I_5=8.30, E_6=1.07, I_6=7.50)
 RES = 0.1  # ms: timestep, delay buckets and ring slots
 # model "pd14": ring run capacity per population (links per (group, slot) cell, G=256) -- the peak demand
 # through the thalamic volley at 700 ms (3.4k-9.3k, 30-45 rounds after it; quiet activity peaks at 160-350)

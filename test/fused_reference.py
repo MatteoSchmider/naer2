@@ -36,7 +36,7 @@ def _receive_none(state, hit, time, w, srcword):
 def pd14_neuron_kernel(
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr,
     n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
-    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr,
+    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
@@ -118,7 +118,7 @@ def pd14_neuron_kernel(
 def pd14_poisson_kernel(
     next_spike_ptr,
     n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
-    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr,
+    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,

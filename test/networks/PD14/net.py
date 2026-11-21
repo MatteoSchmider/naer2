@@ -11,7 +11,8 @@ Units: ms / mV / nA / MOhm  (1 nA × 1 MOhm = 1 mV).
 
 Weights: PSC amplitudes in nA from spec PSP J=0.15 mV via
   J_unit(tau_m=10, tau_s=0.5, R_m=40) ≈ 0.08781 nA (excitatory),
-  -4 × J_unit ≈ -0.35124 nA (inhibitory), 2 × J_unit ≈ 0.17562 nA (E23→E4).
+  -4 × J_unit ≈ -0.35124 nA (inhibitory), 2 × J_unit ≈ 0.17562 nA (E4→E23: from L4e to L2/3e,
+  the published model's one doubled projection -- NEST's microcircuit: PSP_mean_matrix[L23E, L4E] = 2 PSP_e).
 
 Neuron: exact propagator integration (Rotter & Diesmann 1999) with dynamic dt,
   so the same code works for fixed-step and event-driven simulation.
@@ -94,7 +95,7 @@ def build(desc: dict = description):
                 continue
             w_mean, w_std = (
                 (2 * _J_E, abs(2 * _J_E) * 0.1)
-                if source == "E_23" and target == "E_4"
+                if source == "E_4" and target == "E_23"
                 else (weight_mean, weight_std)
             )
             conn = populations[source] >> PD14_connection(prob) >> populations[target]

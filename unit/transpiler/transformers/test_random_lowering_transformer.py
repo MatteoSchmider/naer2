@@ -11,24 +11,22 @@ import pytest
 from naer2.transpiler.transformers import RandomLoweringTransformer
 
 
+# the Philox key: the population's seed (the kernel's `seed`) high, the time's bits low (RandomLoweringTransformer)
+KEY = "seed.to(tl.int64) << 32 | t.to(tl.int32, bitcast=True).to(tl.int64) & 4294967295"
+
+
 def _rhs(src: str) -> str:
     out = ast.unparse(RandomLoweringTransformer().visit(ast.parse(src)))
     return out.split(" = ", 1)[1]
 
 
-def test_random_random_lowers_to_tl_rand_seeded_by_t_and_offs():
-    assert _rhs("y = random.random()") == "tl.rand(t.to(tl.int32, bitcast=True), offs)"
+def test_random_random_lowers_to_tl_rand_keyed_by_seed_t_and_offs():
+    assert _rhs("y = random.random()") == f"tl.rand({KEY}, offs)"
 
 
 def test_gauss_and_normalvariate_lower_to_tl_randn():
-    assert (
-        _rhs("y = random.gauss(mu, sigma)")
-        == "mu + sigma * tl.randn(t.to(tl.int32, bitcast=True), offs)"
-    )
-    assert (
-        _rhs("y = random.normalvariate(0.0, 1.0)")
-        == "0.0 + 1.0 * tl.randn(t.to(tl.int32, bitcast=True), offs)"
-    )
+    assert _rhs("y = random.gauss(mu, sigma)") == f"mu + sigma * tl.randn({KEY}, offs)"
+    assert _rhs("y = random.normalvariate(0.0, 1.0)") == f"0.0 + 1.0 * tl.randn({KEY}, offs)"
 
 
 def test_multiple_call_sites_in_one_body_get_distinct_seeds():
@@ -37,9 +35,9 @@ def test_multiple_call_sites_in_one_body_get_distinct_seeds():
     first, second = out.splitlines()
     seed1 = first.split(" = ", 1)[1]
     seed2 = second.split(" = ", 1)[1]
-    assert seed1 == "tl.rand(t.to(tl.int32, bitcast=True), offs)"
+    assert seed1 == f"tl.rand({KEY}, offs)"
     assert seed2 != seed1
-    assert "t.to(tl.int32, bitcast=True) ^" in seed2
+    assert "seed.to(tl.int64) << 32" in seed2 and "t.to(tl.int32, bitcast=True) ^" in seed2  # (the salt: low)
 
 
 def test_each_fresh_transformer_instance_restarts_the_call_site_count():
@@ -50,7 +48,7 @@ def test_each_fresh_transformer_instance_restarts_the_call_site_count():
 
 
 def test_nested_in_an_expression():
-    assert _rhs("y = 1.0 - random.random()") == "1.0 - tl.rand(t.to(tl.int32, bitcast=True), offs)"
+    assert _rhs("y = 1.0 - random.random()") == f"1.0 - tl.rand({KEY}, offs)"
 
 
 def test_random_random_rejects_arguments():

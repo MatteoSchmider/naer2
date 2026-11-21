@@ -1,3 +1,4 @@
+import itertools
 import math
 
 import torch
@@ -13,6 +14,9 @@ def _same_time(a: float, b: float) -> bool:
     if math.isinf(a) or math.isinf(b):
         return a == b
     return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+
+
+_SEEDS = itertools.count(1)  # (Population.seed: the populations numbered as they are made)
 
 
 class Population:
@@ -118,6 +122,10 @@ class Population:
         # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
         # development aid -- off by default, a little work per delivered link
         self.count_received: bool = False
+        # random.* draws from this population's own stream (RandomLoweringTransformer): distinct by default
+        # (populations numbered as they are made: the same network built the same way draws the same numbers),
+        # the same stream where set equal
+        self.seed: int = next(_SEEDS)
 
         self.network: Network = Network(self)
 
@@ -394,6 +402,7 @@ class Population:
         self._runtime = PopulationRuntime(kernel, len(self.shape), group_size=self.group_size,
                                           depth=self.history_depth or self._derived_depth, device=device,
                                           state={a: getattr(self, a) for a in kernel.attrs})
+        self._runtime.seed = self.seed
 
     def _resolution(self, conn) -> float:
         """A connection's delay quantization: its own, else the network's."""
@@ -472,6 +481,8 @@ class Population:
             return
         # a dynamic attr assigned once the runtime exists: the runtime's state follows (same tensor)
         runtime = self.__dict__.get("_runtime")
+        if runtime is not None and name == "seed":
+            runtime.seed = int(value)
         if runtime is not None and name in runtime.state:
             value = torch.as_tensor(value).to(runtime.device)
             runtime.state[name] = value

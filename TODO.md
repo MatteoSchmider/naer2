@@ -19,15 +19,16 @@ tests (`python -m pytest -k gap`) and `# GAP (...)` comments in the code
 (`grep -rn "GAP (" naer2`); known limitations are `# LIMITATION (...)`
 comments; D-n are the decisions below.
 
-## Model correctness (high priority; not a gap)
+## Model correctness
 
-- **E_23 is silent in PD14** (0.0 Hz, 2026-11-06 and still in 2026-11-16's
-  runs). PD14's L2/3e is sparse but not zero: a sign the simulated model
-  doesn't match the published one somewhere (the network's description,
-  its drive, the neuron model, or the simulation itself) -- investigate.
-  The other rates (0-700 ms): I_23 2.2, E_4 5.0, I_4 6.0, E_5 ~8.4, I_5
-  ~8.5, E_6 1.7, I_6 7.6 Hz, not yet checked against the published rates
-  either.
+- **PD14's rates** (2026-11-21): E_23 was silent (0.0 Hz) because the network doubled the wrong projection
+  -- E_23 -> E_4 instead of the published L4e -> L2/3e (test/networks/PD14/net.py). Fixed, 5 s through
+  Network.step on the 4090, the last second: E_23 0.81, I_23 2.74, E_4 4.21, I_4 5.60, E_5 7.18, I_5 8.30,
+  E_6 1.07, I_6 7.50 Hz -- every population a few percent below the published ones (from memory, to check
+  against the paper: ~0.9, 2.9, 4.4, 5.8, 7.6, 8.6, 1.1, 7.8), plausibly the DC background (V_rest shifted)
+  lacking the Poisson drive's fluctuations: a Poisson background in PD14_neuron.update would close it.
+  Left: the harness's fixed ring capacities (tools/pd14_setup.py, PD14_MAIN_CAP) were sized for the old,
+  weaker volley -- re-measure them (the network's E_6 arena now peaks at ~1500 blocks, ~700 before).
 
 ## Open work
 
@@ -152,12 +153,8 @@ comments; D-n are the decisions below.
   - `test_network_step::test_gap_history_grows_with_a_slow_consumer` -- a
     history that grows when a consumer falls behind (today the overrun
     raises)
-  - `test_population_fused_gpu::test_gap_populations_draw_their_own_random_numbers`
-    -- `random.*` lowers to a draw seeded from the run's time and the
-    lane's neuron index only, so two populations draw identical numbers
-    for the same lane at the same time; each population should own a
-    public seed. (An edge hook calling `random.*` would also use the
-    neuron lane index, not the link's.)
+  - (closed 2026-11-21: every population draws its own `random.*` stream, `Population.seed`. Still open:
+    an edge hook calling `random.*` would use the neuron lane index, not the link's.)
 - **The per-link attr load is unconditional** (`_stage_records`): a
   connection whose receive reads no attr gets a placeholder attr block
   (`fabric.PLACEHOLDER`); a constexpr skipping the load would save it.

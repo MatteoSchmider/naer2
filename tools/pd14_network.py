@@ -7,7 +7,7 @@ Both from build() under the same seed, at the same group size.
 
     python tools/pd14_network.py record {network,harness} OUT.pt [--ms 800] [--G 256] [--harness-caps]
         [--block B] [--in-flight C]
-    python tools/pd14_network.py compare A.pt B.pt
+    python tools/pd14_network.py compare A.pt B.pt [--last MS]
     python tools/pd14_network.py [--rdna2] time {network,harness} [--ms 800] [--G 256] [--rounds 200]
         [--harness-caps | --scaled-caps | --block B] [--in-flight C]
 
@@ -132,7 +132,7 @@ def _rate(runs, n, lo, hi):
     return spikes / n / ((hi - lo) * 1e-3)
 
 
-def compare(a_path, b_path):
+def compare(a_path, b_path, last=None):
     a, b = torch.load(a_path), torch.load(b_path)
     print(f"{a['path']} ({a['rounds']} rounds) vs {b['path']} ({b['rounds']} rounds), {a['ms']} ms, G={a['G']}")
     for x in (a, b):
@@ -161,6 +161,11 @@ def compare(a_path, b_path):
         print(f"  {name:5s} {len(ra):5d}/{len(rb):<5d} {windows:8d} {same:>16s} "
               + " ".join(f"{x:7.2f}/{y:<7.2f}" if hi > lo else f"{'':15s}"
                          for (x, y), (lo, hi) in zip(rates, ((0, ms), (0, min(700, ms)), (700, min(750, ms))))))
+    if last:  # the rates over the run's last `last` ms (the settled state)
+        lo = ms - last
+        print(f"  rates over the last {last:g} ms ({lo:g}-{ms:g} ms), Hz: " + ", ".join(
+            f"{name} {_rate(a['runs'][name], a['sizes'][name], lo, ms):.2f}/"
+            f"{_rate(b['runs'].get(name, []), b['sizes'][name], lo, ms):.2f}" for name in sorted(a["runs"])))
 
 
 def timed(path, ms, G, rounds, harness_caps=False, scaled_caps=False, block=None, in_flight=None):
@@ -205,6 +210,7 @@ if __name__ == "__main__":
     cmp_ = sub.add_parser("compare")
     cmp_.add_argument("a")
     cmp_.add_argument("b")
+    cmp_.add_argument("--last", type=float, default=None, help="also the rates over the last LAST ms")
     tm = sub.add_parser("time")
     tm.add_argument("path", choices=["network", "harness"])
     tm.add_argument("--ms", type=float, default=800.0)
@@ -221,7 +227,7 @@ if __name__ == "__main__":
     if args.cmd == "record":
         record(args.path, args.out, args.ms, args.G, args.harness_caps, args.block, args.in_flight)
     elif args.cmd == "compare":
-        compare(args.a, args.b)
+        compare(args.a, args.b, args.last)
     else:
         timed(args.path, args.ms, args.G, args.rounds, args.harness_caps, args.scaled_caps, args.block,
               args.in_flight)

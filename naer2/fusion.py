@@ -20,7 +20,6 @@ block size). Worth it where the populations are alike and all run every round (P
     .launch(params, stream)         one launch: params[i] runtime i's run (PopulationRuntime launch params)
 """
 
-import contextlib
 import importlib.util
 import pathlib
 import tempfile
@@ -104,9 +103,9 @@ def fused_round(
     def covers(self, runtimes) -> bool:
         return len(runtimes) == len(self.runtimes) and {id(rt) for rt in runtimes} == {k for k, _ in self.key}
 
-    def launch(self, params: list, stream=None) -> None:
-        """One launch of the round: params[i] runtime i's run, as PopulationRuntime._launch takes it."""
-        self.launches += 1
+    def _args(self, params: list) -> tuple[list, tuple, bool]:
+        """The fused kernel's arguments for one round (params[i]: runtime i's run), its constexprs' values
+        (the compiled variant's key), and whether every state tensor is aligned (the specialization)."""
         args, consts, aligned = [], [], True
         for rt, p in zip(self.runtimes, params):
             a, num_warps, al = rt._launch_args(p)
@@ -116,17 +115,29 @@ def fused_round(
             aligned &= al
             c = rt._constexprs(num_warps)
             consts += [c[n] for n in CONSTEXPRS]
-        key = tuple(consts)
+        return args, tuple(consts), aligned
+
+    def ensure_compiled(self, params: list):
+        """The compiled variant for this round's runs, compiled now if it isn't yet -- without launching
+        anything (Triton's warmup): before a graph capture, not inside it (a compile under capture allocates,
+        and a garbage collection then may free CUDA objects mid-capture). Returns its launcher."""
+        args, key, aligned = self._args(params)
         launch = self._launchers.get(key)
-        if launch is not None and aligned:
-            launch(args, stream.cuda_stream if stream is not None else None)
-            return
-        kw = {f"p{i}_{c}": consts[i * len(CONSTEXPRS) + j]
+        if launch is not None:
+            return launch
+        kw = {f"p{i}_{c}": key[i * len(CONSTEXPRS) + j]
               for i in range(len(self.runtimes)) for j, c in enumerate(CONSTEXPRS)}
         opts = {"waves_per_eu": self.waves_per_eu} if torch.version.hip else (
             {"maxnreg": self.maxnreg} if self.maxnreg else {})
-        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
-            compiled = self.kernel[(self.n_programs,)](*args, **kw, num_warps=self.num_warps, **opts)
+        compiled = self.kernel.warmup(*args, **kw, num_warps=self.num_warps, grid=(self.n_programs,), **opts)
         self.compiled = compiled  # (the last compiled variant: its registers, shared memory -- tools)
-        if aligned:
-            self._launchers[key] = _direct_launch(compiled, self.n_programs, key)
+        launch = _direct_launch(compiled, self.n_programs, key)
+        if aligned:  # (its specialization: what every aligned call meets)
+            self._launchers[key] = launch
+        return launch
+
+    def launch(self, params: list, stream=None) -> None:
+        """One launch of the round: params[i] runtime i's run, as PopulationRuntime._launch takes it."""
+        self.launches += 1
+        args, _, _ = self._args(params)
+        self.ensure_compiled(params)(args, stream.cuda_stream if stream is not None else None)

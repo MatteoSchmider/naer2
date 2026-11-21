@@ -42,13 +42,14 @@ _STMTS = lambda src: ast.parse(src).body
 # (a run's own values -- run id, round, the slots it delivers, its window -- come from its schedule entry,
 # sched[sched_i]: fused.py _run_entry, naer2/schedule.py; the status slot the entry's, else the run id mod
 # n_status: fused.py _status_slot)
+# (seed: the population's own, for random.*: RandomLoweringTransformer)
 FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "ctl", "status", "n_status", "sched",
               "sched_i", "ev", "slot_width", "received_ptr", "n_received_ptr", "log_ptr", "log_cap", "history", "hist_cap",
-              "trace_ptr")
+              "trace_ptr", "seed")
 CONSTEXPRS = ("GROUP_SIZE", "K", "SK", "KP", "UNIFORM_SOURCES", "N_SLOTS", "LOG", "STREAM",
               "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "COUNT", "BATCH", "NSP", "TRACE",
               "TRACE_CAP", "POOL_B")
-DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "n_status", "sched_i", "log_cap", "hist_cap")
+DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "n_status", "sched_i", "log_cap", "hist_cap", "seed")
 
 
 class _SpikeSites:
