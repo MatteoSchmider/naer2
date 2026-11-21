@@ -207,3 +207,11 @@ what limits a round is the slowest of its ~309 programs running side by side, no
   targets and stores): each tile slower (1.94 -> 2.24 us: spills at the compiler's ~128-register default),
   a round ~0.4 us slower; with a 168-register cap (`maxnreg`: no spills, 127-148 used) still no gain -- and
   the cap alone none either.
+- **Fused rounds** (`naer2/fusion.py`, `Network.fuse_rounds`, off by default): a round's 9 populations as one
+  kernel (each population's generated body, `fused_template.py: fused_run`, dispatched on the program id),
+  bitwise the unfused runs' results (`test/test_fusion.py`). The 4090: the replay's GPU time ~25.8 -> ~25.0
+  us a round (3 pairs, all), less than the synthetic ~3 us (`tools/graph_overhead.py`); in the trace a fused
+  round spans 21.9 us at the median (the kernel 21.6, 0.32 us to the next round's), against 23.3 unfused --
+  the window's mean above it is its slower rounds (p90 27.4) and the graph's start. The fused kernel: ~8 s
+  to compile, 168 registers (each population's own: <= 123) -- 3 programs an SM, still one wave; capped at
+  128 (4 an SM): no different.

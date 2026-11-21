@@ -223,6 +223,7 @@ class FusedKernelTemplate:
     def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e) -> str:
         args = ",\n    ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS)
                               + [f"{c}: gl.constexpr" for c in CONSTEXPRS])
+        names = ", ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS) + list(CONSTEXPRS))
         # every node attr loaded first thing in the program, with the pull's first reads (none depends on the
         # run's entry; the population's previous run wrote them): their latency under the pull, not before
         # delivery or update -- PD14 on the 4090: ~0.8 us a round (limitations.md)
@@ -270,14 +271,15 @@ from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_spike
 
 {recv_src}
 
-@gluon.jit(do_not_specialize={list(DO_NOT_SPECIALIZE)!r})
-def fused_kernel(
+@gluon.jit
+def fused_run(
+    pid, n_groups,
     {args},
 ):
+    """Program pid of the population's n_groups (its group): the whole run -- its own kernel's (fused_kernel), or
+    one population's share of a fused round's (naer2/fusion.py)."""
     LT: gl.constexpr = gl.BlockedLayout([SPT, U], [32, 1], [NUM_WARPS, 1], [1, 0])
     LN: gl.constexpr = gl.SliceLayout(1, LT)
-    pid = gl.program_id(0)
-    n_groups = gl.num_programs(0)
     n_ev = gl.to_tensor(0)
     trace = trace_ptr
     if TRACE:
@@ -308,6 +310,13 @@ def fused_kernel(
         else:
 {textwrap.indent(body, "            ")}
     _run_status(status_run, ring, pid, run_id, fin > 0)
+
+
+@gluon.jit(do_not_specialize={list(DO_NOT_SPECIALIZE)!r})
+def fused_kernel(
+    {args},
+):
+    fused_run(gl.program_id(0), gl.num_programs(0), {names})
 '''
 
 

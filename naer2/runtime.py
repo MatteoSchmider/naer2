@@ -332,24 +332,33 @@ class PopulationRuntime:
         bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay, note_run).
         status: where the kernel writes its status (the entry's slot in it; None: the runtime's host slots)."""
         if not bookkeeping:
-            self._launch((sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs),
-                          status), stream)
+            self._launch(self.entry_params(sched, i, run_id, num_warps, status), stream)
             return
-        if self.device.type == "cuda":
-            while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
-                self._judge(self._pending.popleft())
-        params = (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs))
+        self.free_slot()
+        params = self.entry_params(sched, i, run_id, num_warps)
         self._launch(params, stream)
         if self.device.type == "cuda":
             self._launches.journal[(id(self), run_id)] = (self, params)
             self._pending.append(run_id)
+
+    def entry_params(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None, status=None) -> tuple:
+        """A planned run's launch params (_launch, _launch_args): entry i of schedule sched; status: where the
+        kernel writes its status (None: the runtime's host slots). The state tensors as of now: a rerun reads
+        what this launch reads, whatever replaces them later."""
+        return (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs), status)
+
+    def free_slot(self) -> None:
+        """Before a run that writes a status slot: the slot judged free (the oldest pending runs judged)."""
+        if self.device.type == "cuda":
+            while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
+                self._judge(self._pending.popleft())
 
     def note_run(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None, status=None,
                  status_row=None) -> None:
         """A replayed graph's run: the bookkeeping launch_entry does (its status pending, its journal entry:
         a rerun after a stop launches it directly, writing where the replay did: status). status_row: where
         the host finds the run's status (the window's copy: naer2/graph.py), else its slot."""
-        params = (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs), status)
+        params = self.entry_params(sched, i, run_id, num_warps, status)
         self._launches.journal[(id(self), run_id)] = (self, params)
         self._pending.append(run_id)
         if status_row is not None:
@@ -360,9 +369,10 @@ class PopulationRuntime:
         while self._pending and len(self._pending) + n > self.status_slots:
             self._judge(self._pending.popleft())
 
-    def _launch(self, params, stream) -> None:
-        """One run's kernel launch: entry sched_i of schedule sched (run(): the direct schedule; a planned
-        window: naer2/schedule.py; a rerun: _Launches.recover)."""
+    def _launch_args(self, params) -> tuple[list, int, bool]:
+        """One run's kernel arguments (the generated kernel's, constexprs aside: _constexprs), its warps, and
+        whether its state tensors are 16-byte aligned (the specialization every call meets) -- for its own
+        kernel (_launch) or its share of a fused round's (naer2/fusion.py)."""
         sched, sched_i, run_id, num_warps, state = params[:5]
         status = params[5] if len(params) > 5 else None
         if status is None:
@@ -372,11 +382,16 @@ class PopulationRuntime:
             status, self.status_slots, sched, sched_i,
             self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
             self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log]
+        return args, num_warps, all(not (t.data_ptr() & 15) for t in state)
+
+    def _launch(self, params, stream) -> None:
+        """One run's kernel launch: entry sched_i of schedule sched (run(): the direct schedule; a planned
+        window: naer2/schedule.py; a rerun: _Launches.recover)."""
+        args, num_warps, aligned = self._launch_args(params)
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
         key = (num_warps, self.waves_per_eu, self.maxnreg, self.count_received, self.batch, self.stream_block,
                self.unroll, self.log_cap > 0)
         launch = self._launchers.get(key)
-        aligned = all(not (t.data_ptr() & 15) for t in state)  # the specialization every call meets
         if launch is not None and aligned:
             launch(args, stream.cuda_stream if stream is not None else None)
         else:

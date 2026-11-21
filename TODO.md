@@ -167,6 +167,10 @@ comments; D-n are the decisions below.
 - **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean
   post-target mapping because `@` binds tighter than `>>`; TODOs in
   `Population.__matmul__` / `Connection.__matmul__`.
+- **History depth with an unset timestep**: `Network._plan_histories` derives K from the timesteps only
+  where both a source's and its consumer's are given, else 3 -- the mini E/I network with I at 0.2 and E
+  unset (the resolution, 0.1) overruns E's history ("a consumer fell behind"); the depth should take an
+  unset timestep as the network's resolution (found 2026-11-21, test/test_fusion.py sets both).
 - **Optimizations**: a mixed (NON_)UNIFORM_SOURCES pull (D-5); an
   automatic, device-dependent group size (`SimulationTopology.locality`;
   default 32, PD14 measured at 256 only) and warps per program (an

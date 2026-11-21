@@ -3,7 +3,7 @@ and what lies between them on the GPU -- where a replay's time per round goes (t
 between dependent graph nodes, the barrier).
 
     nsys profile --capture-range=cudaProfilerApi --cuda-graph-trace=node -o OUT \\
-        python tools/pd14_graph_trace.py run [--window=100] [--warmup=1000] [--windows=1] [--barrier]
+        python tools/pd14_graph_trace.py run [--window=100] [--warmup=1000] [--windows=1] [--barrier] [--fuse]
     nsys stats --report cuda_gpu_trace --format csv --output OUT OUT.nsys-rep
     python tools/pd14_graph_trace.py analyze OUT_cuda_gpu_trace.csv [--window=100]
 (cloud/remote run: the three in one go, see the commit's notes)
@@ -33,6 +33,7 @@ if sys.argv[1] == "run":
         P._advance("network", obj, r)
         if r % 500 == 0:
             torch.cuda.synchronize()
+    net.fuse_rounds = "--fuse" in sys.argv  # (fused rounds: one kernel a round)
     for _ in range(3):
         net.run_graph(max_launches=WINDOW)
     torch.cuda.synchronize()

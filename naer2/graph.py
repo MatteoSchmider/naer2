@@ -31,10 +31,11 @@ class WindowGraph:
     entries stay as they were until the window after next (its statuses judged by then -- a stopped run's
     rerun reads them)."""
 
-    def __init__(self, network, schedule, barrier: bool = False):
+    def __init__(self, network, schedule, barrier: bool = False, fused=None):
         """barrier: a tiny kernel on the capture stream between rounds -- every round's kernels before it,
         every next round's kernels after it (9 + 9 edges a round, not 9 x 9: what a graph is instantiated
-        from, its edges -- torch has no empty node to stand in)."""
+        from, its edges -- torch has no empty node to stand in). fused: a FusedRound (naer2/fusion.py) --
+        every round it covers one kernel on the capture stream (no fork, no join, no barrier needed)."""
         device = network.device
         self._bar = torch.zeros(1, dtype=torch.int32, device=device) if barrier else None
         self.addresses = {key: self._addresses(rt) for key, rt in self._runtimes(schedule).items()}
@@ -54,6 +55,11 @@ class WindowGraph:
                 if barrier:  # (one root node: the first round's kernels after it, as every later round's)
                     self._bar.add_(1)
                 for runs in schedule.launches:
+                    if fused is not None and fused.covers([pop._runtime for pop, _, _ in runs]):
+                        by_rt = {id(pop._runtime): (i, run_id) for pop, i, run_id in runs}
+                        fused.launch([rt.entry_params(buffers[id(rt)], *by_rt[id(rt)], status=status[id(rt)])
+                                      for rt in fused.runtimes], torch.cuda.current_stream())
+                        continue
                     network._concurrently(
                         (pop, lambda stream, pop=pop, i=i, run_id=run_id, b=buffers, st=status:
                          pop._runtime.launch_entry(b[id(pop._runtime)], i, run_id, stream, bookkeeping=False,

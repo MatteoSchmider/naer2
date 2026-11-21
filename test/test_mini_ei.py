@@ -10,8 +10,8 @@ fused_template.py), then asserts on the generated source:
     template's fixed arguments, then its constexprs; static attrs inlined
   - receive: the per-link edge.weight as the staged attr `w`, its update
     rooted at the delivered lanes (is_target = hit)
-  - the receive state (current) loaded before delivery, every other attr
-    after it
+  - every node attr loaded first thing in the program, before the run's
+    gate (with the pull's first reads), once
   - no send after each delivery: receive writes current, send reads
     potential, so send runs once, after update
   - bare n2.spike(): emitted at the window's start (D-4)

@@ -30,6 +30,35 @@ class Network:
         # real kernel launch (Population._ensure_on_device).
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._streams: dict[Population, torch.cuda.Stream] = {}
+        # Fused rounds (naer2/fusion.py): a round in which every population runs as ONE kernel launch, in
+        # planned and captured windows -- off by default (one kernel: the most registers any population
+        # needs, longer compiles); PD14 turns it on: net = pop.network; net.fuse_rounds = True
+        self._fuse_rounds = False
+        self._fused = None
+
+    @property
+    def fuse_rounds(self) -> bool:
+        return self._fuse_rounds
+
+    @fuse_rounds.setter
+    def fuse_rounds(self, on: bool) -> None:
+        if bool(on) != self._fuse_rounds:
+            self._fuse_rounds = bool(on)
+            self._graphs = {}  # (captured either way: captured anew)
+
+    def _fused_round(self):
+        """The fused kernel of every population (fuse_rounds; None if off, or a population without its
+        runtime): built once, again when a runtime or its kernel is replaced."""
+        if not self._fuse_rounds or self.device.type != "cuda":
+            return None
+        runtimes = [pop._runtime for pop in sorted(self.populations, key=id)]  # (a fixed order: the key)
+        if any(rt is None for rt in runtimes):
+            return None
+        key = tuple((id(rt), id(rt.kernel)) for rt in runtimes)
+        if self._fused is None or self._fused.key != key:
+            from .fusion import FusedRound
+            self._fused = FusedRound(runtimes)
+        return self._fused
 
     def merge(self, other: Network):
         for population in other.populations:
@@ -197,7 +226,11 @@ class Network:
             need = 2 * schedule.n_runs.get(id(rt), 0)
             if rt.status_slots < need:
                 rt._alloc_slots(1 << math.ceil(math.log2(need)))
+        fused = self._fused_round()
         for runs in schedule.launches:
+            if fused is not None and fused.covers([pop._runtime for pop, _, _ in runs]):
+                self._launch_fused(fused, schedule, runs)
+                continue
             self._concurrently(
                 (pop, lambda stream, pop=pop, i=i, run_id=run_id: pop._runtime.launch_entry(
                     schedule.entries(pop._runtime), i, run_id, stream))
@@ -208,6 +241,21 @@ class Network:
                 pop._runtime.sync_ring_pos()
         self._schedule = schedule  # (its entries stay alive until the next window's)
         return len(launches)
+
+    @staticmethod
+    def _launch_fused(fused, schedule, runs) -> None:
+        """A planned round's runs as one fused launch (naer2/fusion.py), each run's bookkeeping its runtime's
+        (launch_entry's): its status slot free first, then pending, journaled for a rerun."""
+        by_rt = {id(pop._runtime): (pop._runtime, i, run_id) for pop, i, run_id in runs}
+        params = []
+        for rt in fused.runtimes:
+            _, i, run_id = by_rt[id(rt)]
+            rt.free_slot()
+            params.append(rt.entry_params(schedule.entries(rt), i, run_id))
+        fused.launch(params, torch.cuda.current_stream())
+        for rt, p in zip(fused.runtimes, params):
+            rt._launches.journal[(id(rt), p[2])] = (rt, p)
+            rt._pending.append(p[2])
 
     def run_graph(self, max_launches: int = 1000, until: float | None = None) -> int:
         """As run_planned, but the window replayed from a captured device graph (naer2/graph.py): captured
@@ -239,7 +287,8 @@ class Network:
         sig = schedule.signature()
         graph = self._graphs.get(sig)
         if graph is None or not graph.valid(schedule):
-            graph = self._graphs[sig] = WindowGraph(self, schedule, barrier=getattr(self, "graph_barrier", False))
+            graph = self._graphs[sig] = WindowGraph(self, schedule, barrier=getattr(self, "graph_barrier", False),
+                                                    fused=self._fused_round())
             self._captures = getattr(self, "_captures", 0) + 1
         graph.replay(schedule)
         schedule.commit()
