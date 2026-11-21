@@ -200,3 +200,10 @@ what limits a round is the slowest of its ~309 programs running side by side, no
 - **Pipelining the pull's spike blocks** (the next block's spikes -- binary search, nodes, times -- loaded
   before this block's segments and appends): no gain alone, and slower with the early node state (most
   programs have one block in quiet rounds; with two, the block's own work bounds it, as the link loop's).
+- **The batched pull's per-pair plan values first thing too** (each pair's topology and directory addresses
+  and counts, its link targets' address: `_pull_headers`, TABLES): a round ~1.2 us faster (3 pairs, all);
+  the header chain ~1.5-1.8 us.
+- **Pipelining the append's tiles** (the next tile's spikes and segments loaded before this tile's claim,
+  targets and stores): each tile slower (1.94 -> 2.24 us: spills at the compiler's ~128-register default),
+  a round ~0.4 us slower; with a 168-register cap (`maxnreg`: no spills, 127-148 used) still no gain -- and
+  the cap alone none either.

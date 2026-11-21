@@ -284,7 +284,7 @@ def fused_kernel(
         trace = trace_begin(trace_ptr, pid, TRACE_CAP)
         n_ev = mark(trace, n_ev, 0, 0, TRACE_CAP)
     # the pull's first reads -- plan -> history -> run headers -- issued before anything else (_pull_headers)
-    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS)
+    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, UNIFORM_SOURCES and BATCH)
     lane = gl.arange(0, GROUP_SIZE, layout=LN)
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons

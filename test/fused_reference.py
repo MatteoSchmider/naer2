@@ -58,7 +58,7 @@ def pd14_neuron_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
-    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS)  # (first: as the template's)
+    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, UNIFORM_SOURCES and BATCH)  # (first)
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
@@ -139,7 +139,7 @@ def pd14_poisson_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
-    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS)  # (first: as the template's)
+    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, UNIFORM_SOURCES and BATCH)  # (first)
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)

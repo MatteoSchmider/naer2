@@ -486,6 +486,24 @@ def _link_record(rec0, word, blk, j, w, n_l, lo_l, base, lim, cell, n_cells, e2,
 
 
 @gluon.jit
+def _tile_segments(f0, n_pairs, lane, t_first, t_a, t_gb, t_st, SPK: gl.constexpr):
+    """Tile f0's lanes: each its (spike, segment) pair -- its spike by binary search over the spikes' first
+    pairs -- and the segment's group-bucket word and link range. Returns (fl, ok, sp, seg, gb, lo_l, n_l)."""
+    fl = f0 + lane
+    ok = fl < n_pairs
+    sp = gl.zeros_like(fl)
+    for st in gl.static_range(6):  # (SPK <= 64: a probe stride of 0 past log2(SPK) steps)
+        probe = sp + (SPK >> (st + 1))
+        sp = gl.where(t_first.gather(probe, 0) <= fl, probe, sp)
+    seg = t_a.gather(sp, 0) + (fl - t_first.gather(sp, 0))
+    gb = gl.load(t_gb.gather(sp, 0).to(gl.pointer_type(gl.int32)) + seg, mask=ok, other=0)
+    stp = t_st.gather(sp, 0).to(gl.pointer_type(gl.int32))
+    lo_l = gl.load(stp + seg, mask=ok, other=0)
+    n_l = gl.load(stp + seg + 1, mask=ok, other=0) - lo_l
+    return fl, ok, sp, seg, gb, lo_l, n_l
+
+
+@gluon.jit
 def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt, s_cnt, g, k_lo, slot_width, n_cells,
                   main_time, main_src, main_lo, main_n, flags, trace, n_ev, table, log_rec, ovf_cap,
                   N_SLOTS: gl.constexpr, main_cap, LP2: gl.constexpr, LM: gl.constexpr,
@@ -522,19 +540,11 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
     gl.barrier()
     lane = gl.arange(0, T, layout=LT)
     for f0 in range(0, n_pairs, T):
-        fl = f0 + lane
-        ok = fl < n_pairs
-        sp = gl.zeros_like(fl)
-        for st in gl.static_range(6):  # (SPK <= 64: a probe stride of 0 past log2(SPK) steps)
-            probe = sp + (SPK >> (st + 1))
-            sp = gl.where(t_first.gather(probe, 0) <= fl, probe, sp)
-        seg = t_a.gather(sp, 0) + (fl - t_first.gather(sp, 0))
+        # (the next tile's segments loaded here, before this tile's claim and stores -- a pipeline over the
+        # tiles -- was no faster on the 4090, with registers to spare or not: limitations.md)
+        fl, ok, sp, seg, gb, lo_l, n_l = _tile_segments(f0, n_pairs, lane, t_first, t_a, t_gb, t_st, SPK)
         e1 = t_e.gather(sp, 0)
         srcw2 = t_srcw.gather(sp, 0)
-        gb = gl.load(t_gb.gather(sp, 0).to(gl.pointer_type(gl.int32)) + seg, mask=ok, other=0)
-        stp = t_st.gather(sp, 0).to(gl.pointer_type(gl.int32))
-        lo_l = gl.load(stp + seg, mask=ok, other=0)
-        n_l = gl.load(stp + seg + 1, mask=ok, other=0) - lo_l
         if TRACE >= 3:
             gb = pin(gb)
             n_l = pin(n_l)
@@ -1020,16 +1030,18 @@ def _spike_block(t0, n_tot, tab_first, tab_node, tab_time, LK: gl.constexpr, SPK
 
 @gluon.jit
 def _pull_headers(plan, n_conns, SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr,
-                  NUM_WARPS: gl.constexpr):
+                  NUM_WARPS: gl.constexpr, TABLES: gl.constexpr):
     """What the pull reads first -- per connection its last-read run ids (both parities: the run's isn't known
     yet), per (connection, history slot) its history's address and cap and its run's header -- loaded first
     thing in a program, before its schedule entry is even back (none of it depends on the entry; the run's
     own values only filter it, _pull): the chain to the headers is plan -> history -> header, issued with the
-    entry's and the gate's loads, not after them. Read-only: a gated-off run just drops it."""
+    entry's and the gate's loads, not after them. TABLES (the batched pull): per pair its topology's and
+    directory's addresses and counts and its link targets' address too (the plan's, static: _pull's
+    per-pair LDS tables). Read-only: a gated-off run just drops it."""
     MAX_CJ: gl.constexpr = MAX_CONNS * KP
     LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
-    (hist_addr, _topo_addr, _link_target_addr, _attr_addr, _dir_addr, hcap_p, _t_src_p, _t_seg_p, _t_bkt_p,
-     _t_lnk_p, _dpairs_p, _dwords_p, last_read) = _fused_plan(plan, n_conns)
+    (hist_addr, topo_addr, link_target_addr, _attr_addr, dir_addr, hcap_p, t_src_p, t_seg_p, _t_bkt_p,
+     _t_lnk_p, dpairs_p, dwords_p, last_read) = _fused_plan(plan, n_conns)
     ci = gl.arange(0, MAX_CONNS, layout=LV)
     cv = ci < n_conns
     last0 = gl.load(last_read + ci, mask=cv, other=0)
@@ -1047,7 +1059,15 @@ def _pull_headers(plan, n_conns, SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: 
     cnt = gl.load(hdr + 2, mask=vj, other=0)
     wend = gl.load((hdr + 3).to(gl.pointer_type(gl.float32)), mask=vj, other=0.0)
     early = gl.load((hdr + 4).to(gl.pointer_type(gl.float32)), mask=vj, other=float("inf"))
-    return last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early
+    if TABLES:
+        topo = (gl.load(topo_addr + c_of, mask=vj, other=0), gl.load(t_src_p + c_of, mask=vj, other=0),
+                gl.load(t_seg_p + c_of, mask=vj, other=0), gl.load(dir_addr + c_of, mask=vj, other=0),
+                gl.load(dpairs_p + c_of, mask=vj, other=0), gl.load(dwords_p + c_of, mask=vj, other=0),
+                # every pair a real connection's link targets (the append reads targets unmasked)
+                gl.load(link_target_addr + gl.minimum(c_of, n_conns - 1), mask=c_of * 0 < n_conns, other=0))
+    else:
+        topo = ()
+    return last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early, topo
 
 
 @gluon.jit
@@ -1088,7 +1108,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     cv = ci < n_conns
     # per (connection, slot): its run's header -- one chain (plan -> history -> header) for everything below,
     # loaded first thing in the program (_pull_headers); the run's parity picks its last-read ids
-    last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early = hdrs
+    last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early, topo = hdrs
     last_c = gl.where(parity == 0, last0, last1)
     lastj = gl.where(parity == 0, lastj0, lastj1)
     cj = gl.arange(0, MAX_CJ, layout=LV)
@@ -1119,25 +1139,21 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     if UNIFORM_SOURCES and BATCH:
         # per (connection, slot) pair, everything a spike's decode needs, as read-only LDS tables: a
         # spike looks its pair's values up directly (no barriers, no layout conversions per block)
-        tb_j = gl.load(topo_addr + c_of, mask=vj, other=0).to(gl.pointer_type(gl.int32))
-        nsrc_j = gl.load(t_src_p + c_of, mask=vj, other=0)
-        _j_offs, j_start, j_gb, j_mean = topology_ptrs(tb_j, nsrc_j, gl.load(t_seg_p + c_of, mask=vj, other=0))
-        j_doffs, j_dfirst, j_dwords = directory_ptrs(
-            gl.load(dir_addr + c_of, mask=vj, other=0).to(gl.pointer_type(gl.int32)), nsrc_j,
-            gl.load(dpairs_p + c_of, mask=vj, other=0))
+        # (the plan's per-pair values: loaded first thing, _pull_headers)
+        tb_j, nsrc_j, nseg_j, dbuf_j, dpairs_j, dwords_j, ltp_j = topo
+        _j_offs, j_start, j_gb, j_mean = topology_ptrs(tb_j.to(gl.pointer_type(gl.int32)), nsrc_j, nseg_j)
+        j_doffs, j_dfirst, j_dwords = directory_ptrs(dbuf_j.to(gl.pointer_type(gl.int32)), nsrc_j, dpairs_j)
         tab_node = _table(node_addr, SM)
         tab_time = _table(time_addr, SM)
         tab_wend = _table(wend, SM)
         tab_start = _table(j_start.to(gl.int64), SM)
         tab_gb = _table(j_gb.to(gl.int64), SM)
         tab_mean = _table(j_mean.to(gl.int64), SM)
-        # every pair a real connection's link targets (the append reads targets unmasked)
-        tab_ltp = _table(gl.load(link_target_addr + gl.minimum(c_of, n_conns - 1), mask=c_of * 0 < n_conns,
-                                 other=0), SM)
+        tab_ltp = _table(ltp_j, SM)
         tab_doffs = _table(j_doffs.to(gl.int64), SM)
         tab_dfirst = _table(j_dfirst.to(gl.int64), SM)
         tab_dwords = _table(j_dwords.to(gl.int64), SM)
-        tab_W = _table(gl.load(dwords_p + c_of, mask=vj, other=0), SM)
+        tab_W = _table(dwords_j, SM)
         tab_first = gl.allocate_shared_memory(gl.int32, [MAX_CJ], SM)  # per e-group: each pair's first spike
     if UNIFORM_SOURCES:
         # this group's per-slot link counts, in LDS for the pull's appends (it is their only writer)
