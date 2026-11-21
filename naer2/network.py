@@ -35,6 +35,9 @@ class Network:
         # needs, longer compiles); PD14 turns it on: net = pop.network; net.fuse_rounds = True
         self._fuse_rounds = False
         self._fused = None
+        # Periodic windows (naer2/periodic.py): a clock-only network's captured windows extrapolated once
+        # learned, not planned -- off by default; PD14 turns it on (its tune)
+        self.periodic_windows = False
 
     @property
     def fuse_rounds(self) -> bool:
@@ -265,18 +268,27 @@ class Network:
         flight while the next is planned and filled: status slots for two windows' runs, the older one
         judged (waited for) when its slots are needed. Returns the rounds made."""
         from .graph import WindowGraph
+        from .periodic import Periodic
         from .schedule import Schedule
 
         pops = list(self.populations)
         if any(pop._runtime is None for pop in pops):
             raise RuntimeError("run_graph: every population needs its runtime -- step() a round first")
-        round0 = self.round_id
-        launches = self.plan(max_launches, until, commit=True)
-        if not launches:
-            return 0
-        saved_round, self.round_id = self.round_id, round0
-        schedule = Schedule(self, launches, self.device, upload=False)
-        self.round_id = saved_round
+        if not hasattr(self, "_periodic"):
+            self._periodic = Periodic()
+        # a clock-only network's windows repeat: once learned, the next one extrapolated (naer2/periodic.py)
+        schedule = self._periodic.next(self, max_launches) if until is None and self.periodic_windows else None
+        if schedule is None:
+            start = (self.t, self.round_id)
+            launches = self.plan(max_launches, until, commit=True)
+            if not launches:
+                return 0
+            saved_round, self.round_id = self.round_id, start[1]
+            schedule = Schedule(self, launches, self.device, upload=False)
+            self.round_id = saved_round
+            n_rounds = len(launches)
+        else:
+            start, launches, n_rounds = None, None, schedule.base.n
         for pop in pops:
             rt = pop._runtime
             n = schedule.n_runs.get(id(rt), 0)
@@ -293,12 +305,17 @@ class Network:
             self._captures = getattr(self, "_captures", 0) + 1
         graph.replay(schedule)
         schedule.commit()
+        if launches is not None:  # (planned: a sample for the periodic windows, where they apply)
+            if until is None and self.periodic_windows and Periodic.applies(self, launches):
+                self._periodic.learn(self, schedule, start)
+            else:
+                self._periodic.forget()
         if any(pop._is_event_driven and pop._ins for pop in pops):
             torch.cuda.synchronize()  # (the gated runs' delivery positions: only their kernels know)
             for pop in pops:
                 if pop._is_event_driven and pop._ins:
                     pop._runtime.sync_ring_pos()
-        return len(launches)
+        return n_rounds
 
     def _plan_histories(self, pops) -> None:
         """The emission histories' depth K, once, before the first round: a

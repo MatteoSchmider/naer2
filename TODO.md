@@ -167,6 +167,11 @@ comments; D-n are the decisions below.
 - **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean
   post-target mapping because `@` binds tighter than `>>`; TODOs in
   `Population.__matmul__` / `Connection.__matmul__`.
+- **Stops inside planned and captured windows** (resizing left out of those paths so far): a run too large
+  for its ring inside a window -- the recovery's rerun ends in a consumer's history overrun ("fell behind a
+  source's emission history"), and the next capture fails (something synchronizes or compiles during it);
+  `test/test_graph_windows.py::test_gap_a_stop_inside_a_captured_window_is_rerun` (2026-11-21: fails with the
+  per-run bookkeeping as with the per-window one). Windows need rings that fit until then (PD14: warmed up).
 - **History depth with an unset timestep**: `Network._plan_histories` derives K from the timesteps only
   where both a source's and its consumer's are given, else 3 -- the mini E/I network with I at 0.2 and E
   unset (the resolution, 0.1) overruns E's history ("a consumer fell behind"); the depth should take an

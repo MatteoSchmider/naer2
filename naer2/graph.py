@@ -25,6 +25,8 @@ statuses are judged, the ring grown); a resized ring's new buffer means a new ca
 import numpy as np
 import torch
 
+from .runtime import _Window, _WindowPart
+
 
 class WindowGraph:
     """Two captures of one window shape, each with its own entry buffers, replayed in turn: a window's
@@ -39,7 +41,7 @@ class WindowGraph:
         device = network.device
         self._bar = torch.zeros(1, dtype=torch.int32, device=device) if barrier else None
         self.addresses = {key: self._addresses(rt) for key, rt in self._runtimes(schedule).items()}
-        runtimes = self._runtimes(schedule)
+        runtimes = self._rts = self._runtimes(schedule)
         self.buffers, self.staging, self.graphs = [], [], []
         self.status, self.status_pinned, self.status_host = [], [], []  # (device rows; their host copy; its numpy)
         self._slots = {key: np.arange(len(rows), dtype=np.int32) for key, rows in schedule.rows.items()}
@@ -85,7 +87,7 @@ class WindowGraph:
 
     @staticmethod
     def _runtimes(schedule) -> dict:
-        return {id(pop._runtime): pop._runtime for runs in schedule.launches for pop, _, _ in runs}
+        return schedule.runtimes
 
     def valid(self, schedule) -> bool:
         """Whether the captured graph still fits: every runtime's ring and state where it was captured."""
@@ -100,8 +102,11 @@ class WindowGraph:
             stage.numpy()[:, 7] = self._slots[key]  # (each run's status row: its entry's index)
             buffers[key].copy_(stage, non_blocking=True)
         self.graphs[turn].replay()
+        # the window's runs pending as one per runtime (judged together), one journal entry for a rerun
         status, status_host = self.status[turn], self.status_host[turn]
-        for runs in schedule.launches:
-            for pop, i, run_id in runs:
-                key = id(pop._runtime)
-                pop._runtime.note_run(buffers[key], i, run_id, status=status[key], status_row=status_host[key][i])
+        window = _Window(lambda: [(pop._runtime, i, run_id) for runs in schedule.launches for pop, i, run_id in runs])
+        for key, rows in schedule.rows.items():
+            rt = self._rts[key]
+            rt.note_window(_WindowPart(window, rows[:, 0].astype(np.int64), self._slots[key], buffers[key],
+                                       status[key], status_host[key]))
+        next(iter(self._rts.values()))._launches.journal[("window", id(window))] = window

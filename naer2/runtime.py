@@ -94,6 +94,37 @@ def _warp_cap(device) -> int:
     return 4
 
 
+class _WindowPart:
+    """One runtime's runs of a replayed window (naer2/graph.py), pending as one: their run ids (in order), their
+    entries' indices in the window's entry buffer, the status rows its kernels wrote (device) and the window's
+    last node copied to the host -- judged together (PopulationRuntime._judge_part)."""
+
+    __slots__ = ("window", "run_ids", "entries", "sched", "status", "status_host")
+
+    def __init__(self, window, run_ids, entries, sched, status, status_host):
+        self.window, self.run_ids, self.entries = window, run_ids, entries
+        self.sched, self.status, self.status_host = sched, status, status_host
+
+    def __len__(self) -> int:
+        return len(self.run_ids)
+
+
+class _Window:
+    """A replayed window's runs as one journal entry: per runtime its part, and the order its runs were launched
+    in (round by round) -- a recovery reruns the parts not yet judged complete, in that order."""
+
+    def __init__(self, order):
+        self._order = order  # () -> [(runtime, entry index, run id)], round by round (asked for on a rerun only)
+        self.parts: dict = {}  # runtime id -> _WindowPart, until judged complete
+
+    def runs(self):
+        """(runtime, launch params) of every run of a part still pending, in launch order."""
+        for rt, i, run_id in self._order():
+            part = self.parts.get(id(rt))
+            if part is not None:
+                yield rt, rt.entry_params(part.sched, i, run_id, status=part.status)
+
+
 class _Launches:
     """Every runtime's launches on one device, in launch order, each kept until its run is known complete
     (its status judged: every group done), and the stop word ctl the kernels share: a run whose ring is too
@@ -105,7 +136,8 @@ class _Launches:
 
     def __init__(self, device):
         self.ctl = torch.zeros(1, device=device, dtype=torch.int32)
-        self.journal = collections.OrderedDict()  # (runtime id, run id) -> (runtime, launch params)
+        # (runtime id, run id) -> (runtime, launch params); ("window", id) -> a replayed window's runs (_Window)
+        self.journal = collections.OrderedDict()
         self.runtimes = weakref.WeakSet()
         self.recoveries = 0
         self._resizing = False
@@ -139,13 +171,13 @@ class _Launches:
             torch.cuda.synchronize()  # nothing runs from here on: the rings can be reallocated
             for rt in list(self.runtimes):
                 rt._pending.clear()  # (stale: their runs stopped, or are rerun below)
-                rt._status_rows.clear()
             for rt in list(self.runtimes):
                 rt._grow_stopped()
                 rt._apply_wanted()
             self.ctl.zero_()
-            for rt, params in list(self.journal.values()):
-                rt._launch(params, None)
+            for entry in list(self.journal.values()):
+                for rt, params in (entry.runs() if isinstance(entry, _Window) else (entry,)):
+                    rt._launch(params, None)
             torch.cuda.synchronize()
             self.recoveries += 1
             if not int(self.ctl[0]):
@@ -202,7 +234,6 @@ class PopulationRuntime:
         self.waves_per_eu = 0
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
-        self._status_rows: dict = {}  # run id -> its status ([n_groups, 4], host) where not in a slot: a replayed window's
         self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
@@ -329,7 +360,7 @@ class PopulationRuntime:
                      bookkeeping: bool = True, status: torch.Tensor | None = None) -> None:
         """A planned run: entry i of a schedule (naer2/schedule.py) -- everything the run needs besides
         this runtime's own buffers is in it; run_id is the entry's (for the status bookkeeping).
-        bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay, note_run).
+        bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay, note_window).
         status: where the kernel writes its status (the entry's slot in it; None: the runtime's host slots)."""
         if not bookkeeping:
             self._launch(self.entry_params(sched, i, run_id, num_warps, status), stream)
@@ -353,20 +384,18 @@ class PopulationRuntime:
             while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
                 self._judge(self._pending.popleft())
 
-    def note_run(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None, status=None,
-                 status_row=None) -> None:
-        """A replayed graph's run: the bookkeeping launch_entry does (its status pending, its journal entry:
-        a rerun after a stop launches it directly, writing where the replay did: status). status_row: where
-        the host finds the run's status (the window's copy: naer2/graph.py), else its slot."""
-        params = self.entry_params(sched, i, run_id, num_warps, status)
-        self._launches.journal[(id(self), run_id)] = (self, params)
-        self._pending.append(run_id)
-        if status_row is not None:
-            self._status_rows[run_id] = status_row
+    def note_window(self, part: _WindowPart) -> None:
+        """A replayed window's runs of this runtime (naer2/graph.py): pending as one, judged together
+        (_judge_part); the window's journal entry (_Window) holds them for a rerun."""
+        part.window.parts[id(self)] = part
+        self._pending.append(part)
+
+    def _n_pending(self) -> int:
+        return sum(len(p) if isinstance(p, _WindowPart) else 1 for p in self._pending)
 
     def make_room(self, n: int) -> None:
         """Status slots for n more runs: the oldest pending runs judged (waited for) until n fit."""
-        while self._pending and len(self._pending) + n > self.status_slots:
+        while self._pending and self._n_pending() + n > self.status_slots:
             self._judge(self._pending.popleft())
 
     def _launch_args(self, params) -> tuple[list, int, bool]:
@@ -408,25 +437,26 @@ class PopulationRuntime:
 
     # ---- the ring's status and size (see the module docstring)
 
-    def _landed(self, run_id: int) -> bool:
-        """Every group of run run_id wrote its done word (finished or stopped) into the run's host slot
-        (fused.py: _run_status -- 2 run_id, + 1 if stopped; the slot's earlier runs wrote less)."""
-        return int(self._status_of(run_id)[:, 3].min()) >= 2 * run_id
+    def _landed(self, run) -> bool:
+        """Every group of run `run` wrote its done word (finished or stopped) into the run's host slot
+        (fused.py: _run_status -- 2 run_id, + 1 if stopped; the slot's earlier runs wrote less); a window part
+        (_WindowPart): every group of every one of its runs, into the window's host copy."""
+        if isinstance(run, _WindowPart):
+            return bool((run.status_host[:, :, 3] >= 2 * run.run_ids[:, None]).all())
+        return int(self._status_np[run % self.status_slots, :, 3].min()) >= 2 * run
 
-    def _status_of(self, run_id: int):
-        """Run run_id's status on the host, [n_groups, 4] (a replayed window's copy, else its slot)."""
-        row = self._status_rows.get(run_id)
-        return row if row is not None else self._status_np[run_id % self.status_slots]
-
-    def _wait_landed(self, run_id: int) -> None:
-        """Until run run_id's status has landed: polling the host slot a little, then waiting for the device
-        (its kernels done, their stores visible) -- a kernel that didn't write raises, it doesn't hang."""
+    def _wait_landed(self, run) -> None:
+        """Until run `run`'s status has landed (a run id, or a window part): polling the host a little, then
+        waiting for the device (its kernels done, their stores visible) -- a kernel that didn't write raises,
+        it doesn't hang."""
         deadline = time.perf_counter() + 2e-3
-        while not self._landed(run_id):
+        while not self._landed(run):
             if time.perf_counter() > deadline:
                 torch.cuda.synchronize()
-                if not self._landed(run_id):
-                    raise RuntimeError(f"run {run_id}'s kernel finished without writing its status")
+                if not self._landed(run):
+                    what = (f"runs {int(run.run_ids[0])}-{int(run.run_ids[-1])}" if isinstance(run, _WindowPart)
+                            else f"run {run}")
+                    raise RuntimeError(f"{what}' kernels finished without writing their status")
                 return
 
     def _judge_pending(self, stream, wait: bool) -> None:
@@ -434,22 +464,38 @@ class PopulationRuntime:
         while self._pending and (wait or self._landed(self._pending[0])):
             self._judge(self._pending.popleft())
 
-    def _judge(self, run_id: int) -> None:
-        """One run's status (waited for). Not every group finished -- this run stopped (its ring too small), or
-        another one before it did: _Launches.recover. Finished: the run's launch is complete, and the ring
-        follows its need (pooled: the most blocks any group holds, the most records any cell logged;
-        per-cell: the longest run) -- see the module docstring. The general pull's lost links (a full side
-        run, or a main run / arena out of room: it takes room one record at a time and can't stop) double
-        that size."""
-        self._wait_landed(run_id)
-        ring = self.ring
-        # per column, the most any group wrote: blocks held, records logged, lost bits (any), done (odd: stopped)
-        blocks, most, lost, done = (int(v) for v in self._status_of(run_id).max(0))
-        self._status_rows.pop(run_id, None)
+    def _judge(self, run) -> None:
+        """One run's status (waited for); `run`: a run id, or a replayed window's part (_WindowPart: its runs
+        judged together -- the most of each column over all of them). Not every group finished -- this run
+        stopped (its ring too small), or another one before it did: _Launches.recover. Finished: the run's
+        launch is complete, and the ring follows its need (_follow_need)."""
+        self._wait_landed(run)
+        if isinstance(run, _WindowPart):
+            # per column, the most any group of any run wrote: blocks held, records logged, lost bits (any),
+            # done (odd: stopped)
+            blocks, most, lost, _ = (int(v) for v in run.status_host.reshape(-1, 4).max(0))
+            if (run.status_host[:, :, 3] & 1).any():
+                self._launches.recover()
+                return
+            window = run.window
+            window.parts.pop(id(self), None)
+            if not window.parts:
+                self._launches.journal.pop(("window", id(window)), None)
+            self._follow_need(blocks, most, lost, int(run.run_ids[-1]), len(run))
+            return
+        blocks, most, lost, done = (int(v) for v in self._status_np[run % self.status_slots].max(0))
         if done & 1:
             self._launches.recover()
             return
-        self._launches.journal.pop((id(self), run_id), None)
+        self._launches.journal.pop((id(self), run), None)
+        self._follow_need(blocks, most, lost, run, 1)
+
+    def _follow_need(self, blocks: int, most: int, lost: int, run_id: int, n_runs: int) -> None:
+        """The ring following what complete runs needed -- n_runs of them, run_id the last (pooled: the most
+        blocks any group held, the most records any cell logged; per-cell: the longest run) -- see the
+        module docstring. The general pull's lost links (a full side run, or a main run / arena out of room:
+        it takes room one record at a time and can't stop) double that size."""
+        ring = self.ring
         main_full = side_full = lost > 0  # (the general pull: either kind grows)
         if not ring.pool_b:
             longest = blocks
@@ -462,7 +508,7 @@ class PopulationRuntime:
         if main_full:  # (the general pull: the arena ran out, links lost)
             blocks = max(blocks, 2 * ring.pool_nb)
         w = self._window
-        w[0], w[1], w[2] = max(w[0], blocks), max(w[1], most), w[2] + 1
+        w[0], w[1], w[2] = max(w[0], blocks), max(w[1], most), w[2] + n_runs
         nb, log_cap = self._sizes(blocks, most)
         grew = nb > ring.pool_nb or log_cap > ring.log_cap
         if not grew and w[2] >= self.shrink_window:

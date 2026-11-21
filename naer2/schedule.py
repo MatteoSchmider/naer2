@@ -66,6 +66,7 @@ class Schedule:
         self.rows = {key: np.stack(r) for key, (rt, r) in rows.items()}  # (host: [runs, RUN_WORDS] int32)
         self.buf = {key: torch.from_numpy(r).to(device) for key, r in self.rows.items()} if upload else {}
         self._ends = {key: (rows[key][0], run_ids[key], ring_pos[key]) for key in rows}
+        self.runtimes = {key: rt for key, (rt, _) in rows.items()}  # (runtime id -> runtime)
         self.n_runs = {key: len(r) for key, (rt, r) in rows.items()}
 
     def signature(self) -> tuple:
