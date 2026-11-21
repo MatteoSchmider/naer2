@@ -148,6 +148,7 @@ class _Launches:
             torch.cuda.synchronize()  # nothing runs from here on: the rings can be reallocated
             for rt in list(self.runtimes):
                 rt._pending.clear()  # (stale: their runs stopped, or are rerun below)
+                rt._status_rows.clear()
             for rt in list(self.runtimes):
                 rt._grow_stopped()
                 rt._apply_wanted()
@@ -210,6 +211,7 @@ class PopulationRuntime:
         self.waves_per_eu = 0
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
+        self._status_rows: dict = {}  # run id -> its status ([n_groups, 4], host) where not in a slot: a replayed window's
         self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
@@ -333,13 +335,14 @@ class PopulationRuntime:
         return int((t + 1e-6) // self.ring.slot_width) - 1
 
     def launch_entry(self, sched: torch.Tensor, i: int, run_id: int, stream=None, num_warps=None,
-                     bookkeeping: bool = True) -> None:
+                     bookkeeping: bool = True, status: torch.Tensor | None = None) -> None:
         """A planned run: entry i of a schedule (naer2/schedule.py) -- everything the run needs besides
         this runtime's own buffers is in it; run_id is the entry's (for the status bookkeeping).
-        bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay, note_run)."""
+        bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay, note_run).
+        status: where the kernel writes its status (the entry's slot in it; None: the runtime's host slots)."""
         if not bookkeeping:
-            self._launch((sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs)),
-                         stream)
+            self._launch((sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs),
+                          status), stream)
             return
         if self.device.type == "cuda":
             while len(self._pending) >= self.status_slots:  # the slot this run's kernel writes: judged first
@@ -350,12 +353,16 @@ class PopulationRuntime:
             self._launches.journal[(id(self), run_id)] = (self, params)
             self._pending.append(run_id)
 
-    def note_run(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None) -> None:
+    def note_run(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None, status=None,
+                 status_row=None) -> None:
         """A replayed graph's run: the bookkeeping launch_entry does (its status pending, its journal entry:
-        a rerun after a stop launches it directly)."""
-        params = (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs))
+        a rerun after a stop launches it directly, writing where the replay did: status). status_row: where
+        the host finds the run's status (the window's copy: naer2/graph.py), else its slot."""
+        params = (sched, i, run_id, self._warps(num_warps), tuple(self.state[a] for a in self.kernel.attrs), status)
         self._launches.journal[(id(self), run_id)] = (self, params)
         self._pending.append(run_id)
+        if status_row is not None:
+            self._status_rows[run_id] = status_row
 
     def make_room(self, n: int) -> None:
         """Status slots for n more runs: the oldest pending runs judged (waited for) until n fit."""
@@ -365,10 +372,13 @@ class PopulationRuntime:
     def _launch(self, params, stream) -> None:
         """One run's kernel launch: entry sched_i of schedule sched (run(): the direct schedule; a planned
         window: naer2/schedule.py; a rerun: _Launches.recover)."""
-        sched, sched_i, run_id, num_warps, state = params
+        sched, sched_i, run_id, num_warps, state = params[:5]
+        status = params[5] if len(params) > 5 else None
+        if status is None:
+            status = self._status_host if self.device.type == "cuda" else self.overrun
         args = list(state) + [
             self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, self._launches.ctl,
-            self._status_host if self.device.type == "cuda" else self.overrun, self.status_slots, sched, sched_i,
+            status, self.status_slots, sched, sched_i,
             self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
             self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log]
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
@@ -395,7 +405,12 @@ class PopulationRuntime:
     def _landed(self, run_id: int) -> bool:
         """Every group of run run_id wrote its done word (finished or stopped) into the run's host slot
         (fused.py: _run_status -- 2 run_id, + 1 if stopped; the slot's earlier runs wrote less)."""
-        return int(self._status_np[run_id % self.status_slots, :, 3].min()) >= 2 * run_id
+        return int(self._status_of(run_id)[:, 3].min()) >= 2 * run_id
+
+    def _status_of(self, run_id: int):
+        """Run run_id's status on the host, [n_groups, 4] (a replayed window's copy, else its slot)."""
+        row = self._status_rows.get(run_id)
+        return row if row is not None else self._status_np[run_id % self.status_slots]
 
     def _wait_landed(self, run_id: int) -> None:
         """Until run run_id's status has landed: polling the host slot a little, then waiting for the device
@@ -423,7 +438,8 @@ class PopulationRuntime:
         self._wait_landed(run_id)
         ring = self.ring
         # per column, the most any group wrote: blocks held, records logged, lost bits (any), done (odd: stopped)
-        blocks, most, lost, done = (int(v) for v in self._status_np[run_id % self.status_slots].max(0))
+        blocks, most, lost, done = (int(v) for v in self._status_of(run_id).max(0))
+        self._status_rows.pop(run_id, None)
         if done & 1:
             self._launches.recover()
             return

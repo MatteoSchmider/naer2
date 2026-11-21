@@ -3,7 +3,7 @@ and what lies between them on the GPU -- where a replay's time per round goes (t
 between dependent graph nodes, the barrier).
 
     nsys profile --capture-range=cudaProfilerApi --cuda-graph-trace=node -o OUT \\
-        python tools/pd14_graph_trace.py run [--window=100] [--warmup=1000] [--barrier]
+        python tools/pd14_graph_trace.py run [--window=100] [--warmup=1000] [--windows=1] [--barrier]
     nsys stats --report cuda_gpu_trace --format csv --output OUT OUT.nsys-rep
     python tools/pd14_graph_trace.py analyze OUT_cuda_gpu_trace.csv [--window=100]
 (cloud/remote run: the three in one go, see the commit's notes)
@@ -37,7 +37,8 @@ if sys.argv[1] == "run":
         net.run_graph(max_launches=WINDOW)
     torch.cuda.synchronize()
     torch.cuda.profiler.start()
-    net.run_graph(max_launches=WINDOW)
+    for _ in range(opts.get("windows", 1)):
+        net.run_graph(max_launches=WINDOW)
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
     print("traced one window; captures:", net._captures)

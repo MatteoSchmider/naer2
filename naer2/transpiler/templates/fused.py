@@ -600,7 +600,8 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
 
 
 # one run's entry in a schedule (naer2/schedule.py: RUN_WORDS int32 words), what a launch would otherwise pass
-# as arguments: run id, round id, the slots it delivers (k_lo .. k_hi), its window (t_start, t_end), gated
+# as arguments: run id, round id, the slots it delivers (k_lo .. k_hi), its window (t_start, t_end), gated,
+# its status slot (-1: the run id mod n_status)
 RUN_WORDS = gl.constexpr(8)
 
 
@@ -618,6 +619,16 @@ def _run_entry(sched, sched_i):
     t_end = gl.load((e + 5).to(gl.pointer_type(gl.float32)))
     gated = gl.load(e + 6)
     return run_id, round_id, k_lo, k_hi, t_start, t_end, gated
+
+
+@gluon.jit
+def _status_slot(status, sched, sched_i, run_id, n_status, n_groups):
+    """This run's status slot (4 n_groups words, _run_status): the entry's word 7 -- a captured window's runs
+    each their own, in device memory (naer2/graph.py) -- or, -1, slot run_id mod n_status (a direct run's or
+    a planned window's: the runtime's pinned host slots, written straight from the kernel)."""
+    slot = gl.load(sched + RUN_WORDS * sched_i + 7)
+    slot = gl.where(slot >= 0, slot, run_id % n_status)
+    return status + slot * (4 * n_groups)
 
 
 # A runtime's event state, [2, EV_HDR + n_groups] int32 double-buffered by run parity (run r reads row r % 2,

@@ -6,7 +6,7 @@ the entry's index, and a planned window of runs can be filled ahead (and capture
 
 One entry is RUN_WORDS int32 words:
   [run id, round id, first slot delivered (k_lo), last slot delivered (k_hi), t_start (float32 bits),
-   t_end (float32 bits), gated, 0]
+   t_end (float32 bits), gated, status slot (-1: the run id mod the runtime's status slots)]
 
   - a direct run (PopulationRuntime.run): one entry in the runtime's own pinned host schedule, its slot the
     run id mod the runtime's status slots (the kernel reads it from host memory; a slot is reused only
@@ -33,7 +33,7 @@ def write_entry(row, run_id: int, round_id: int, k_lo: int, k_hi: int, t_start: 
     row[0], row[1], row[2], row[3] = run_id, round_id, k_lo, k_hi
     row[4] = np.float32(t_start).view(np.int32)
     row[5] = np.float32(t_end).view(np.int32)
-    row[6], row[7] = gated, 0
+    row[6], row[7] = gated, -1  # (status slot -1: the run id's, fused.py _status_slot)
 
 
 class Schedule:

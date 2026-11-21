@@ -15,7 +15,7 @@ from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
 from naer2.transpiler.templates.fused import (_deliver, _emit, _pin_first, _pull, _rand, _run_done, _run_entry,
-                                              _run_gate, _run_status, _gate_skip, _ev_close)
+                                              _status_slot, _run_gate, _run_status, _gate_skip, _ev_close)
 from naer2.transpiler.templates.fused_template import DO_NOT_SPECIALIZE, FusedKernel
 
 
@@ -60,7 +60,7 @@ def pd14_neuron_kernel(
 
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
-    status_run = status + (run_id % n_status) * (4 * n_groups)
+    status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
     if gated != 0:
         k_lo = gl.load(ev + parity * (2 + n_groups))
     skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
@@ -140,7 +140,7 @@ def pd14_poisson_kernel(
 
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
-    status_run = status + (run_id % n_status) * (4 * n_groups)
+    status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
     if gated != 0:
         k_lo = gl.load(ev + parity * (2 + n_groups))
     skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,

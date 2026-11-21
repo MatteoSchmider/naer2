@@ -40,7 +40,8 @@ _STMTS = lambda src: ast.parse(src).body
 
 # the entry's fixed arguments after the node attrs' pointers (the template's phases take them)
 # (a run's own values -- run id, round, the slots it delivers, its window -- come from its schedule entry,
-# sched[sched_i]: fused.py _run_entry, naer2/schedule.py; the status slot from the run id, n_status of them)
+# sched[sched_i]: fused.py _run_entry, naer2/schedule.py; the status slot the entry's, else the run id mod
+# n_status: fused.py _status_slot)
 FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "ctl", "status", "n_status", "sched",
               "sched_i", "ev", "slot_width", "received_ptr", "n_received_ptr", "log_ptr", "log_cap", "history", "hist_cap",
               "trace_ptr")
@@ -263,7 +264,7 @@ from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
 from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_spikes, _pin_first, _pull, _rand, _randn,
-                                              _run_done, _run_entry, _run_gate, _run_status, _gate_skip,
+                                              _run_done, _run_entry, _status_slot, _run_gate, _run_status, _gate_skip,
                                               _gate_carry, _ev_close)
 
 
@@ -290,7 +291,7 @@ def fused_kernel(
     # rerun): nothing to do -- see _run_gate, _pull
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
-    status_run = status + (run_id % n_status) * (4 * n_groups)  # this run's host status slot
+    status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)  # this run's status slot
     if gated != 0:  # a gated run delivers from where the population's last run left off (event state)
         k_lo = gl.load(ev + parity * (2 + n_groups))
     skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
