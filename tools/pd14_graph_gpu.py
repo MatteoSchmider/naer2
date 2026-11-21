@@ -2,7 +2,7 @@
 (events around the graph launch alone) and the wall clock -- for a kernel configuration: group size, warps
 per program, NVIDIA's register cap. One configuration per process.
 
-    python tools/pd14_graph_gpu.py [--G=256] [--Gpop=I_4:128,...] [--Wpop=I_4:8,...] [--stream=256] [--fuse] [--warps=N] [--maxnreg=N] [--window=100] [--warmup=1000] [--trace | --slowest [--serial] [--status-device]] [--trace_rounds=40] [--rdna2]
+    python tools/pd14_graph_gpu.py [--G=256] [--Gpop=I_4:128,...] [--Wpop=I_4:8,...] [--stream=256] [--fuse | --unfused] [--warps=N] [--maxnreg=N] [--window=100] [--warmup=1000] [--trace | --slowest [--serial] [--status-device]] [--trace_rounds=40] [--rdna2]
 
 Also each population's compiled registers per thread and spills (NVIDIA), so a register cap's cost shows.
 """
@@ -39,7 +39,8 @@ R._direct_launch = recording
 obj = P._network(G)
 net = obj[0]
 net.graph_barrier = True
-FUSE = "--fuse" in sys.argv  # (fused rounds, naer2/fusion.py: set after the first rounds, before any window)
+# fused rounds (naer2/fusion.py): as PD14's definition sets them (net.py: on), --fuse / --unfused to override
+FUSE = True if "--fuse" in sys.argv else False if "--unfused" in sys.argv else net.fuse_rounds
 pops = P._runtimes("network", obj)
 P.group_sizes(pops, next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--Gpop=")), None))
 P._advance("network", obj, 0)

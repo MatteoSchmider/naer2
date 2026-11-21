@@ -41,11 +41,11 @@ RES = 0.1
 
 
 def _network(G, harness_caps=False, scaled_caps=False, block=None, in_flight=None):
-    """PD14 at group size G. Rings: the populations' default (per-group arenas, Population.ring_block /
+    """PD14 at group size G (with its expert settings: test/networks/PD14/net.py, tune). Rings: the populations' default (per-group arenas, Population.ring_block /
     ring_in_flight; block / in_flight override), or per-cell runs at the harness's capacities (harness_caps)
     or those scaled to G (scaled_caps)."""
     from pd14_setup import PD14_MAIN_CAP
-    from test.networks.PD14.net import build, description
+    from test.networks.PD14.net import build, description, tune
 
     torch.cuda.set_device(0)
     torch.manual_seed(0)
@@ -53,8 +53,8 @@ def _network(G, harness_caps=False, scaled_caps=False, block=None, in_flight=Non
     names = dict(zip(description["populations"]["size"], description["populations"]["name"]))
     names[description["T"]["size"]] = "T"
     pops = {names[len(p.shape)]: p for p in net.populations}
+    tune(pops, net, G)  # (PD14's expert settings at group size G: net.py)
     for name, p in pops.items():
-        p.group_size = G
         if block is not None:
             p.ring_block = block or None  # 0: per-cell runs
         if in_flight is not None:

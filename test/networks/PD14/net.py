@@ -102,4 +102,24 @@ def build(desc: dict = description):
             weights = torch.normal(w_mean, w_std, conn.shape)
             conn.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
 
-    return populations["T"].network
+    network = populations["T"].network
+    tune(populations, network)
+    return network
+
+
+# ── expert settings: PD14's own optimizations, not the library's defaults ─────────────────────────────
+# (comment a line out to compare without it; measured on the RTX 4090, captured windows,
+# naer2/transpiler/templates/limitations.md)
+GROUP_SIZE = 256  # neurons per program (4 warps: 2 a lane)
+# the populations receiving the most links per neuron (I_4 ~520 a group of 256, E_5 ~440, the rest ~300-350)
+# end most rounds: half-size groups even the round's programs out (~0.7 us a round, fused)
+SMALL_GROUPS = ("I_4", "E_5")
+
+
+def tune(populations: dict, network, group_size: int = GROUP_SIZE) -> None:
+    """PD14's expert settings on its populations (by name) and network: group sizes, fused rounds."""
+    small = min(group_size, max(group_size // 2, 128))  # (128 at least: every population at the same warps)
+    for name, pop in populations.items():
+        pop.group_size = small if name in SMALL_GROUPS else group_size
+    # one kernel a round in planned and captured windows (naer2/fusion.py: ~0.8 us a round)
+    network.fuse_rounds = True

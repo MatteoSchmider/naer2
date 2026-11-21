@@ -51,9 +51,10 @@ class Network:
         runtime): built once, again when a runtime or its kernel is replaced."""
         if not self._fuse_rounds or self.device.type != "cuda":
             return None
-        runtimes = [pop._runtime for pop in sorted(self.populations, key=id)]  # (a fixed order: the key)
-        if any(rt is None for rt in runtimes):
+        if any(pop._runtime is None for pop in self.populations):
             return None
+        # a fixed order (the same fused kernel every process -- its compile, its cache): the largest first
+        runtimes = sorted((pop._runtime for pop in self.populations), key=lambda rt: (-rt.n_groups, -rt.n, id(rt)))
         key = tuple((id(rt), id(rt.kernel)) for rt in runtimes)
         if self._fused is None or self._fused.key != key:
             from .fusion import FusedRound

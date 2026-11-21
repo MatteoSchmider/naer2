@@ -1,7 +1,7 @@
 """
 Fused rounds (naer2/fusion.py, Network.fuse_rounds): a round in which every population runs as one kernel
-launch, each population's share its own generated body -- the same runs as unfused, so the same results,
-exactly: the mini E/I network (test/networks/mini_ei: two PD14-neuron populations, all four connections, both
+launch, each population's share its own generated body -- the same runs as unfused, so the same results
+(the links received exactly, the node state up to float rounding: _same_state): the mini E/I network (test/networks/mini_ei: two PD14-neuron populations, all four connections, both
 clocked) through planned and captured windows, fused and not, every node attr and received count compared.
 """
 
@@ -45,8 +45,16 @@ def test_fused_rounds_run_what_unfused_ones_do(mode):
     assert sum(int(r.sum()) for r in received.values()) > 0, "links were delivered"
     for n in received:
         assert torch.equal(received[n], received_f[n]), f"{n}: received counts differ"
-    for key in state:
-        assert torch.equal(state[key], state_f[key]), f"{key}: differs"
+    _same_state(state, state_f)
+
+
+def _same_state(a: dict, b: dict) -> None:
+    """Every node attr the same up to float rounding: one kernel of all the populations is compiled as one
+    function, and its multiply-adds may contract differently (FP fusion: FMAs) than in each population's
+    own -- bitwise equal on the 780M, ~1e-7 apart on the 4090 (the runs themselves are reproducible)."""
+    for key in a:
+        assert torch.allclose(a[key], b[key], rtol=1e-5, atol=1e-6), (
+            f"{key}: differs by {float((a[key] - b[key]).abs().max()):.3g}")
 
 
 def test_rounds_not_every_population_runs_launch_per_population():
@@ -74,5 +82,4 @@ def test_rounds_not_every_population_runs_launch_per_population():
     state, _, _, _ = run(False)
     state_f, launches, mixed, n_rounds = run(True)
     assert 0 < mixed < n_rounds and launches == n_rounds - mixed
-    for key in state:
-        assert torch.equal(state[key], state_f[key]), f"{key}: differs"
+    _same_state(state, state_f)
