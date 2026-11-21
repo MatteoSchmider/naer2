@@ -11,6 +11,7 @@ reading less often than their sources run, overrun detection, tracing.
 
 import math
 import random
+import sys
 
 import pytest
 import torch
@@ -31,6 +32,12 @@ GROUP_SIZE = 32
 @pytest.fixture(autouse=True, scope="module")
 def _device():
     torch.cuda.set_device(0)
+
+
+@pytest.fixture(autouse=True, params=[32, 128], ids=["1-warp", "4-warps"])
+def _group_size(monkeypatch, request):
+    """Groups of one warp, and of four: delivery walks each warp's own list of links (fused.py _walk)."""
+    monkeypatch.setattr(sys.modules[__name__], "GROUP_SIZE", request.param)
 
 
 @pytest.fixture(autouse=True, params=[(256, 8), (32, 8)], ids=["default", "small-stream"])

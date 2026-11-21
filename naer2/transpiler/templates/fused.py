@@ -74,8 +74,9 @@ from naer2.trace import mark, pin, pin_s, trace_end
 
 FUSED_TRACE_TAGS = ("start", "state", "pulled", "slot", "headers", "streamed", "walked", "delivered", "sent", "end",
                     "runs", "spikes", "found", "appended",  # TRACE >= 2: inside the pull
-                    "a:segments", "a:mean", "a:claimed", "a:targets", "a:stored")  # TRACE >= 3:
-                    # inside the append, per tile
+                    "a:segments", "a:mean", "a:claimed", "a:targets", "a:stored",
+                    # TRACE >= 3: inside the append, per tile
+                    "f:bar", "f:fixed", "f:stored", "d:bar", "d:freed")  # (TRACE >= 3: temporary dissection)
 PULL = dict(batch=True)  # PopulationRuntime default (naer2/runtime.py); tools/fused_sweep.py: batching ~30%
 # (PD14, G=256, 780M); the group directory always on (as fast again over binary search)
 # delivery walk: links staged in LDS per stream block, links per broadcast LDS read (tools/walk_sweep.py on
@@ -799,50 +800,103 @@ def _pin_first(state):
 
 
 @gluon.jit
-def _walk(r_tgt, r_w, r_src, r_e, nq, state, received, n_received, lane, mask, ui, k, pid,
-          log_ptr, log_e, log_cap, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, U: gl.constexpr,
-          LU: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, STAGE_E: gl.constexpr):
-    """The staged stream block's nq links, U per broadcast LDS read,
-    received one by one by their target lanes."""
+def _walk(r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr, log_e,
+          log_cap, LW: gl.constexpr, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, U: gl.constexpr,
+          NUM_WARPS: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, STAGE_E: gl.constexpr):
+    """The staged stream block (_stage_records): every warp its own list, the links to its own neurons in
+    link order, U of them a broadcast LDS read ([NUM_WARPS, U]: each warp its row), received one by one by
+    their target lanes. state, received, n_received: [NUM_WARPS, GROUP_SIZE // NUM_WARPS], a row per warp
+    (_to_rows); n_w: each warp's links [NUM_WARPS] (LW), n_max the most; a list past its links: masked."""
     # GAP (D-7): one broadcast LDS read and one register select per staged attr slot (here: w);
     #   up to the most attrs any variant's receive reads (D-7)
     # GAP (D-6, D-1): per link, its variant from srcword >> 24 (D-6) and its arrival time (D-1) are
     #   selected alongside -- a variant is the same for all links of one source spike through one connection,
     #   but links of different spikes and connections interleave here, so the choice is made per link
-    for g in range(0, (nq + U - 1) // U):
-        tg = r_tgt.index(g).load(LU)
-        wg = r_w.index(g).load(LU)
+    L3: gl.constexpr = gl.BlockedLayout([1, U], [1, 32], [NUM_WARPS, 1], [1, 0])  # a warp's row whole per thread
+    SM2: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    u3 = gl.arange(0, U, layout=gl.SliceLayout(0, L3))
+    for g in range(0, (n_max + U - 1) // U):
+        tg = r_tgt.index(g).reinterpret(gl.int32, [NUM_WARPS, U], SM2).load(L3)
+        wg = r_w.index(g).reinterpret(gl.float32, [NUM_WARPS, U], SM2).load(L3)
         if LOG:
-            sg = r_src.index(g).load(LU)
+            sg = r_src.index(g).reinterpret(gl.int32, [NUM_WARPS, U], SM2).load(L3)
         if STAGE_E:
-            eg = r_e.index(g).load(LU)
+            eg = r_e.index(g).reinterpret(gl.float32, [NUM_WARPS, U], SM2).load(L3)
         for u in gl.static_range(U):
-            t = gl.sum(gl.where(ui == u, tg, 0), axis=0)    # in-thread: a register select
-            w = gl.sum(gl.where(ui == u, wg, 0.0), axis=0)
+            sel = u3[None, :] == u  # in-thread: a register select from each warp's row
+            t = gl.convert_layout(gl.sum(gl.where(sel, tg, 0), axis=1), LW)
+            w = gl.convert_layout(gl.sum(gl.where(sel, wg, 0.0), axis=1), LW)
+            live = (g * U + u) < n_w
             if LOG:
-                srcword = gl.sum(gl.where(ui == u, sg, 0), axis=0)
+                srcword = gl.convert_layout(gl.sum(gl.where(sel, sg, 0), axis=1), LW)
             else:
                 srcword = 0
             if STAGE_E:
-                e = gl.sum(gl.where(ui == u, eg, 0.0), axis=0)
+                e = gl.convert_layout(gl.sum(gl.where(sel, eg, 0.0), axis=1), LW)
             else:
-                e = 0.0
-            state, received, n_received = _deliver_link(
-                state, t, w, srcword, e, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
-                RECEIVE, GROUP_SIZE, LOG, COUNT)
+                e = gl.zeros_like(w)
+            hit = (lane2 == t[:, None]) & mask2 & live[:, None]
+            # RECEIVE(state, hit, time, w, srcword) -> state: the transpiled receive (_deliver_link), rooted at
+            #   `hit`, each warp's one target lane -- elementwise, every warp's link's values along its row
+            state = RECEIVE(state, hit, e[:, None], w[:, None], srcword)
+            if COUNT:  # dev: the stand-in's bookkeeping (tests)
+                received = gl.where(hit, received + w[:, None], received)
+                n_received = n_received + hit.to(gl.int32)
+            if LOG:  # each warp's link: its record in the delivery log (in delivery order per target)
+                lv = live & (t >= 0)
+                at_log = gl.atomic_add(log_ptr + gl.zeros_like(t), 1, mask=lv)
+                lw = lv & (at_log < log_cap)
+                rec = log_ptr + 1 + 4 * at_log
+                gl.store(rec, gl.zeros_like(t) + k, mask=lw)
+                gl.store(rec + 1, srcword >> 24, mask=lw)
+                gl.store(rec + 2, srcword & 0xFFFFFF, mask=lw)
+                gl.store(rec + 3, pid * GROUP_SIZE + t, mask=lw)
+                gl.store(log_e + at_log, e, mask=lw)
     return state, received, n_received
 
 
 @gluon.jit
-def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, table, STREAM: gl.constexpr,
-                   NUM_WARPS: gl.constexpr, LOG: gl.constexpr, STAGE_E: gl.constexpr, N_SLOTS: gl.constexpr,
-                   main_cap, POOL_B: gl.constexpr, nb):
-    """Links b0 .. b0 + STREAM of a slot's main run staged in LDS for the
-    walk: each record ONE 128-bit load, split into its fields in registers,
-    the weight by link index through the connection's attribute pointer (a
-    read-only LDS table), every field stored straight from the load's layout
-    into a flat LDS buffer -- no layout conversion. Returns the links in the
-    block."""
+def _to_rows(x, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr, LWN: gl.constexpr):
+    """A [GROUP_SIZE] neuron tensor (the program's layout) as delivery's rows, one per warp (_walk)."""
+    return gl.convert_layout(gl.reshape(x, [NUM_WARPS, GROUP_SIZE // NUM_WARPS]), LWN)
+
+
+@gluon.jit
+def _from_rows(x, GROUP_SIZE: gl.constexpr, LN: gl.constexpr):
+    """Delivery's rows back to the program's [GROUP_SIZE] layout."""
+    return gl.convert_layout(gl.reshape(x, [GROUP_SIZE]), LN)
+
+
+@gluon.jit
+def _state_to_rows(state, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr, LWN: gl.constexpr):
+    out = ()
+    for i in gl.static_range(len(state)):
+        out = out + (_to_rows(state[i], NUM_WARPS, GROUP_SIZE, LWN),)
+    return out
+
+
+@gluon.jit
+def _state_from_rows(state, GROUP_SIZE: gl.constexpr, LN: gl.constexpr):
+    out = ()
+    for i in gl.static_range(len(state)):
+        out = out + (_from_rows(state[i], GROUP_SIZE, LN),)
+    return out
+
+
+@gluon.jit
+def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e, table, LW: gl.constexpr,
+                   STREAM: gl.constexpr, U: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
+                   LOG: gl.constexpr, STAGE_E: gl.constexpr, N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr,
+                   nb):
+    """Links b0 .. b0 + STREAM of a slot's main run staged in LDS for the walk, each into its target warp's
+    list: each record ONE 128-bit load, split into its fields in registers, the weight by link index through
+    the connection's attribute pointer (a read-only LDS table); then a stable partition by target warp (one
+    scan over the block: a link's place in its warp's list -- per target, link order kept), its fields
+    scattered there. f_*: flat [STREAM // U, NUM_WARPS, U] buffers, link r of warp q's list at
+    (r // U) NUM_WARPS U + q U + r % U (_walk reads a warp's U links at once). The block's padding (past
+    nm: the block's end, last in every warp's scan) is spread over the lists after their real links -- no
+    list holds more than STREAM -- past their counts. Returns (the links in the block, each warp's count
+    [NUM_WARPS] in LW, the most)."""
     LR: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [NUM_WARPS, 1], [1, 0])
     LRQ: gl.constexpr = gl.SliceLayout(1, LR)
     q = b0 + gl.arange(0, STREAM, layout=LRQ)
@@ -876,14 +930,27 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, t
     # GAP (D-9): forward's destination.x (the target neuron's state) isn't wired up -- the target is
     #   known here (t) and its state is in scope in the walk; connecting the two is left for later
     # GAP (D-10): source.x unsupported for now
-    s_tgt.store(gl.where(qv, t, -1))
-    s_w.store(w)
+    NPW: gl.constexpr = GROUP_SIZE // NUM_WARPS
+    pos = q - b0
+    if NUM_WARPS == 1:  # one list: the block as it is
+        wq = gl.zeros_like(q)
+        rank = pos
+    else:
+        wq = gl.where(qv, t // NPW, pos % NUM_WARPS)  # its target's warp (padding: spread)
+        wi = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(0, LR))
+        oh = (wq[:, None] == wi[None, :]).to(gl.int32)
+        rank = gl.sum(oh * (gl.cumsum(oh, axis=0) - 1), axis=1)  # its place in its warp's list
+    wl = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(0, LR))
+    n_w = gl.convert_layout(gl.sum(((wq[:, None] == wl[None, :]) & qv[:, None]).to(gl.int32), axis=0), LW)
+    dst = (rank // U) * (NUM_WARPS * U) + wq * U + rank % U
+    f_tgt.scatter(gl.where(qv, t, -1), dst, 0)
+    f_w.scatter(w, dst, 0)
     if LOG:
-        s_src.store(srcw)
+        f_src.scatter(srcw, dst, 0)
     if STAGE_E:
-        s_e.store(gl.convert_layout(e_i, LRQ).to(gl.float32, bitcast=True))
+        f_e.scatter(gl.convert_layout(e_i, LRQ).to(gl.float32, bitcast=True), dst, 0)
     gl.barrier()
-    return gl.minimum(nm - b0, STREAM)
+    return gl.minimum(nm - b0, STREAM), n_w, gl.max(n_w, axis=0)
 
 
 @gluon.jit
@@ -1215,9 +1282,13 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
         if violated > 0:
             gl.atomic_max(flags + 2, 1)
         gl.barrier()
+        if TRACE >= 3:
+            n_ev = mark(trace, n_ev, 19, 0, TRACE_CAP)
         if POOL_B > 0:
             fits, top0, used, most = _pool_fixup(s_cnt, cnt0, main_src - 1, table, stack, log_rec, ovf_cap, top0,
                                                  pid, sl, LV, N_SLOTS, main_cap, POOL_B, nb, NUM_WARPS, NSP)
+            if TRACE >= 3:
+                n_ev = mark(trace, n_ev, 20, pin_s(most), TRACE_CAP)
             gl.store(stats + 2 * pid, used)  # the run's status: the blocks the group holds, the most logged
             gl.store(stats + 2 * pid + 1, most)
             if fits:
@@ -1225,6 +1296,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
                 gl.store(main_count + pid * N_SLOTS + sl, packed & ((1 << POOL_CNT_BITS) - 1), mask=sl < N_SLOTS)
                 gl.store(nblk + pid * N_SLOTS + sl, packed >> POOL_CNT_BITS, mask=sl < N_SLOTS)
                 gl.store(top + pid, top0)
+            if TRACE >= 3:
+                n_ev = mark(trace, n_ev, 21, 0, TRACE_CAP)
             ok = fits
         else:
             cnt = s_cnt.load(LV)
@@ -1269,13 +1342,16 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     attrs receive touches, [GROUP_SIZE] tensors in the program's neuron
     layout (lane's). STAGE_E: the walk stages each record's time word too
     (LOG, or a receive that reads time). Returns (state, n_ev)."""
-    # neurons over lanes and warps, the U links of a walk group whole in every thread
+    # neurons over lanes and warps (the program's layout, LN); during delivery as rows, one per warp (LWN:
+    # [NUM_WARPS, GROUP_SIZE // NUM_WARPS]) -- each warp walks the links to its own neurons (_walk)
     LT: gl.constexpr = gl.BlockedLayout([SPT, U], [32, 1], [NUM_WARPS, 1], [1, 0])
     LN: gl.constexpr = gl.SliceLayout(1, LT)
-    LU: gl.constexpr = gl.SliceLayout(0, LT)
+    LWN: gl.constexpr = gl.BlockedLayout([1, SPT], [1, 32], [NUM_WARPS, 1], [1, 0])
+    LW: gl.constexpr = gl.SliceLayout(1, LWN)
     LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
     SM: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
-    ui = gl.arange(0, U, layout=LU)
+    NPW: gl.constexpr = GROUP_SIZE // NUM_WARPS
+    gl.static_assert(NPW == 32 * SPT, "a group: SPT neurons a lane, every lane of every warp")
     (_hist_addr, _topo_addr, _link_target_addr, attr_addr, _dir_addr, _hcap_p, _t_src_p, _t_seg_p, _t_bkt_p,
      _t_lnk_p, _dpairs_p, _dwords_p, _last_read) = _fused_plan(plan, n_conns)
     (main_time, main_src, main_lo, main_n, main_count, side_time, side_src, side_lo, side_n, side_count,
@@ -1289,27 +1365,36 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         received = gl.zeros([GROUP_SIZE], gl.float32, layout=LN)
         n_received = gl.zeros_like(lane)
     log_e = (log_ptr + 4 * log_cap + 1).to(gl.pointer_type(gl.float32))
-    # the stream block's fields, staged flat (the walk reads them as [STREAM // U, U]), and the
-    # connections' attribute pointers (weights by link index), a read-only table
+    # the stream block's fields, staged as each warp's list (_stage_records: [STREAM // U, NUM_WARPS, U], the
+    # walk reads [NUM_WARPS, U] a step), and the connections' attribute pointers (weights by link index), a
+    # read-only table
     # GAP (D-7): one block pointer per connection; one LDS stage buffer per attr slot -- the most
     #   attrs any variant's receive reads (here: the weight), D-7
     cq = gl.arange(0, MAX_CONNS, layout=LV)
     s_atp = gl.allocate_shared_memory(gl.int64, [MAX_CONNS], SM)
     s_atp.store(gl.load(attr_addr + cq, mask=cq < n_conns, other=0))
-    s_tgt = gl.allocate_shared_memory(gl.int32, [STREAM], SM)
-    s_w = gl.allocate_shared_memory(gl.float32, [STREAM], SM)
+    f_tgt = gl.allocate_shared_memory(gl.int32, [STREAM * NUM_WARPS], SM)
+    f_w = gl.allocate_shared_memory(gl.float32, [STREAM * NUM_WARPS], SM)
     if LOG:
-        s_src = gl.allocate_shared_memory(gl.int32, [STREAM], SM)
+        f_src = gl.allocate_shared_memory(gl.int32, [STREAM * NUM_WARPS], SM)
     else:  # placeholder, never touched
-        s_src = s_tgt
+        f_src = f_tgt
     if STAGE_E:
-        s_e = gl.allocate_shared_memory(gl.float32, [STREAM], SM)
+        f_e = gl.allocate_shared_memory(gl.float32, [STREAM * NUM_WARPS], SM)
     else:  # placeholder, never touched
-        s_e = s_w
-    r_tgt = s_tgt.reinterpret(gl.int32, [STREAM // U, U], SM)
-    r_w = s_w.reinterpret(gl.float32, [STREAM // U, U], SM)
-    r_src = s_src.reinterpret(gl.int32, [STREAM // U, U], SM)
-    r_e = s_e.reinterpret(gl.float32, [STREAM // U, U], SM)
+        f_e = f_w
+    RW: gl.constexpr = [STREAM // U, NUM_WARPS * U]  # (a row: a walk step's [NUM_WARPS, U])
+    r_tgt = f_tgt.reinterpret(gl.int32, RW, SM)
+    r_w = f_w.reinterpret(gl.float32, RW, SM)
+    r_src = f_src.reinterpret(gl.int32, RW, SM)
+    r_e = f_e.reinterpret(gl.float32, RW, SM)
+    wi = gl.arange(0, NUM_WARPS, layout=LW)
+    ji = gl.arange(0, NPW, layout=gl.SliceLayout(0, LWN))
+    lane2 = wi[:, None] * NPW + ji[None, :]
+    mask2 = _to_rows(mask.to(gl.int32), NUM_WARPS, GROUP_SIZE, LWN) > 0
+    state = _state_to_rows(state, NUM_WARPS, GROUP_SIZE, LWN)
+    received = _to_rows(received, NUM_WARPS, GROUP_SIZE, LWN)
+    n_received = _to_rows(n_received, NUM_WARPS, GROUP_SIZE, LWN)
     gl.barrier()
     # GAP (D-1): every delivery's time is its link's arrival, e + its bucket's mean delay (D-1): the
     #   pull knows the mean when it appends, so the record's time word carries the arrival (the main/side
@@ -1337,22 +1422,29 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         if ns == 0:
             # the slot's link records are its stream: STREAM links at a time
             for b0 in range(0, nm, STREAM):
-                nq = _stage_records(main_src - 1, cell, b0, nm, n_cells, s_atp, s_tgt, s_w, s_src, s_e, table,
-                                    STREAM, NUM_WARPS, LOG, STAGE_E, N_SLOTS, main_cap, POOL_B, nb)
+                nq, n_w, n_max = _stage_records(main_src - 1, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e,
+                                                table, LW, STREAM, U, NUM_WARPS, GROUP_SIZE, LOG, STAGE_E, N_SLOTS,
+                                                main_cap, POOL_B, nb)
                 if TRACE:
                     n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
                 state, received, n_received = _walk(
-                    r_tgt, r_w, r_src, r_e, nq, state, received, n_received, lane, mask, ui, k, pid,
-                    log_ptr, log_e, log_cap, RECEIVE, GROUP_SIZE, U, LU, LOG, COUNT, STAGE_E)
+                    r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr,
+                    log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E)
                 if TRACE:
                     state = _pin_first(state)
                     n_ev = mark(trace, n_ev, 6, nq, TRACE_CAP)
                 gl.barrier()
-        else:
-            state, received, n_received = _merge_links(
+                if TRACE >= 3:
+                    n_ev = mark(trace, n_ev, 22, 0, TRACE_CAP)
+        else:  # side entries: merged one link at a time in the program's layout (rare: back and forth)
+            st1, r1, n1 = _merge_links(
                 main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
-                attr_addr, state, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap, table,
+                attr_addr, _state_from_rows(state, GROUP_SIZE, LN), _from_rows(received, GROUP_SIZE, LN),
+                _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k, pid, log_ptr, log_e, log_cap, table,
                 side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb)
+            state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
+            received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
+            n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)
         if POOL_B > 0:  # the delivered cell's blocks back on the group's free stack
             # the main run keeps its first POOL_RESERVE blocks, the side run none
             keep = gl.minimum(held, POOL_RESERVE)  # (fixed blocks: never missing, never given away)
@@ -1361,10 +1453,15 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                 gl.store(nblk + cell, keep)
             tp = _free_blocks(side_table, stack, tp, pid, cell, 0, (ns + POOL_B - 1) // POOL_B, lost_v, LV,
                               nb, NUM_WARPS)
+            if TRACE >= 3:
+                n_ev = mark(trace, n_ev, 23, pin_s(tp), TRACE_CAP)
         gl.store(main_count + cell, 0)
         gl.store(side_count + cell, 0)
     if POOL_B > 0:
         gl.store(top + pid, tp)
+    state = _state_from_rows(state, GROUP_SIZE, LN)
+    received = _from_rows(received, GROUP_SIZE, LN)
+    n_received = _from_rows(n_received, GROUP_SIZE, LN)
     if COUNT:  # dev
         gl.store(received_ptr + offs, received, mask=mask)
         gl.store(n_received_ptr + offs, n_received, mask=mask)

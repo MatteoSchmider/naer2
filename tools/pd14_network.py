@@ -66,6 +66,15 @@ def _network(G, harness_caps=False, scaled_caps=False, block=None, in_flight=Non
     return net, pops
 
 
+def group_sizes(pops, spec: str | None) -> None:
+    """Per-population group sizes over the network's G: spec "I_4:128,E_5:128" (before the first round:
+    a population's runtime takes its group size when it's built)."""
+    for item in (spec or "").split(","):
+        if item:
+            name, g = item.split(":")
+            pops[name].group_size = int(g)
+
+
 def _harness(G):
     from pd14_setup import PD14
 

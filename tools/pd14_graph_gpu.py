@@ -2,7 +2,7 @@
 (events around the graph launch alone) and the wall clock -- for a kernel configuration: group size, warps
 per program, NVIDIA's register cap. One configuration per process.
 
-    python tools/pd14_graph_gpu.py [--G=256] [--warps=N] [--maxnreg=N] [--window=100] [--warmup=1000] [--trace | --slowest [--serial] [--status-device]] [--trace_rounds=40] [--rdna2]
+    python tools/pd14_graph_gpu.py [--G=256] [--Gpop=I_4:128,...] [--Wpop=I_4:8,...] [--stream=256] [--warps=N] [--maxnreg=N] [--window=100] [--warmup=1000] [--trace | --slowest [--serial] [--status-device]] [--trace_rounds=40] [--rdna2]
 
 Also each population's compiled registers per thread and spills (NVIDIA), so a register cap's cost shows.
 """
@@ -20,7 +20,8 @@ import naer2.graph as GR
 import naer2.runtime as R
 import pd14_network as P
 
-opts = {a.split("=")[0][2:]: int(a.split("=")[1]) for a in sys.argv if a.startswith("--") and "=" in a}
+opts = {a.split("=")[0][2:]: int(a.split("=")[1]) for a in sys.argv
+        if a.startswith("--") and "=" in a and not a.startswith(("--Gpop=", "--Wpop="))}
 G, WINDOW, WARMUP = opts.get("G", 256), opts.get("window", 100), opts.get("warmup", 1000)
 WARPS, MAXNREG = opts.get("warps"), opts.get("maxnreg")
 
@@ -39,10 +40,19 @@ obj = P._network(G)
 net = obj[0]
 net.graph_barrier = True
 pops = P._runtimes("network", obj)
+P.group_sizes(pops, next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--Gpop=")), None))
 P._advance("network", obj, 0)
 for p in pops.values():
     rt = P._runtime("network", p)
     rt.max_warps, rt.maxnreg = WARPS, MAXNREG
+if "stream" in opts:  # the walk's stream block (fused.py WALK), every runtime
+    for p in pops.values():
+        P._runtime("network", p).stream_block = opts["stream"]
+        P._runtime("network", p)._launchers = {}
+WPOP = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--Wpop=")), "")
+for item in filter(None, WPOP.split(",")):  # per-population warps: "I_4:8,E_5:8"
+    name, w = item.split(":")
+    P._runtime("network", pops[name]).max_warps = int(w)
 for r in range(1, WARMUP):
     P._advance("network", obj, r)
     if r % 500 == 0:
@@ -107,7 +117,7 @@ while n < 10 * WINDOW:
 torch.cuda.synchronize()
 wall = (time.perf_counter() - t) / n * 1e6
 gpu = sorted(s.elapsed_time(e) * 1e3 / WINDOW for s, e in events)
-fused = [k for k in compiled if k.metadata.name.startswith("fused")][-len(pops):]
+fused = [k for k in compiled if k.metadata.name.startswith("fused")][-len(pops):]  # (approximate: last compiled)
 regs = sorted({getattr(k, "n_regs", 0) for k in fused})
 spills = max(getattr(k, "n_spills", 0) for k in fused)
 nw = sorted({k.metadata.num_warps for k in fused})

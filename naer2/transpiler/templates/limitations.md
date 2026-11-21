@@ -104,9 +104,9 @@ interleaving got the locality instead).
   warps ~280, host-bound -- each lane's neurons are serial, and half the
   waves hide the memory round trips (limit 1). G=512 at 16 warps ~620:
   1024-thread programs, fewer resident per CU. Device-dependent: the 780M
-  (12 CUs) at G=256 is best at 4 warps (~425 us, ~470 at 8) --
-  `runtime._warp_cap`: 8 warps from 12 multiprocessors (RDNA: WGPs) up,
-  else 4.
+  (12 CUs) at G=256 is best at 4 warps (~425 us, ~470 at 8). Now 4 warps
+  everywhere (`runtime._warp_cap`; see below: the 4090 in graph mode),
+  until the warps are chosen per device.
 
 ## The RTX 4090 (2026-11-19, PD14 quiet, G=256)
 
@@ -146,3 +146,43 @@ update + send ~1.3, ~3 us per kernel of launch and scheduling (T, no inputs: 3 u
 - **Measuring GPU busy time:** `tools/pd14_busy.py` (the trace's per-program wall clock, per-round trace
   slices, free-running). RTX 4090, G=256: 105 us busy a round, no overlap between kernels, the longest
   15 us (23 max) -- while the profiler's kernel times are ~25 us: ~10 us a kernel outside the programs.
+
+## Captured windows on the RTX 4090 (2026-11-21, PD14 quiet, G=256)
+
+A round replayed from a captured graph (`naer2/graph.py`): all 9 populations' kernels launched at once, so
+what limits a round is the slowest of its ~309 programs running side by side, not launches. Tools:
+`tools/pd14_graph_gpu.py` (the replay's GPU time; `--trace`, `--slowest`), `tools/pd14_phases.py --graph`
+(phases and steps in one-round graphs; level 3 `--dissect`), `tools/pd14_tail.py`, `tools/pd14_occupancy.py`
+(`--targets`), `tools/graph_overhead.py`.
+
+- **Host-memory stores stall the other kernels.** The run status written straight into pinned host memory
+  by every program (zero-copy): a kernel finishing with those stores outstanding froze the programs of the
+  kernels still running for ~15-20 us, in nearly every round (alone, on one stream: none). The status in
+  device memory, copied to the host once per window (the graph's last node): a round's GPU time 65 -> 40 us.
+- **Occupancy: 4 warps.** At 8 warps registers (~112-128) allow 2 programs an SM, a round's 309 need 155 SMs
+  of 128: a second wave. At 4 warps 4 fit (512 slots): one wave, 40 -> ~29 us. Beyond that registers don't
+  matter (a cap of 96 or 80: within noise, 80 spills); G=128 everywhere (615 programs) or G=512: no better.
+- **The round's shape costs ~4 us** (9 kernels + the barrier kernel between rounds, against ~1.3 for one
+  kernel of all programs: `tools/graph_overhead.py`, programs busy a fixed time) -- fusing the populations
+  into one kernel would buy ~3 us. A barrier kernel between rounds makes the graph cheap to instantiate
+  (194 -> 1 ms for 100 rounds: 9 + 9 edges a round, not 9 x 9); one before the first round, too (its kernels
+  as roots started up to ~2.6 ms late).
+- **The tail is per program, not per population.** All programs start together; each covers one group, so a
+  big population isn't late, it has more programs. A program costs ~10-12 us fixed plus ~17 ns per link it
+  receives: the populations receiving most per group (I_4 ~520 links, E_5 ~440, against ~300-350) end the
+  round. Smaller groups (G=128) or 8 warps for just those: ~1 us at best -- the fixed part stays.
+- **Stepped runs read their entry from host memory** (the direct schedule): 1-5 us of every program's
+  start, growing with the population's programs (uncached PCIe reads, each program its own); in a captured
+  window the entries are in device memory (~1.1 us to the run headers, flat). Same-address loads from many
+  programs at once cost nothing extra (`tools/same_line_loads.py`: 128 programs, one chain or one each).
+- **The walk split by target warp** (`_stage_records`' stable partition, `_walk`: each warp its own neurons'
+  links, U a read): staging +0.5 us a stream block (one scan over a one-hot [STREAM, warps] tile, the
+  scatters, a barrier), the walk 2.7 -> 1.3 us; a round 28.8 -> ~27 us. At 8 warps (2026-11-19, launched one
+  by one) it hadn't paid: the walk is now the tail's load-dependent part, and the partition's LDS work
+  hides behind other programs. The 780M (throughput-bound) is ~5-8% slower with it (stream 128: the same).
+- **Tried, no gain:** one compare per thread for its SPT neurons (`lane & ~(SPT-1) == t & ~(SPT-1)`: the
+  compiler keeps a compare per element and adds the masks); dropping `& mask` in the walk (padding is -1);
+  only program 0 storing the shared last-read words.
+- **Fixed parts per program** (one-round graphs, median): header chain ~1.6-2.7 us, a spike block 0.4-0.8 +
+  ~1.9 a tile (1-2 tiles), fix-up ~0.8-1.7 (mostly the epilogue before its barrier; the growth branch runs
+  in <15% of programs), delivery setup ~0.4, freeing a slot's blocks 0.2-0.4, update + send ~1.3.

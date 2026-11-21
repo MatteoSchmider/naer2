@@ -169,7 +169,9 @@ comments; D-n are the decisions below.
   `Population.__matmul__` / `Connection.__matmul__`.
 - **Optimizations**: a mixed (NON_)UNIFORM_SOURCES pull (D-5); an
   automatic, device-dependent group size (`SimulationTopology.locality`;
-  default 32, PD14 measured at 256 only); adaptive implicit scheduling --
+  default 32, PD14 measured at 256 only) and warps per program (an
+  autotuning at startup: 4 everywhere for now, `runtime._warp_cap` -- the
+  RX 6600 was faster at 8 when stepped); adaptive implicit scheduling --
   no explicit `Network.resolution` / `Connection.resolution` / slot width,
   derived from the populations' and connections' own timing instead of a
   0.1 ms default; `n_slots` (longest delay + one window + 3) revisited

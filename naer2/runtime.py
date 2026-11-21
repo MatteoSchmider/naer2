@@ -85,22 +85,13 @@ def _direct_launch(kernel, n_programs, consts):
 
 
 def _warp_cap(device) -> int:
-    """The most warps a program gets by default on this device: 8 with 12 or more multiprocessors as torch
-    counts them (RDNA: work-group processors, two CUs each; NVIDIA: SMs), else 4. PD14 at G=256, quiet: the
-    RX 6600 (14 WGPs) ~280 us a round at 8 warps against ~465 at 4; the 780M (6 WGPs) ~425 at 4 against ~470
-    at 8 -- a full small GPU gains no latency hiding from more waves, and every
-    barrier waits for more of them. A threshold from two devices: TODO.md (an automatic, device-dependent
-    group size; a calibration at startup could replace it)."""
-    if device.type != "cuda":
-        return 4
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    if index not in _WARP_CAPS:
-        units = torch.cuda.get_device_properties(index).multi_processor_count
-        _WARP_CAPS[index] = 8 if units >= 12 else 4
-    return _WARP_CAPS[index]
-
-
-_WARP_CAPS: dict = {}
+    """The most warps a program gets by default: 4, on every device for now (a per-device choice -- an
+    autotuning at startup -- is a later feature, TODO.md). Measured: PD14 at G=256 replayed from captured
+    windows on the 4090 ~29 us a round at 4 warps against ~35-40 at 8 (4 warps: a round's 309 programs all
+    resident at once, 4 a multiprocessor by registers; 8: 2, the rest a second wave -- tools/pd14_occupancy.py);
+    the 780M ~425 us stepped at 4 against ~470 at 8. The RX 6600 (14 WGPs) was faster at 8 when stepped
+    (~280 us a round against ~465 at 4, host-bound): its loss, until the warps are chosen per device."""
+    return 4
 
 
 class _Launches:
