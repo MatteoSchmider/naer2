@@ -232,7 +232,7 @@ class FusedKernelTemplate:
         flush = "".join(f"    _emit_spikes(_fire{k}, _e{k}, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)\n"
                         for k in range(len(sites)))
         body = f'''n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
-                  parity, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
+                  parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
                   GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
 if ok:
     # the node attrs receive touches: the state through delivery
@@ -263,9 +263,9 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
-from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_spikes, _pin_first, _pull, _rand, _randn,
-                                              _run_done, _run_entry, _status_slot, _run_gate, _run_status, _gate_skip,
-                                              _gate_carry, _ev_close)
+from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_spikes, _pin_first, _pull, _pull_headers,
+                                              _rand, _randn, _run_done, _run_entry, _status_slot, _run_gate,
+                                              _run_status, _gate_skip, _gate_carry, _ev_close)
 
 
 {recv_src}
@@ -283,6 +283,8 @@ def fused_kernel(
     if TRACE:
         trace = trace_begin(trace_ptr, pid, TRACE_CAP)
         n_ev = mark(trace, n_ev, 0, 0, TRACE_CAP)
+    # the pull's first reads -- plan -> history -> run headers -- issued before anything else (_pull_headers)
+    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS)
     lane = gl.arange(0, GROUP_SIZE, layout=LN)
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons

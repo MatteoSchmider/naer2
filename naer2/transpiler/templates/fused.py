@@ -996,7 +996,40 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
 
 
 @gluon.jit
-def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id, parity, trace, n_ev,
+def _pull_headers(plan, n_conns, SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr,
+                  NUM_WARPS: gl.constexpr):
+    """What the pull reads first -- per connection its last-read run ids (both parities: the run's isn't known
+    yet), per (connection, history slot) its history's address and cap and its run's header -- loaded first
+    thing in a program, before its schedule entry is even back (none of it depends on the entry; the run's
+    own values only filter it, _pull): the chain to the headers is plan -> history -> header, issued with the
+    entry's and the gate's loads, not after them. Read-only: a gated-off run just drops it."""
+    MAX_CJ: gl.constexpr = MAX_CONNS * KP
+    LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+    (hist_addr, _topo_addr, _link_target_addr, _attr_addr, _dir_addr, hcap_p, _t_src_p, _t_seg_p, _t_bkt_p,
+     _t_lnk_p, _dpairs_p, _dwords_p, last_read) = _fused_plan(plan, n_conns)
+    ci = gl.arange(0, MAX_CONNS, layout=LV)
+    cv = ci < n_conns
+    last0 = gl.load(last_read + ci, mask=cv, other=0)
+    last1 = gl.load(last_read + n_conns + ci, mask=cv, other=0)
+    cj = gl.arange(0, MAX_CJ, layout=LV)
+    c_of = cj // KP
+    j_of = cj % KP
+    vj = (c_of < n_conns) & (j_of < SK)
+    hbuf = gl.load(hist_addr + c_of, mask=vj, other=0)
+    hcap = gl.load(hcap_p + c_of, mask=vj, other=0)
+    lastj0 = gl.load(last_read + c_of, mask=vj, other=0)
+    lastj1 = gl.load(last_read + n_conns + c_of, mask=vj, other=0)
+    hdr = hbuf.to(gl.pointer_type(gl.int32)) + 8 * j_of
+    tag = gl.load(hdr.to(gl.pointer_type(gl.int64)), mask=vj, other=0)  # run id and round, read whole
+    cnt = gl.load(hdr + 2, mask=vj, other=0)
+    wend = gl.load((hdr + 3).to(gl.pointer_type(gl.float32)), mask=vj, other=0.0)
+    early = gl.load((hdr + 4).to(gl.pointer_type(gl.float32)), mask=vj, other=float("inf"))
+    return last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early
+
+
+@gluon.jit
+def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id, parity, hdrs,
+          trace, n_ev,
           SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
           N_SLOTS: gl.constexpr, NSP: gl.constexpr,
           UNIFORM_SOURCES: gl.constexpr, BATCH: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
@@ -1019,7 +1052,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     LP2: gl.constexpr = gl.BlockedLayout([1, MSEG // 4], [8, 4], [NUM_WARPS, 1], [1, 0])
     LK: gl.constexpr = gl.SliceLayout(1, LP2)
     LM: gl.constexpr = gl.SliceLayout(0, LP2)
-    (hist_addr, topo_addr, link_target_addr, attr_addr, dir_addr, hcap_p, t_src_p, t_seg_p, t_bkt_p, t_lnk_p,
+    (_hist_addr, topo_addr, link_target_addr, attr_addr, dir_addr, _hcap_p, t_src_p, t_seg_p, t_bkt_p, t_lnk_p,
      dpairs_p, dwords_p, last_read) = _fused_plan(plan, n_conns)
     (main_time, main_src, main_lo, main_n, main_count, side_time, side_src, side_lo, side_n, side_count,
      _watermark, flags, table, side_table, stack, top, nblk, lost, log_rec, ovf_cap, main_cap, side_cap,
@@ -1030,22 +1063,17 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     #   every hook runs at delivery, in delivery order (strict per-link order)
     ci = gl.arange(0, MAX_CONNS, layout=LV)
     cv = ci < n_conns
-    last_c = gl.load(last_read + parity * n_conns + ci, mask=cv, other=0)
-    # per (connection, slot): its run's header -- one chain (plan -> history -> header) for everything below
+    # per (connection, slot): its run's header -- one chain (plan -> history -> header) for everything below,
+    # loaded first thing in the program (_pull_headers); the run's parity picks its last-read ids
+    last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early = hdrs
+    last_c = gl.where(parity == 0, last0, last1)
+    lastj = gl.where(parity == 0, lastj0, lastj1)
     cj = gl.arange(0, MAX_CJ, layout=LV)
     c_of = cj // KP
     j_of = cj % KP
     vj = (c_of < n_conns) & (j_of < SK)
-    hbuf = gl.load(hist_addr + c_of, mask=vj, other=0)
-    hcap = gl.load(hcap_p + c_of, mask=vj, other=0)
-    lastj = gl.load(last_read + parity * n_conns + c_of, mask=vj, other=0)
-    hdr = hbuf.to(gl.pointer_type(gl.int32)) + 8 * j_of
-    tag = gl.load(hdr.to(gl.pointer_type(gl.int64)), mask=vj, other=0)  # run id and round, read whole
     rid = (tag & 0xFFFFFFFF).to(gl.int32)
     rnd = (tag >> 32).to(gl.int32)
-    cnt = gl.load(hdr + 2, mask=vj, other=0)
-    wend = gl.load((hdr + 3).to(gl.pointer_type(gl.float32)), mask=vj, other=0.0)
-    early = gl.load((hdr + 4).to(gl.pointer_type(gl.float32)), mask=vj, other=float("inf"))
     # per connection: its newest and oldest run newer than last read (the last-read update, the overrun
     # check), reduced over its slots
     newer = vj & (rid > lastj) & (rnd < round_id)
@@ -1061,12 +1089,6 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     fresh = newer & (cnt > 0)
     n_spk = gl.where(fresh, gl.minimum(cnt, hcap), 0)
     key = gl.where(fresh, early, float("inf"))
-    key_r = gl.convert_layout(key, gl.SliceLayout(0, LKC))
-    cj_r = gl.arange(0, MAX_CJ, layout=gl.SliceLayout(0, LKC))
-    key_l = gl.convert_layout(key, gl.SliceLayout(1, LKC))
-    cj_l = gl.arange(0, MAX_CJ, layout=gl.SliceLayout(1, LKC))
-    before = (key_r[None, :] < key_l[:, None]) | ((key_r[None, :] == key_l[:, None]) & (cj_r[None, :] < cj_l[:, None]))
-    order = gl.convert_layout(gl.sum(before.to(gl.int32), axis=1), LV)  # rank by (e, cj); fresh runs first
     n_runs = gl.sum(fresh.to(gl.int32), axis=0)
     node_addr = hbuf + 4 * (8 * SK + j_of * hcap).to(gl.int64)
     time_addr = node_addr + 4 * (SK * hcap).to(gl.int64)
@@ -1117,70 +1139,79 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     if UNIFORM_SOURCES and BATCH:
         # all fresh runs sharing an emission time as ONE stream of spikes
         # (normally every source's run of the previous round), in blocks
-        # spanning runs and connections; e-groups in order of e
-        for ri in range(0, n_runs):
-            e0 = gl.sum(gl.where(order == ri, early, 0.0), axis=0)
-            if gl.sum((key < e0).to(gl.int32), axis=0) == ri:  # the first run of its e-group leads it
-                n_g = gl.where(fresh & (key == e0), n_spk, 0)
-                g_first = gl.cumsum(n_g, axis=0) - n_g
-                n_tot = gl.sum(n_g, axis=0)
-                total += n_tot
-                e_max = gl.to_tensor(float("-inf"))
-                tab_first.store(g_first)
-                gl.barrier()
-                for t0 in range(0, n_tot, SPK):
-                    t = t0 + gl.arange(0, SPK, layout=LK)
-                    tv = t < n_tot
-                    # each spike's pair: the last whose first spike is at or before it (pairs
-                    # without spikes here start where the next one does, so never the last one),
-                    # a binary search over the LDS table (first[0] = 0)
-                    cj_t = gl.zeros_like(t)
-                    f_t = gl.zeros_like(t)
-                    for st in gl.static_range(LOG_CJ):
-                        probe = cj_t + (MAX_CJ >> (st + 1))
-                        v = tab_first.gather(probe, 0)
-                        le = v <= t
-                        cj_t = gl.where(le, probe, cj_t)
-                        f_t = gl.where(le, v, f_t)
-                    i = (t - f_t).to(gl.int64)
-                    s = gl.load((tab_node.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.int32)), mask=tv,
-                                other=0)
-                    e = gl.load((tab_time.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.float32)), mask=tv,
-                                other=0.0)
-                    if TRACE >= 2:
-                        s = pin(s)
-                        e = pin(e)
-                        n_ev = mark(trace, n_ev, 11, gl.sum(tv.to(gl.int32), axis=0), TRACE_CAP)
-                    # GAP (D-10): source.x unsupported for now; taken at emission, it would be read off
-                    #   the history here, next to the spike's node and e, and travel with its records
-                    wend_t = tab_wend.gather(cj_t, 0)
-                    c_t = cj_t // KP
-                    seg_start = tab_start.gather(cj_t, 0).to(gl.pointer_type(gl.int32))
-                    seg_gb = tab_gb.gather(cj_t, 0).to(gl.pointer_type(gl.int32))
-                    bucket_mean = tab_mean.gather(cj_t, 0).to(gl.pointer_type(gl.float32))
-                    ltp_t = _target_ptr(tab_ltp.gather(cj_t, 0), GROUP_SIZE)
-                    a, b = _segments_of(s, tv, pid, tab_doffs.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
-                                        tab_dfirst.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
-                                        tab_dwords.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
-                                        tab_W.gather(cj_t, 0))
-                    if TRACE >= 2:
-                        b = pin(b)
-                        n_ev = mark(trace, n_ev, 12, gl.sum((b > a).to(gl.int32), axis=0), TRACE_CAP)
-                    main = tv & (e >= wmark) & (e < wend_t)
-                    has = b > a
-                    violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
-                    e_max = gl.maximum(e_max, gl.max(gl.where(main & has, e, float("-inf")), axis=0))
-                    n_ev = _append_links(s, e, main, c_t, a, b, seg_start, seg_gb, bucket_mean,
-                                         ltp_t, s_cnt, pid, k_lo, slot_width, n_cells,
-                                         main_time, main_src, main_lo, main_n,
-                                         flags, trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap,
-                                         LP2, LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B,
-                                         nb)
-                    if TRACE >= 2:
-                        n_ev = mark(trace, n_ev, 13, gl.sum(gl.where(main, b - a, 0), axis=0), TRACE_CAP)
-                wmark = gl.maximum(wmark, e_max)  # later e-groups are compared against this one
-                gl.barrier()  # the group's appends are in before the next group's (main runs grow in e)
+        # spanning runs and connections; e-groups in order of e -- the distinct emission times one after
+        # another, each the least after the last (one reduction a group: quiet rounds have one)
+        e0 = gl.min(key, axis=0)
+        while e0 < float("inf"):
+            n_g = gl.where(fresh & (key == e0), n_spk, 0)
+            g_first = gl.cumsum(n_g, axis=0) - n_g
+            n_tot = gl.sum(n_g, axis=0)
+            total += n_tot
+            e_max = gl.to_tensor(float("-inf"))
+            tab_first.store(g_first)
+            gl.barrier()
+            for t0 in range(0, n_tot, SPK):
+                t = t0 + gl.arange(0, SPK, layout=LK)
+                tv = t < n_tot
+                # each spike's pair: the last whose first spike is at or before it (pairs
+                # without spikes here start where the next one does, so never the last one),
+                # a binary search over the LDS table (first[0] = 0)
+                cj_t = gl.zeros_like(t)
+                f_t = gl.zeros_like(t)
+                for st in gl.static_range(LOG_CJ):
+                    probe = cj_t + (MAX_CJ >> (st + 1))
+                    v = tab_first.gather(probe, 0)
+                    le = v <= t
+                    cj_t = gl.where(le, probe, cj_t)
+                    f_t = gl.where(le, v, f_t)
+                i = (t - f_t).to(gl.int64)
+                s = gl.load((tab_node.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.int32)), mask=tv,
+                            other=0)
+                e = gl.load((tab_time.gather(cj_t, 0) + 4 * i).to(gl.pointer_type(gl.float32)), mask=tv,
+                            other=0.0)
+                if TRACE >= 2:
+                    s = pin(s)
+                    e = pin(e)
+                    n_ev = mark(trace, n_ev, 11, gl.sum(tv.to(gl.int32), axis=0), TRACE_CAP)
+                # GAP (D-10): source.x unsupported for now; taken at emission, it would be read off
+                #   the history here, next to the spike's node and e, and travel with its records
+                wend_t = tab_wend.gather(cj_t, 0)
+                c_t = cj_t // KP
+                seg_start = tab_start.gather(cj_t, 0).to(gl.pointer_type(gl.int32))
+                seg_gb = tab_gb.gather(cj_t, 0).to(gl.pointer_type(gl.int32))
+                bucket_mean = tab_mean.gather(cj_t, 0).to(gl.pointer_type(gl.float32))
+                ltp_t = _target_ptr(tab_ltp.gather(cj_t, 0), GROUP_SIZE)
+                a, b = _segments_of(s, tv, pid, tab_doffs.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
+                                    tab_dfirst.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
+                                    tab_dwords.gather(cj_t, 0).to(gl.pointer_type(gl.int32)),
+                                    tab_W.gather(cj_t, 0))
+                if TRACE >= 2:
+                    b = pin(b)
+                    n_ev = mark(trace, n_ev, 12, gl.sum((b > a).to(gl.int32), axis=0), TRACE_CAP)
+                main = tv & (e >= wmark) & (e < wend_t)
+                has = b > a
+                violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
+                e_max = gl.maximum(e_max, gl.max(gl.where(main & has, e, float("-inf")), axis=0))
+                n_ev = _append_links(s, e, main, c_t, a, b, seg_start, seg_gb, bucket_mean,
+                                     ltp_t, s_cnt, pid, k_lo, slot_width, n_cells,
+                                     main_time, main_src, main_lo, main_n,
+                                     flags, trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap,
+                                     LP2, LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B,
+                                     nb)
+                if TRACE >= 2:
+                    n_ev = mark(trace, n_ev, 13, gl.sum(gl.where(main, b - a, 0), axis=0), TRACE_CAP)
+            wmark = gl.maximum(wmark, e_max)  # later e-groups are compared against this one
+            gl.barrier()  # the group's appends are in before the next group's (main runs grow in e)
+            e0 = gl.min(gl.where(key > e0, key, float("inf")), axis=0)
     else:
+        # the fresh runs one by one, by (e, pair): each pair's rank
+        key_r = gl.convert_layout(key, gl.SliceLayout(0, LKC))
+        cj_r = gl.arange(0, MAX_CJ, layout=gl.SliceLayout(0, LKC))
+        key_l = gl.convert_layout(key, gl.SliceLayout(1, LKC))
+        cj_l = gl.arange(0, MAX_CJ, layout=gl.SliceLayout(1, LKC))
+        before = (key_r[None, :] < key_l[:, None]) | ((key_r[None, :] == key_l[:, None])
+                                                      & (cj_r[None, :] < cj_l[:, None]))
+        order = gl.convert_layout(gl.sum(before.to(gl.int32), axis=1), LV)  # rank by (e, cj); fresh runs first
         # per connection, its topology (picked per run below)
         tbuf_c = gl.load(topo_addr + ci, mask=cv, other=0)
         nsrc_c = gl.load(t_src_p + ci, mask=cv, other=0)

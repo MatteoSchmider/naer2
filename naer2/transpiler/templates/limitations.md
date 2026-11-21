@@ -186,3 +186,11 @@ what limits a round is the slowest of its ~309 programs running side by side, no
 - **Fixed parts per program** (one-round graphs, median): header chain ~1.6-2.7 us, a spike block 0.4-0.8 +
   ~1.9 a tile (1-2 tiles), fix-up ~0.8-1.7 (mostly the epilogue before its barrier; the growth branch runs
   in <15% of programs), delivery setup ~0.4, freeing a slot's blocks 0.2-0.4, update + send ~1.3.
+- **The pull's first reads before everything else** (`_pull_headers`: both parities' last-read ids, the
+  histories' addresses, the run headers -- none of it depends on the run's entry): the chain to the headers
+  issued with the entry's and the gate's loads, 4 dependent steps -> 2; the header chain ~2.3-2.7 -> ~1.4-2.0
+  us, a round ~1 us faster (A/B, 3 pairs). The ring header's offsets hoisted too: no gain (never on the path).
+- **E-groups by their distinct emission times** (the least e after the last, one reduction a group) instead
+  of a loop over every fresh run with two reductions each, and no all-pairs rank for the batched pull: the
+  epilogue before the fix-up's barrier 0.5-1.3 -> ~0.15 us (E_6, I_6: 9 connections, the most fresh runs);
+  a round ~0.3 us (6 pairs, within single-run noise).
