@@ -278,14 +278,15 @@ class PopulationRuntime:
     def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
                 main_cap: int | None = None, side_cap: int | None = None, pool: tuple[int, int] | None = None,
                 min_delays: list[float] | None = None, classes: list[int] | None = None,
-                class_delays: list[float] | None = None):
+                class_delays: list[float] | None = None, queues: bool = False):
         """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs.
         min_delays: per connection its minimum delay as the host schedules with it (a gated run's due time;
         default 0). classes, class_delays: several homogeneous delays (D-1, BRUNEL.md) -- per connection its
         delay class, per class its delay: a ring of n_slots per class, delivered merged by arrival; None:
-        one class."""
+        one class. queues: a queue per connection (n_slots: the connections; fused.py _pull_queues)."""
         caps = {k: v for k, v in (("main_cap", main_cap), ("side_cap", side_cap)) if v}
         n_classes = len(class_delays) if class_delays else 1
+        self.queues = queues
         self.ring = Ring(self.n_groups, n_slots * n_classes, slot_width, self.device, pool=pool, n_classes=n_classes,
                          **caps)
         self.wmark = torch.full((self.n_groups,), -math.inf, device=self.device)
@@ -375,6 +376,15 @@ class PopulationRuntime:
         """The ring's delivery position from the device (after planned gated runs: only their kernels know
         which ran; a sync)."""
         self.ring.ring_pos = int(self.ev[(self.run_id + 1) % 2, 0])
+
+    def next_arrival(self) -> float:
+        """A queue population (queues): its queues' next arrival after its last run -- every group's earliest head's
+        e + D_c, from the run's event state (fused.py _ev_close); inf: nothing queued. A readback."""
+        if self.run_id == 0:
+            return math.inf
+        row = self.ev[1 - self.run_id % 2, 2:].view(torch.float32)
+        row = torch.where(torch.isnan(row), torch.full_like(row, math.inf), row)
+        return float(row.min()) if len(row) else math.inf
 
     def delivers_until(self, t: float) -> int:
         """The last ring slot a run delivering up to time t delivers (its slots end by t)."""
@@ -698,6 +708,7 @@ class PopulationRuntime:
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
             POOL_B=self.ring.pool_b,
             ARENA_CHECK=bool(self.arena_check and self.ring.pool_b), NC=self.ring.n_classes,
+            QUEUES=self.queues, GP=p2(max([max(h.G if h.regions else 1, 1) for h in self.plan.histories], default=1)),
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 
