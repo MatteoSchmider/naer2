@@ -118,13 +118,13 @@ def _two_delay_net(seed=0):
 
 @pytest.mark.parametrize("mode", ["step", "planned", "graph"])
 def test_several_homogeneous_delays_through_the_network(mode):
-    """Several homogeneous delays (D-1, BRUNEL.md step 3) end to end: the consumer's ring a ring per delay class,
-    scheduled from its pending slots across the classes (the 2.5 arrivals: only its ring knows them), every
-    link delivered -- stepped, and through planned and captured windows."""
+    """Several homogeneous delays end to end: the consumer's connections a queue each (SPIKES.md), scheduled from
+    its queues' next arrival (the 2.5 arrivals: only its queues know them), every link delivered -- stepped,
+    and through planned and captured windows."""
     network, B, conns, fires = _two_delay_net()
     if mode == "step":
         network.step(2.0)
-        assert B.runtime.ring.n_classes == 2
+        assert B.runtime.queues and B.runtime.ring.n_slots == 2  # (a queue per connection: SPIKES.md)
         first, _ = _expected(conns[0], fires[0], 60)
         assert int(B.runtime.n_received.sum()) == int(first.sum())  # the 0.5 links only, so far
         network.step(2.0)

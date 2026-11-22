@@ -229,7 +229,10 @@ class PopulationRuntime:
                 self.state[a] = torch.full((n,), float(v), device=self.device)
         # depth from the scheduler (naer2/history.py); history_cap: the spikes a run can emit (default: one per
         # neuron -- D-3: more where neurons fire inside delivery)
-        self.history = EmissionHistory(n, depth, self.device, cap=history_cap)
+        # (a region per program where its spikes need ordering -- non-uniform emission; a uniform one's: one flat
+        # list, history.py)
+        self.history = EmissionHistory(n, depth, self.device, cap=history_cap, group_size=group_size,
+                                       regions=not kernel.uniform_emission)
         self.run_id = 0
         # dev aids: the template's receive counters (count_received: off by default, a little work per
         # link), delivery log, trace
@@ -483,7 +486,7 @@ class PopulationRuntime:
             self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, self._launches.ctl,
             status, self.status_slots, sched, sched_i,
             self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
-            self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log, self.seed,
+            self.history.buf, self.history.R, self.trace.buf if self.trace is not None else self.log, self.seed,
             self._arena_check_buf()]
         return args, num_warps, all(not (t.data_ptr() & 15) for t in state)
 

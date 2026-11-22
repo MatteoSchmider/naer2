@@ -76,7 +76,7 @@ class _SpikeSites:
         if in_loop:  # (fires any number of times: into the history at once, D-3)
             self.loop_sites.append(bare)
             return _STMTS(f"_emit_spikes({mask}, ({time_expr}) + gl.zeros([GROUP_SIZE], gl.float32, layout=LN), "
-                          f"offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)")
+                          f"offs, pid, n_groups, history, hist_cap, run_id, K, SPT, NUM_WARPS, _REGIONS)")
         k = len(self.sites)
         self.sites.append(bare)
         return _STMTS(f"_fire{k} = {mask}\n_e{k} = ({time_expr}) + gl.zeros([GROUP_SIZE], gl.float32, layout=LN)")
@@ -210,14 +210,16 @@ class FusedKernelTemplate:
             final += TargetMaskTransformer(set(pop.dynamic_attrs), mask="mask").transform(stmts)
         final = GluonTransformer().transform(final)
 
+        # the history: a region per program where the spikes need ordering (any non-bare site: history.py)
+        uniform = all(sites.sites) and all(sites.loop_sites) and not delivery_sites.sites
         source = self._module_source(attrs, state_attrs, later, recv_src, final, sites.sites, stage_e,
-                                     stage_w=edge_attr is not None, emit_delivered=bool(delivery_sites.sites))
+                                     stage_w=edge_attr is not None, emit_delivered=bool(delivery_sites.sites),
+                                     regions=not uniform)
         kernel = _load(source, f"naer2_fused_{type(pop.instance).__name__}_{id(pop)}")
         # receive's time (D-1): its map from a record's emission time and slot, by the incoming delays
         t_a, t_c, t_b = pop._delivery_time()
         return FusedKernel(source, kernel, attrs, state_attrs, edge_attr,
-                           uniform_emission=all(sites.sites) and all(sites.loop_sites) and not delivery_sites.sites,
-                           stage_e=stage_e,
+                           uniform_emission=uniform, stage_e=stage_e,
                            consts=dict(T_A=float(t_a), T_C=float(t_c), T_B=float(t_b)))
 
     @staticmethod
@@ -240,7 +242,7 @@ class FusedKernelTemplate:
 
     @staticmethod
     def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e, stage_w=True,
-                       emit_delivered=False) -> str:
+                       emit_delivered=False, regions=False) -> str:
         args = ",\n    ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS)
                               + [f"{c}: gl.constexpr" for c in CONSTEXPRS])
         names = ", ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS) + list(CONSTEXPRS))
@@ -252,10 +254,11 @@ class FusedKernelTemplate:
         unpack = f"    ({', '.join(state_attrs)},) = state\n" if state_attrs else ""
         final_src = "".join("    " + line + "\n" for stmt in final for line in ast.unparse(stmt).splitlines())
         stores = "".join(f"    gl.store({a}_ptr + offs, {a}, mask=mask)\n" for a in attrs)
-        flush = "".join(f"    _emit_spikes(_fire{k}, _e{k}, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)\n"
+        flush = "".join(f"    _emit_spikes(_fire{k}, _e{k}, offs, pid, n_groups, history, hist_cap, run_id, K, SPT, "
+                        f"NUM_WARPS, _REGIONS)\n"
                         for k in range(len(sites)))
         # spikes inside delivery (D-3): the run's history slot, for receive's _emit_delivered
-        ectx = "_emit_ctx(history, hist_cap, run_id, K)" if emit_delivered else "()"
+        ectx = "_emit_ctx(pid, n_groups, history, hist_cap, run_id, K)" if emit_delivered else "()"
         body = f'''n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                   parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
                   GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, NC)
@@ -275,7 +278,10 @@ if ok:
     # update, then send
 {final_src}
 {stores}
-{flush}    n_ev = _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP)
+{flush}    if _REGIONS:  # (its region ordered by (e, node): a consumer's queues need a source's runs in e order)
+        _sort_region(pid, n_groups, history, hist_cap, run_id, K, GROUP_SIZE, NUM_WARPS)
+    n_ev = _emit_close(pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP,
+                _REGIONS)
     _run_done(ring, pid, run_id)
     _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B, NC)
     fin = fin + 1
@@ -287,10 +293,14 @@ from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
 from naer2.transpiler.templates.fused import (_any_lane, _deliver, _emit_close, _emit_ctx, _emit_delivered, _emit_spikes,
+                                              _region_reset, _sort_region,
                                               _pin_first, _pull, _pull_headers,
                                               _rand, _randn, _run_done, _run_entry, _status_slot, _run_gate,
                                               _run_status, _gate_skip, _gate_carry, _ev_close, _run_from)
 
+
+# the history's layout (naer2/history.py): a region per program -- this population's spikes need ordering
+_REGIONS = gl.constexpr({regions})
 
 {recv_src}
 
@@ -326,9 +336,12 @@ def fused_run(
                                SK, KP, MAX_CONNS, NUM_WARPS)
     fin = gl.to_tensor(0)
     if _run_gate(ring, ctl, pid, run_id):
+        if _REGIONS:  # (its region's count, before it emits: history.py)
+            _region_reset(pid, n_groups, history, hist_cap, run_id, K)
         if skip:  # gated, nothing due: an empty run (published, done), everything carried over
             _gate_carry(plan, n_conns, ev, pid, run_id, n_groups, MAX_CONNS, NUM_WARPS)
-            n_ev = _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP)
+            n_ev = _emit_close(pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP,
+                _REGIONS)
             _run_done(ring, pid, run_id)
             fin = fin + 1
         else:

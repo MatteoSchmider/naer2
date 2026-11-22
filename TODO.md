@@ -50,6 +50,10 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   sequential per spike and link, a barrier per link -- phase 2); its arenas sized up front (`ring_in_flight`: the
   general pull can't stop a run that outgrows them, links are lost); a run at scale on the 4090, then planned
   and captured windows.
+- **PD14's reproducible order** (SPIKES.md): its uniform producers keep one flat, atomically placed history list
+  and its pull claims through LDS atomics, so a cell's order -- its targets' summation order -- varies between
+  runs. Per-program regions cost 1.6 us a round (21.0 -> 22.6 on the 4090): a cheaper way, possibly a hacky one,
+  separately.
 - **D-1, the delay classes' cost**: a ring per class (memory x classes, every class the longest delay's
   slots); a slot with side runs (the general pull: timed sources) merges its classes one link at a time
   (`_merge_classes`), the block merge (`_stage_merged`) reads every class's candidates twice -- both unmeasured.

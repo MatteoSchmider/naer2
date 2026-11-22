@@ -143,7 +143,7 @@ class FusedPlan:
                 raise ValueError("every incoming topology must use the consumer's group layout")
         self.n_conns, self.histories, self.topologies = n, histories, topologies
         self.K = histories[0].K if histories else 3
-        plan = torch.zeros(23 * n, dtype=torch.int32)
+        plan = torch.zeros(24 * n, dtype=torch.int32)
         links = [t.link_addresses() for t in topologies]
         dirs = [t.directory() for t in topologies]
         plan[: 10 * n].view(torch.int64)[:] = torch.tensor(
@@ -151,7 +151,7 @@ class FusedPlan:
             + [a[1] for a in links] + [a[2] for a in links] + [d[0].data_ptr() for d in dirs], dtype=torch.int64)
         max_segs = [int(t.seg_offsets.diff().max()) if t.n_sources else 0 for t in topologies]
         for i, values in enumerate((
-            [h.cap for h in histories], [t.n_sources for t in topologies], [t.n_segments for t in topologies],
+            [h.R for h in histories], [t.n_sources for t in topologies], [t.n_segments for t in topologies],
             [t.n_buckets for t in topologies], [t.n_links for t in topologies], max_segs,
             [d[1] for d in dirs], [d[2] for d in dirs],
         )):
@@ -166,6 +166,9 @@ class FusedPlan:
                 raise ValueError("a class per connection, at most as many classes as connections")
             plan[21 * n:22 * n] = torch.tensor(classes, dtype=torch.int32)
             plan[22 * n:22 * n + len(class_delays)] = torch.tensor(class_delays, dtype=torch.float32).view(torch.int32)
+        # per connection its source history's programs (G: a run's spikes in G regions of R, history.py; 0: one
+        # flat list, a uniform producer's)
+        plan[23 * n:24 * n] = torch.tensor([h.G if h.regions else 0 for h in histories], dtype=torch.int32)
         self.plan = plan.to(device)
 
 
@@ -1309,7 +1312,8 @@ def _pull_headers(plan, n_conns, SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: 
     j_of = cj % KP
     vj = (c_of < n_conns) & (j_of < SK)
     hbuf = gl.load(hist_addr + c_of, mask=vj, other=0)
-    hcap = gl.load(hcap_p + c_of, mask=vj, other=0)
+    hcap = gl.load(hcap_p + c_of, mask=vj, other=0)  # (a source program's region: R spikes, history.py)
+    hG = gl.load(plan + 23 * n_conns + c_of, mask=vj, other=0)  # (its programs: G; 0: one flat list)
     lastj0 = gl.load(last_read + c_of, mask=vj, other=0)
     lastj1 = gl.load(last_read + n_conns + c_of, mask=vj, other=0)
     hdr = hbuf.to(gl.pointer_type(gl.int32)) + 8 * j_of
@@ -1325,7 +1329,7 @@ def _pull_headers(plan, n_conns, SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: 
                 gl.load(link_target_addr + gl.minimum(c_of, n_conns - 1), mask=c_of * 0 < n_conns, other=0))
     else:
         topo = ()
-    return last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early, topo
+    return last0, last1, hbuf, hcap, hG, lastj0, lastj1, tag, cnt, wend, early, topo
 
 
 @gluon.jit
@@ -1369,7 +1373,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     cv = ci < n_conns
     # per (connection, slot): its run's header -- one chain (plan -> history -> header) for everything below,
     # loaded first thing in the program (_pull_headers); the run's parity picks its last-read ids
-    last0, last1, hbuf, hcap, lastj0, lastj1, tag, cnt, wend, early, topo = hdrs
+    last0, last1, hbuf, hcap, hG, lastj0, lastj1, tag, cnt, wend, early, topo = hdrs
     last_c = gl.where(parity == 0, last0, last1)
     lastj = gl.where(parity == 0, lastj0, lastj1)
     cj = gl.arange(0, MAX_CJ, layout=LV)
@@ -1391,11 +1395,15 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
     # the fresh runs, taken in in order of their (earliest) emission time -- under uniform sources a run's
     # spikes share one e but runs differ, and main runs must grow in e
     fresh = newer & (cnt > 0)
-    n_spk = gl.where(fresh, gl.minimum(cnt, hcap), 0)
+    n_spk = gl.where(fresh, gl.minimum(cnt, hcap), 0)  # (a flat history's; per region: the run-by-run pull)
     key = gl.where(fresh, early, float("inf"))
     n_runs = gl.sum(fresh.to(gl.int32), axis=0)
-    node_addr = hbuf + 4 * (8 * SK + j_of * hcap).to(gl.int64)
-    time_addr = node_addr + 4 * (SK * hcap).to(gl.int64)
+    # a run's spikes (history.py): one flat list (hG 0: G = 1, its count the header's), or its source programs'
+    # regions -- their counts, then the regions in program order
+    G1 = gl.maximum(hG, 1)
+    cnt_addr = hbuf + 4 * (8 * SK + j_of * G1).to(gl.int64)
+    node_addr = hbuf + 4 * (8 * SK + SK * G1 + j_of * G1 * hcap).to(gl.int64)
+    time_addr = node_addr + 4 * (SK * G1 * hcap).to(gl.int64)
     wmark = gl.load(wmark_ptr + pid)
     if UNIFORM_SOURCES and BATCH:
         # per (connection, slot) pair, everything a spike's decode needs, as read-only LDS tables: a
@@ -1514,7 +1522,10 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
         for ri in range(0, n_runs):
             # the run: its spikes, its connection's topology (scalars)
             sel = order == ri
-            n_r = gl.sum(gl.where(sel, n_spk, 0), axis=0)
+            caddr = gl.sum(gl.where(sel, cnt_addr, 0), axis=0)
+            G_r = gl.sum(gl.where(sel, hG, 0), axis=0)  # (0: one flat list)
+            n_flat = gl.sum(gl.where(sel, n_spk, 0), axis=0)
+            R_r = gl.sum(gl.where(sel, hcap, 0), axis=0)
             naddr = gl.sum(gl.where(sel, node_addr, 0), axis=0)
             taddr = gl.sum(gl.where(sel, time_addr, 0), axis=0)
             wend_r = gl.sum(gl.where(sel, wend, 0.0), axis=0)
@@ -1533,77 +1544,83 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
                 gl.sum(gl.where(selc, dpairs_c, 0), axis=0))
             dwords_r = gl.sum(gl.where(selc, dwords_c, 0), axis=0)
             ltp_r = _target_ptr(gl.sum(gl.where(selc, ltp_c, 0), axis=0), GROUP_SIZE)
-            node_p = naddr.to(gl.pointer_type(gl.int32))
-            time_p = taddr.to(gl.pointer_type(gl.float32))
-            total += n_r
-            if UNIFORM_SOURCES:
-                e_max = gl.to_tensor(float("-inf"))
-                for t0 in range(0, n_r, SPK):
-                    # a block of the run's spikes: each one's segments into this group
-                    i = t0 + gl.arange(0, SPK, layout=LK)
-                    tv = i < n_r
-                    s = gl.load(node_p + i, mask=tv, other=0)
-                    e = gl.load(time_p + i, mask=tv, other=0.0)
-                    a, b = _segments_of(s, tv, pid, dir_offs, dir_first, dir_words, dwords_r)
-                    main = tv & (e >= wmark) & (e < wend_r)
-                    has = b > a
-                    violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
-                    e_max = gl.maximum(e_max, gl.max(gl.where(main & has, e, float("-inf")), axis=0))
-                    n_ev = _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, ltp_r, s_cnt, pid,
-                                         k_lo, slot_width, n_cells, main_time, main_src, main_lo, main_n, flags,
-                                         trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap, LP2,
-                                         LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B, nb,
-                                         cls_r, NC)
-                wmark = gl.maximum(wmark, e_max)  # the next run (later e) is compared against this one
-                gl.barrier()  # the run's appends are in before the next run's (main runs grow in e)
-            else:
-                # any emission times: sequential per entry (the baseline)
-                for i in range(0, n_r):
-                    s = gl.load(node_p + i)
-                    e = gl.load(time_p + i)
-                    a, b = _segments_of(s, True, pid, dir_offs, dir_first, dir_words, dwords_r)
-                    srcw = (c << 24) | s
-                    for sg in range(a, b):
-                        gb = gl.load(seg_gb + sg)
-                        lo_l = gl.load(seg_start + sg)
-                        n_l = gl.load(seg_start + sg + 1) - lo_l
-                        mean = gl.load(bucket_mean + (gb & 0xFFFF))
-                        k = gl.maximum(gl.floor((e + mean) / slot_width).to(gl.int32), k_lo)
-                        if k - k_lo >= NR:
-                            gl.atomic_max(flags + 1, 1)
-                        else:
-                            cell = pid * N_SLOTS + cls_r * NR + k % NR
-                            to_main = (e >= wmark) & (e < wend_r)
-                            for jl in range(0, n_l):  # one record per link, in link order
-                                l = lo_l + jl
-                                tgt = gl.load(ltp_r + l).to(gl.int32) & 0xFFFF
-                                if to_main:
-                                    pos = gl.load(main_count + cell)
-                                    if pos < main_cap:
-                                        if POOL_B > 0:  # a new block where the cell doesn't hold one yet
-                                            if pos // POOL_B >= gl.load(nblk + cell):
-                                                got_b = _take_block(table, stack, top, pid, cell, pos // POOL_B,
-                                                                    nb)
-                                                gl.atomic_max(flags, 1, mask=~got_b)  # the arena ran out: links lost
-                                                gl.atomic_max(lost, 1, mask=~got_b)
-                                                gl.store(nblk + cell, pos // POOL_B + 1)
-                                        rec, ok = _run_rec(cell, pos, n_cells, table, N_SLOTS, POOL_B, nb,
-                                                           POOL_RESERVE)
-                                        at = 4 * rec
-                                        gl.store(main_time + at, e, mask=ok)
-                                        gl.store(main_src + at, srcw, mask=ok)
-                                        gl.store(main_lo + at, l, mask=ok)
-                                        gl.store(main_n + at, tgt, mask=ok)
-                                        gl.store(main_count + cell, pos + 1)
+            cnt_p = caddr.to(gl.pointer_type(gl.int32))
+            for gq in range(0, gl.maximum(G_r, 1)):  # (the run's regions, in program order: history.py)
+                if G_r == 0:
+                    n_r = n_flat
+                else:
+                    n_r = gl.minimum(gl.load(cnt_p + gq), R_r)
+                node_p = naddr.to(gl.pointer_type(gl.int32)) + gq * R_r
+                time_p = taddr.to(gl.pointer_type(gl.float32)) + gq * R_r
+                total += n_r
+                if UNIFORM_SOURCES:
+                    e_max = gl.to_tensor(float("-inf"))
+                    for t0 in range(0, n_r, SPK):
+                        # a block of the run's spikes: each one's segments into this group
+                        i = t0 + gl.arange(0, SPK, layout=LK)
+                        tv = i < n_r
+                        s = gl.load(node_p + i, mask=tv, other=0)
+                        e = gl.load(time_p + i, mask=tv, other=0.0)
+                        a, b = _segments_of(s, tv, pid, dir_offs, dir_first, dir_words, dwords_r)
+                        main = tv & (e >= wmark) & (e < wend_r)
+                        has = b > a
+                        violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
+                        e_max = gl.maximum(e_max, gl.max(gl.where(main & has, e, float("-inf")), axis=0))
+                        n_ev = _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, ltp_r, s_cnt, pid,
+                                             k_lo, slot_width, n_cells, main_time, main_src, main_lo, main_n, flags,
+                                             trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap, LP2,
+                                             LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B, nb,
+                                             cls_r, NC)
+                    wmark = gl.maximum(wmark, e_max)  # the next run (later e) is compared against this one
+                    gl.barrier()  # the run's appends are in before the next run's (main runs grow in e)
+                else:
+                    # any emission times: sequential per entry (the baseline)
+                    for i in range(0, n_r):
+                        s = gl.load(node_p + i)
+                        e = gl.load(time_p + i)
+                        a, b = _segments_of(s, True, pid, dir_offs, dir_first, dir_words, dwords_r)
+                        srcw = (c << 24) | s
+                        for sg in range(a, b):
+                            gb = gl.load(seg_gb + sg)
+                            lo_l = gl.load(seg_start + sg)
+                            n_l = gl.load(seg_start + sg + 1) - lo_l
+                            mean = gl.load(bucket_mean + (gb & 0xFFFF))
+                            k = gl.maximum(gl.floor((e + mean) / slot_width).to(gl.int32), k_lo)
+                            if k - k_lo >= NR:
+                                gl.atomic_max(flags + 1, 1)
+                            else:
+                                cell = pid * N_SLOTS + cls_r * NR + k % NR
+                                to_main = (e >= wmark) & (e < wend_r)
+                                for jl in range(0, n_l):  # one record per link, in link order
+                                    l = lo_l + jl
+                                    tgt = gl.load(ltp_r + l).to(gl.int32) & 0xFFFF
+                                    if to_main:
+                                        pos = gl.load(main_count + cell)
+                                        if pos < main_cap:
+                                            if POOL_B > 0:  # a new block where the cell doesn't hold one yet
+                                                if pos // POOL_B >= gl.load(nblk + cell):
+                                                    got_b = _take_block(table, stack, top, pid, cell, pos // POOL_B,
+                                                                        nb)
+                                                    gl.atomic_max(flags, 1, mask=~got_b)  # the arena ran out: links lost
+                                                    gl.atomic_max(lost, 1, mask=~got_b)
+                                                    gl.store(nblk + cell, pos // POOL_B + 1)
+                                            rec, ok = _run_rec(cell, pos, n_cells, table, N_SLOTS, POOL_B, nb,
+                                                               POOL_RESERVE)
+                                            at = 4 * rec
+                                            gl.store(main_time + at, e, mask=ok)
+                                            gl.store(main_src + at, srcw, mask=ok)
+                                            gl.store(main_lo + at, l, mask=ok)
+                                            gl.store(main_n + at, tgt, mask=ok)
+                                            gl.store(main_count + cell, pos + 1)
+                                        else:
+                                            gl.atomic_max(flags, 1)
+                                        gl.barrier()
                                     else:
-                                        gl.atomic_max(flags, 1)
-                                    gl.barrier()
-                                else:
-                                    _side_insert(side_time, side_src, side_lo, side_n, side_count, flags, cell,
-                                                 n_cells, e, srcw, l, tgt, side_table, stack, top, lost, pid, side_cap,
-                                                 LV,
-                                                 BLK, N_SLOTS, POOL_B, nb)
-                            wmark = gl.where(to_main, gl.maximum(wmark, e), wmark)
+                                        _side_insert(side_time, side_src, side_lo, side_n, side_count, flags, cell,
+                                                     n_cells, e, srcw, l, tgt, side_table, stack, top, lost, pid, side_cap,
+                                                     LV,
+                                                     BLK, N_SLOTS, POOL_B, nb)
+                                wmark = gl.where(to_main, gl.maximum(wmark, e), wmark)
     ok = gl.to_tensor(1) > 0
     if UNIFORM_SOURCES:
         if violated > 0:
@@ -1857,27 +1874,39 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
 
 
 @gluon.jit
-def _emit_spikes(fires, e, offs, history, hist_cap, run_id, K: gl.constexpr, SPT: gl.constexpr,
-                 NUM_WARPS: gl.constexpr):
+def _emit_spikes(fires, e, offs, pid, n_groups, history, hist_cap, run_id, K: gl.constexpr, SPT: gl.constexpr,
+                 NUM_WARPS: gl.constexpr, REGIONS: gl.constexpr = False):
     """One n2.spike() site's spikes into the history: fires (which lanes
     spiked) and e (their emission times), [GROUP_SIZE] in the program's
-    neuron layout; their place in the run's flat list from one count
-    atomic. A run can call this any number of times (D-3: several sites, a
-    neuron spiking more than once)."""
+    neuron layout -- REGIONS (a non-uniform producer): into program pid's
+    own region of the run (hist_cap spikes, history.py), after what its
+    earlier sites put there, in lane order: a fixed place, whatever the
+    other programs do; else into the run's one flat list (hist_cap: its
+    cap), where one count atomic places them. A run can call
+    this any number of times (D-3: several sites, a neuron spiking more than
+    once, a site in a loop)."""
     LS: gl.constexpr = gl.BlockedLayout([SPT], [32], [NUM_WARPS], [0])
     _n_fire = fires.to(gl.int32)
     _local_pos = gl.convert_layout(gl.cumsum(gl.convert_layout(_n_fire, LS), axis=0), fires.type.layout) - _n_fire
     n_emit = gl.sum(_n_fire, axis=0)
-    # GAP (D-3): the history's cap is one spike per neuron and run (EmissionHistory's default); a run's spikes
-    #   beyond it set the overflow flag (the runtime raises: PopulationRuntime.check)
-    slot = run_id % K
-    (h_tag, h_count, h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, slot, K, hist_cap)
-    base = gl.atomic_add(h_count, n_emit)  # this site's place in the run's flat list
+    # the region holds hist_cap (EmissionHistory: its run cap over the programs, default one spike per neuron);
+    #   past it the overflow flag (the runtime raises: PopulationRuntime.check)
+    if REGIONS:
+        (h_tag, h_count, h_wend, h_min, h_counts, h_node, h_time, h_overflow) = history_ptrs(
+            history, run_id % K, K, n_groups, hist_cap)
+        base = gl.atomic_add(h_counts + pid, n_emit)  # (the program's own count: its sites one after another)
+        gl.atomic_add(h_count, n_emit)  # (the run's: a sum, in any order)
+        at = pid * hist_cap + base + _local_pos
+    else:
+        (h_tag, h_count, h_wend, h_min, h_counts, h_node, h_time, h_overflow) = history_ptrs(
+            history, run_id % K, K, 1, hist_cap)
+        base = gl.atomic_add(h_count, n_emit)  # this site's place in the run's flat list
+        at = base + _local_pos
     put = fires & (base + _local_pos < hist_cap)
     if base + n_emit > hist_cap:
         gl.atomic_max(h_overflow, 1)
-    gl.store(h_node + base + _local_pos, offs, mask=put)
-    gl.store(h_time + base + _local_pos, e, mask=put)
+    gl.store(h_node + at, offs, mask=put)
+    gl.store(h_time + at, e, mask=put)
     gl.atomic_min(h_min, gl.min(gl.where(put, e, float("inf")), axis=0))
 
 
@@ -1892,21 +1921,22 @@ def _any_lane(m):
 
 
 @gluon.jit
-def _emit_ctx(history, hist_cap, run_id, K: gl.constexpr):
-    """The run's history slot, for spikes inside delivery (_emit_delivered): (count, earliest, nodes, times,
-    overflow, cap)."""
-    (_h_tag, h_count, _h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, run_id % K, K, hist_cap)
-    return (h_count, h_min, h_node, h_time, h_overflow, hist_cap)
+def _emit_ctx(pid, n_groups, history, hist_cap, run_id, K: gl.constexpr):
+    """Program pid's region of the run's history slot, for spikes inside delivery (_emit_delivered): (its count,
+    the run's count, earliest, its nodes, its times, overflow, its cap)."""
+    (_h_tag, h_count, _h_wend, h_min, h_counts, h_node, h_time, h_overflow) = history_ptrs(
+        history, run_id % K, K, n_groups, hist_cap)
+    return (h_counts + pid, h_count, h_min, h_node + pid * hist_cap, h_time + pid * hist_cap, h_overflow, hist_cap)
 
 
 @gluon.jit
 def _emit_delivered(fire, t, nodes, ectx):
     """An n2.spike() site inside delivery (D-3: in receive, or a send after every delivery): the lanes in fire
-    spike at t, straight into the run's history (ectx: _emit_ctx) -- the history is a flat list per run in no
-    order, and a run's slot is read only after the run. One link a step: at most one lane fires per row of
+    spike at t, straight into the program's region of the run's history (ectx: _emit_ctx) -- a run's slot is
+    read only after the run. One link a step: at most one lane fires per row of
     fire (the walk: a row per warp, each its own target lane; a merge: the one lane), so per row one masked
     atomic, none where nothing fires. nodes: the lanes' neurons; t: the spike time (broadcast to fire)."""
-    h_count, h_min, h_node, h_time, h_overflow, hist_cap = ectx
+    p_count, h_count, h_min, h_node, h_time, h_overflow, hist_cap = ectx
     AX: gl.constexpr = len(fire.shape) - 1
     tt = t + gl.zeros_like(fire.to(gl.float32))
     n = gl.sum(fire.to(gl.int32), axis=AX)
@@ -1914,7 +1944,8 @@ def _emit_delivered(fire, t, nodes, ectx):
     tm = gl.sum(gl.where(fire, tt, 0.0), axis=AX)
     m = n > 0
     zero = n * 0  # (n: a row per warp, or a scalar -- zeros_like takes no scalar)
-    pos = gl.atomic_add(h_count + zero, 1, mask=m)
+    pos = gl.atomic_add(p_count + zero, 1, mask=m)  # (GAP, SPIKES.md: the warps' order within the region)
+    gl.atomic_add(h_count + zero, 1, mask=m)
     put = m & (pos < hist_cap)
     gl.store(h_node + pos, node, mask=put)
     gl.store(h_time + pos, tm, mask=put)
@@ -1923,20 +1954,78 @@ def _emit_delivered(fire, t, nodes, ectx):
 
 
 @gluon.jit
-def _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
-                TRACE: gl.constexpr, TRACE_CAP: gl.constexpr):
+def _region_reset(pid, n_groups, history, hist_cap, run_id, K: gl.constexpr):
+    """Program pid's count of the run's slot to 0, at its run's start, before it emits (REGIONS): the slot's old
+    run stays whole until its producer's next run writes it -- a consumer still reading it (K - 1 runs behind)
+    reads its region counts mid-pull, after its header (history.py). The program the count's only writer."""
+    (_ht, _hc, _hw, _hm, h_counts, _hn, _hti, _ho) = history_ptrs(history, run_id % K, K, n_groups, hist_cap)
+    gl.store(h_counts + pid, 0)
+
+
+@gluon.jit
+def _sort_region(pid, n_groups, history, hist_cap, run_id, K: gl.constexpr, GROUP_SIZE: gl.constexpr,
+                 NUM_WARPS: gl.constexpr):
+    """Program pid's region of the run's history (history.py) ordered by (e, node), in place -- a non-uniform
+    producer's (SPIKES.md: a consumer's queues need a source's runs in e order; the total key makes it the same
+    whatever order the warps emitted in). Up to 4 GROUP_SIZE spikes (four a neuron) through LDS: each one's rank among them
+    (the ones before it in (e, node, position)), then each written to its rank. More: left as it is, the
+    overflow flag set (EmissionHistory: R past 4 GROUP_SIZE raises)."""
+    (_ht, _hc, _hw, _hm, h_counts, h_node, h_time, h_overflow) = history_ptrs(history, run_id % K, K, n_groups,
+                                                                              hist_cap)
+    RS: gl.constexpr = 4 * GROUP_SIZE
+    LI: gl.constexpr = 32 * NUM_WARPS
+    JB: gl.constexpr = 32
+    node = h_node + pid * hist_cap
+    time = h_time + pid * hist_cap
+    gl.barrier()  # (the program's spikes all in its region: every warp's stores before the reads)
+    n = gl.minimum(gl.load(h_counts + pid), hist_cap)
+    if n > RS:
+        gl.atomic_max(h_overflow, 1)
+    elif n > 1:
+        SM: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+        L1: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        L2: gl.constexpr = gl.BlockedLayout([1, JB], [32, 1], [NUM_WARPS, 1], [1, 0])
+        LIr: gl.constexpr = gl.SliceLayout(1, L2)
+        LJr: gl.constexpr = gl.SliceLayout(0, L2)
+        q = gl.arange(0, RS, layout=L1)
+        s_e = _table(gl.load(time + q, mask=q < n, other=float("inf")), SM)
+        s_n = _table(gl.load(node + q, mask=q < n, other=0), SM)
+        gl.barrier()
+        for i0 in range(0, n, LI):
+            i = i0 + gl.arange(0, LI, layout=LIr)
+            vi = i < n
+            ei = s_e.gather(gl.minimum(i, RS - 1), 0)
+            ni = s_n.gather(gl.minimum(i, RS - 1), 0)
+            rank = gl.zeros([LI], gl.int32, layout=LIr)
+            for j0 in range(0, n, JB):
+                j = j0 + gl.arange(0, JB, layout=LJr)
+                ej = s_e.gather(gl.minimum(j, RS - 1), 0)[None, :]
+                nj = s_n.gather(gl.minimum(j, RS - 1), 0)[None, :]
+                e2 = ei[:, None]
+                n2 = ni[:, None]
+                before = (ej < e2) | ((ej == e2) & ((nj < n2) | ((nj == n2) & (j[None, :] < i[:, None]))))
+                rank += gl.sum((before & (j[None, :] < n)).to(gl.int32), axis=1)
+            gl.store(time + rank, ei, mask=vi)
+            gl.store(node + rank, ni, mask=vi)
+
+
+@gluon.jit
+def _emit_close(pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
+                TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, REGIONS: gl.constexpr = False):
     """The run's end: program 0 writes its header (window end, then the tag
     -- one store, never a new run id with an old round) and clears the next
-    run's slot. Returns n_ev (tracing)."""
+    run's slot's header (its regions' counts: each program at its own run's
+    start, _region_reset). Returns n_ev (tracing)."""
     if TRACE:
         n_ev = mark(trace, n_ev, 8, 0, TRACE_CAP)
     # GAP (D-11): edge backward out of scope -- needs this run's spikes at every incoming link of each firing
     #   target (a reverse topology), D-11
+    G_h = n_groups if REGIONS else 1
+    (n_tag, n_count, _nw, n_min, _ncs, _nn, _nt, _no) = history_ptrs(history, (run_id + 1) % K, K, G_h, hist_cap)
     if pid == 0:
-        (h_tag, _hc, h_wend, _hm, _hn, _ht, _ho) = history_ptrs(history, run_id % K, K, hist_cap)
+        (h_tag, _hc, h_wend, _hm, _hcs, _hn, _ht, _ho) = history_ptrs(history, run_id % K, K, G_h, hist_cap)
         gl.store(h_wend, t_end)
         gl.store(h_tag, history_tag(run_id, round_id))  # one store: never a new run id with an old round
-        (n_tag, n_count, _nw, n_min, _nn, _nt, _no) = history_ptrs(history, (run_id + 1) % K, K, hist_cap)
         gl.store(n_tag, history_tag(0, round_id))  # the next run's slot, cleared ahead (see history.py): a
         gl.store(n_count, 0)  # consumer that still needed it sees a gap in run ids and raises its overrun flag
         gl.store(n_min, float("inf"))
@@ -1947,8 +2036,8 @@ def _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K:
 
 
 @gluon.jit
-def _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
+def _emit(fires, e, offs, pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K: gl.constexpr,
           SPT: gl.constexpr, NUM_WARPS: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr):
     """A run with one n2.spike() site: _emit_spikes, then _emit_close."""
-    _emit_spikes(fires, e, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)
-    return _emit_close(pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP)
+    _emit_spikes(fires, e, offs, pid, n_groups, history, hist_cap, run_id, K, SPT, NUM_WARPS)
+    return _emit_close(pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, TRACE, TRACE_CAP)

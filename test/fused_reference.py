@@ -106,7 +106,7 @@ def pd14_neuron_kernel(
             gl.store(current_ptr + offs, current, mask=mask)
             gl.store(last_time_ptr + offs, last_time, mask=mask)
             e = gl.zeros_like(lane).to(gl.float32) + t_start  # bare n2.spike(): the window's start (D-4)
-            n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
+            n_ev = _emit(fires, e, offs, pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
                          TRACE, TRACE_CAP)
             _run_done(ring, pid, run_id)
             _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B)
@@ -173,7 +173,7 @@ def pd14_poisson_kernel(
             next_spike = gl.where(fires, next_spike + -gl.log(_r) / P_RATE, next_spike)
             gl.store(next_spike_ptr + offs, next_spike, mask=mask)
             e = gl.zeros_like(lane).to(gl.float32) + t_start  # bare n2.spike(): the window's start (D-4)
-            n_ev = _emit(fires, e, offs, pid, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
+            n_ev = _emit(fires, e, offs, pid, n_groups, history, hist_cap, run_id, round_id, t_end, trace, n_ev, K, SPT, NUM_WARPS,
                          TRACE, TRACE_CAP)
             _run_done(ring, pid, run_id)
             _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B)

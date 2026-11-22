@@ -8,7 +8,8 @@ work runs through A, most feature gaps through B and the generator.
 
 ## 1. Before any refactor
 
-(Brunel, the delivery times it needs, and the steps: BRUNEL.md.)
+(Brunel, the delivery times it needs, and the steps: BRUNEL.md. Its speed -- spike management with queues
+and slots, replacing the general pull: SPIKES.md.)
 
 - **An event-driven test model: Brunel (2000)**, the sparse balanced E/I network -- event-driven only, scaling
   with N. Coverage for the general (event-driven) path that refactor A must keep, and its first real driver; its

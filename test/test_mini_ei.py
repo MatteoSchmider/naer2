@@ -114,7 +114,8 @@ def test_no_per_delivery_send_when_receive_writes_nothing_send_reads(src_E):
 def test_bare_spike_emits_at_the_window_start(src_E):
     assert "_fire0 = _m0" in src_E
     assert "_e0 = t_start + gl.zeros([GROUP_SIZE], gl.float32, layout=LN)" in src_E
-    assert "_emit_spikes(_fire0, _e0, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)" in src_E
+    assert "_emit_spikes(_fire0, _e0, offs, pid, n_groups, history, hist_cap, run_id, K, SPT, NUM_WARPS, _REGIONS)" in src_E
+    assert "_REGIONS = gl.constexpr(False)" in src_E  # (uniform: one flat history list)
     assert src_E.count("_emit_spikes(") == 1
     assert "_emit_close(" in src_E
 

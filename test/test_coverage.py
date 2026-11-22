@@ -109,7 +109,7 @@ def test_a_spike_inside_delivery_generates(pops):
     lowered, the edge map reversed."""
     k = pops["B"].fused_kernel()
     assert k.edge_attr == "weight" and not k.uniform_emission
-    assert "_emit_delivered(" in k.source and "_emit_ctx(history, hist_cap, run_id, K)" in k.source
+    assert "_emit_delivered(" in k.source and "_emit_ctx(pid, n_groups, history, hist_cap, run_id, K)" in k.source
     for leftover in ("edge.w", "n2.spike", "math.", "tl."):
         assert leftover not in k.source
 
