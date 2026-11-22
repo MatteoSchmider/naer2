@@ -3,7 +3,8 @@
 cloud/remote run 'python tools/pd14_volley.py G ...'; not on the 780M: it drives the display, and a fault there
 takes it down). Diagnostics: --keep-old never frees a ring's old buffer, --zero-growth zero-fills grown rings,
 --warps=N overrides the device's warp cap, --check-arena checks the arena invariant at every resize and
---staging reads staging's counters (tools/pd14_volley_debug.patch) -- both sync there, which hides the race.
+--staging reads staging's counters (tools/pd14_volley_debug.patch) -- both sync there, which hides the race;
+--device-check checks every block popped and freed on the device instead (runtime.arena_check: no syncs).
 Runs to 730 ms freely (no syncs), reports a fault if one happens; with --profile, the volley's first 200 rounds
 (700.5-720.5 ms) under the profiler: per population, median and slowest kernel."""
 import os
@@ -89,9 +90,13 @@ stops = [0]
 _rec = R._Launches.recover
 R._Launches.recover = lambda self: (stops.__setitem__(0, stops[0] + 1), _rec(self))[1]
 r, prof = 0, None
+DEVICE_CHECK = "--device-check" in sys.argv  # (the arena checked on the device: runtime.arena_check, no syncs)
 try:
     for r in range(7005):
         P._advance("network", obj, r)
+        if r == 0 and DEVICE_CHECK:
+            for p in pops.values():
+                P._runtime("network", p).arena_check = DEVICE_CHECK
     torch.cuda.synchronize()
     if PROFILE:
         prof = profile(activities=[ProfilerActivity.CUDA])

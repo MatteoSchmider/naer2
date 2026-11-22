@@ -363,10 +363,42 @@ def _take_block(table, stack, top, g, cell, b, nb):
     return ok
 
 
+# ARENA_CHECK (a development aid, PopulationRuntime.arena_check: compiled out by default): every block a pull's
+# fix-up pops and every block delivery frees, against a held count per (group, block) in device memory (chk:
+# words 16.. -- rebuilt from the tables after every allocation and resize, runtime._arena_check_buf): a pop finds
+# 0, a free 1, the id within the arena -- the first violation recorded (words 1..6: kind 1 pop / 2 free, group,
+# cell, block id, the count found, the round (pop) or slot (free); word 0 counts them), nothing synchronized
+ARENA_CHK_HDR = gl.constexpr(16)
+
+
+@gluon.jit
+def _arena_note(chk, bad, kind: gl.constexpr, g, cell, bid, old, when):
+    """The first arena violation among the lanes `bad`, recorded (see ARENA_CHECK)."""
+    z = gl.zeros_like(bid)
+    n = gl.atomic_add(chk + z, 1, mask=bad)
+    first = bad & (n == 0)
+    gl.store(chk + 1 + z, z + kind, mask=first)
+    gl.store(chk + 2 + z, z + g, mask=first)
+    gl.store(chk + 3 + z, z + cell, mask=first)
+    gl.store(chk + 4 + z, bid, mask=first)
+    gl.store(chk + 5 + z, old, mask=first)
+    gl.store(chk + 6 + z, z + when, mask=first)
+
+
+@gluon.jit
+def _arena_take(chk, v, g, cell, bid, nb, when, kind: gl.constexpr, delta: gl.constexpr, expect: gl.constexpr):
+    """A block popped (delta +1, the count expected 0) or freed (-1, expected 1) on lanes v (ARENA_CHECK)."""
+    ok_id = (bid >= 0) & (bid < nb)
+    old = gl.atomic_add(chk + ARENA_CHK_HDR + g * nb + gl.where(ok_id, bid, 0), gl.zeros_like(bid) + delta,
+                        mask=v & ok_id)
+    old = gl.where(v & ok_id, old, expect)
+    _arena_note(chk, v & (~ok_id | (old != expect)), kind, g, cell, bid, old, when)
+
+
 @gluon.jit
 def _pool_fixup(s_cnt, cnt0, rec0, table, stack, log_rec, ovf_cap, top0, g, sl, LV: gl.constexpr,
                 N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr, nb,
-                NUM_WARPS: gl.constexpr, NSP: gl.constexpr):
+                NUM_WARPS: gl.constexpr, NSP: gl.constexpr, chk, when, ARENA_CHECK: gl.constexpr):
     """After the pull's last barrier, only if some slot grew past its blocks (from the counts in LDS: the same
     answer in every warp). First the check: everything fits -- every slot's log within ovf_cap, the blocks
     the slots lack within the free stack, every run within main_cap. If not, nothing is changed (the pull
@@ -404,6 +436,8 @@ def _pool_fixup(s_cnt, cnt0, rec0, table, stack, log_rec, ovf_cap, top0, g, sl, 
             for i in range(0, gl.max(want, axis=0)):
                 bid = gl.load(stack + g * nb + gl.maximum(top0 - 1 - before - i, 0), mask=i < want, other=-1)
                 gl.store(table + cell * nb + held + i, bid, mask=live & (i < want))
+                if ARENA_CHECK:
+                    _arena_take(chk, live & (i < want), g, cell, bid, nb, when, 1, 1, 0)
             s_cnt.store((packed & MASK) | ((held + want) << POOL_CNT_BITS))
             gl.barrier()
             # every slot's log into its new blocks, all slots' records in one pass over the lanes: record f of
@@ -440,7 +474,7 @@ def _pool_fixup(s_cnt, cnt0, rec0, table, stack, log_rec, ovf_cap, top0, g, sl, 
 
 @gluon.jit
 def _free_blocks(table, stack, tp, g, cell, lo, hi, lost, LV: gl.constexpr, nb,
-                 NUM_WARPS: gl.constexpr):
+                 NUM_WARPS: gl.constexpr, chk, when, ARENA_CHECK: gl.constexpr):
     """A delivered run's blocks lo .. hi back on group g's free stack, above tp (delivery keeps the stack's
     top in a register and stores it once at its end: no barriers here). Once an arena ran out (lost: tables
     may hold missing blocks, -1), they are compacted on the way (a scan): the stack never holds a -1. Returns
@@ -449,14 +483,18 @@ def _free_blocks(table, stack, tp, g, cell, lo, hi, lost, LV: gl.constexpr, nb,
     if lost == 0:
         for i0 in range(lo, hi, 32 * NUM_WARPS):
             m = i0 + bi < hi
-            gl.store(stack + g * nb + tp + i0 - lo + bi, gl.load(table + cell * nb + i0 + bi, mask=m),
-                     mask=m)
+            bid = gl.load(table + cell * nb + i0 + bi, mask=m, other=-1)
+            gl.store(stack + g * nb + tp + i0 - lo + bi, bid, mask=m)
+            if ARENA_CHECK:
+                _arena_take(chk, m, g, cell, bid, nb, when, 2, -1, 1)
         tp = tp + gl.maximum(hi - lo, 0)
     else:
         for i0 in range(lo, hi, 32 * NUM_WARPS):
             bid = gl.load(table + cell * nb + i0 + bi, mask=i0 + bi < hi, other=-1)
             v = (bid >= 0).to(gl.int32)
             gl.store(stack + g * nb + tp + gl.cumsum(v, axis=0) - v, bid, mask=v > 0)
+            if ARENA_CHECK:
+                _arena_take(chk, v > 0, g, cell, bid, nb, when, 2, -1, 1)
             tp = tp + gl.sum(v, axis=0)
     return tp
 
@@ -746,12 +784,13 @@ def _run_done(ring, pid, run_id):
 
 
 @gluon.jit
-def _run_status(status, ring, pid, run_id, finished):
+def _run_status(status, ring, pid, run_id, finished, chk, ARENA_CHECK: gl.constexpr):
     """Program pid's last stores: its group's part of the run's status, straight into the run's pinned host
     slot (PopulationRuntime: no copy, no event) -- the blocks it holds and the most it logged (the pull's
     group stats), its ring's lost bits (main 1, side 2: the general pull), and its done word: 2 run_id if it
     finished the run, 2 run_id + 1 if it stopped (or skipped: a run stopped before it) -- the host reads the
-    whole run from two reductions: landed once the least done word is >= 2 run_id (a slot's earlier runs
+    whole run from two reductions (lost bits: + 4 if the arena check found a violation, ARENA_CHECK):
+    landed once the least done word is >= 2 run_id (a slot's earlier runs
     wrote less), stopped if the largest is odd. Plain stores, done last: the host decides from the done
     words alone whether to rerun (and then reads the ring itself); the rest only sizes."""
     st = ring + gl.load(ring + 7) + 2 * pid
@@ -759,7 +798,10 @@ def _run_status(status, ring, pid, run_id, finished):
     at = status + 4 * pid
     gl.store(at, gl.load(st))
     gl.store(at + 1, gl.load(st + 1))
-    gl.store(at + 2, gl.load(fl) | (gl.load(fl + 3) << 1))
+    bits = gl.load(fl) | (gl.load(fl + 3) << 1)
+    if ARENA_CHECK:  # (4: the arena check recorded a violation -- the host raises when it judges this run)
+        bits = bits | ((gl.load(chk) > 0).to(gl.int32) << 2)
+    gl.store(at + 2, bits)
     gl.store(at + 3, 2 * run_id + gl.where(finished, 0, 1))
 
 
@@ -1076,7 +1118,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
           SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
           N_SLOTS: gl.constexpr, NSP: gl.constexpr,
           UNIFORM_SOURCES: gl.constexpr, BATCH: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
-          TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr):
+          TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr):
     """Phase 1 of program pid: what the sources emitted since this consumer
     last read them, into the program's group's ring; returns (n_ev
     (tracing), ok). Not ok: the ring is too small for the run -- nothing
@@ -1341,7 +1383,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
             n_ev = mark(trace, n_ev, 19, 0, TRACE_CAP)
         if POOL_B > 0:
             fits, top0, used, most = _pool_fixup(s_cnt, cnt0, main_src - 1, table, stack, log_rec, ovf_cap, top0,
-                                                 pid, sl, LV, N_SLOTS, main_cap, POOL_B, nb, NUM_WARPS, NSP)
+                                                 pid, sl, LV, N_SLOTS, main_cap, POOL_B, nb, NUM_WARPS, NSP, chk,
+                                                 round_id, ARENA_CHECK)
             if TRACE >= 3:
                 n_ev = mark(trace, n_ev, 20, pin_s(most), TRACE_CAP)
             gl.store(stats + 2 * pid, used)  # the run's status: the blocks the group holds, the most logged
@@ -1391,7 +1434,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
              STREAM: gl.constexpr, U: gl.constexpr,
              SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG: gl.constexpr,
              COUNT: gl.constexpr, STAGE_E: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
-             POOL_B: gl.constexpr):
+             POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr):
     """Phase 2 of program pid: its group's due slots k_lo..k_hi, every link
     through RECEIVE (see the module docstring); state: the tuple of node
     attrs receive touches, [GROUP_SIZE] tensors in the program's neuron
@@ -1503,11 +1546,12 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         if POOL_B > 0:  # the delivered cell's blocks back on the group's free stack
             # the main run keeps its first POOL_RESERVE blocks, the side run none
             keep = gl.minimum(held, POOL_RESERVE)  # (fixed blocks: never missing, never given away)
-            tp = _free_blocks(table, stack, tp, pid, cell, keep, held, lost_v, LV, nb, NUM_WARPS)
+            tp = _free_blocks(table, stack, tp, pid, cell, keep, held, lost_v, LV, nb, NUM_WARPS, chk, k,
+                              ARENA_CHECK)
             if held > keep:
                 gl.store(nblk + cell, keep)
             tp = _free_blocks(side_table, stack, tp, pid, cell, 0, (ns + POOL_B - 1) // POOL_B, lost_v, LV,
-                              nb, NUM_WARPS)
+                              nb, NUM_WARPS, chk, k, ARENA_CHECK)
             if TRACE >= 3:
                 n_ev = mark(trace, n_ev, 23, pin_s(tp), TRACE_CAP)
         gl.store(main_count + cell, 0)

@@ -36,7 +36,7 @@ def _receive_none(state, hit, time, w, srcword):
 def pd14_neuron_kernel(
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr,
     n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
-    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed,
+    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed, check_ptr,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
@@ -70,7 +70,7 @@ def pd14_neuron_kernel(
     if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                          parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
-                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
+                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, 0)
         if ok:
             # receive touches current: the state through delivery
             state = (gl.load(current_ptr + offs, mask=mask),)
@@ -80,7 +80,7 @@ def pd14_neuron_kernel(
             state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                                    n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_current, GROUP_SIZE, N_SLOTS,
                                    STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
-                                   TRACE_CAP, POOL_B)
+                                   TRACE_CAP, POOL_B, check_ptr, 0)
             (current,) = state
 
             # update(): exact propagator integration over dt
@@ -111,14 +111,14 @@ def pd14_neuron_kernel(
             _run_done(ring, pid, run_id)
             _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B)
             fin = fin + 1
-    _run_status(status_run, ring, pid, run_id, fin > 0)
+    _run_status(status_run, ring, pid, run_id, fin > 0, check_ptr, 0)
 
 
 @gluon.jit(do_not_specialize=list(DO_NOT_SPECIALIZE))
 def pd14_poisson_kernel(
     next_spike_ptr,
     n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
-    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed,
+    received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed, check_ptr,
     GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
@@ -151,7 +151,7 @@ def pd14_poisson_kernel(
     if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                          parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
-                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
+                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, 0)
         if ok:
             state = ()  # no receive
             if TRACE:
@@ -159,7 +159,7 @@ def pd14_poisson_kernel(
             state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                                    n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_none, GROUP_SIZE, N_SLOTS,
                                    STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
-                                   TRACE_CAP, POOL_B)
+                                   TRACE_CAP, POOL_B, check_ptr, 0)
 
             # update() is a no-op; send():
             #   if t_start <= time <= t_stop: if next_spike <= time: spike(); next_spike += -log(random()) / rate
@@ -178,7 +178,7 @@ def pd14_poisson_kernel(
             _run_done(ring, pid, run_id)
             _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS, NSP, NUM_WARPS, POOL_B)
             fin = fin + 1
-    _run_status(status_run, ring, pid, run_id, fin > 0)
+    _run_status(status_run, ring, pid, run_id, fin > 0, check_ptr, 0)
 
 
 def pd14_neuron_reference(neuron) -> FusedKernel:

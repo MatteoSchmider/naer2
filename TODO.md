@@ -32,46 +32,16 @@ comments; D-n are the decisions below.
 
 ## Open work
 
-- **Illegal address in PD14's volley on the RTX 4090** (2026-11-19, open, next).
-  G=256 / 8 warps, free-running (no syncs): faults in most runs between
-  rounds ~7025 and ~7110, after the volley's onset (resizes, one
-  stop-and-rerun). A GPU core dump (cuda-gdb, `CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`)
-  puts it at `fused.py` `_stage_records`, the per-link weight load
-  (`w = gl.load(atp + l)`, in delivery, kernel of 57 programs: E_6) -- a
-  staged ring record within the slot's count holding garbage (connection
-  or link index). Gone with `PYTORCH_NO_CUDA_MEMORY_CACHING=1` (3/3), under
-  compute-sanitizer memcheck (0 errors: serialized) -- both add syncs
-  (cudaFree), so a race. Ruled out (each still faults, `tools/pd14_volley.py`
-  flags): ring buffers freed and reused (`--keep-old`), uninitialized arena
-  memory from the copy-once growth (`--zero-growth`), the warp count
-  (`--warps=4`). Instrumented staging (2026-11-19, reverted): the faulting
-  record lies inside the arena, its connection id is valid (< n_conns) and
-  its link index plausible (0 <= l < 2^26) -- so either the link index is
-  wrong for its connection (a record written from a garbage spike: a
-  source neuron id out of range in the pull would give a garbage segment,
-  hence link index) or the connection's attr pointer table (`s_atp`) is.
-  initcheck is too slow here (> 30 min, only host `.item()` reports).
-  Since (2026-11-19, instrumentation in `tools/pd14_volley_debug.patch`:
-  `git apply` it, run `tools/pd14_volley.py 256`): the pull writes only
-  valid records (spikes, segment ranges, link ranges all checked: none
-  bad); staging finds MIXED records -- a valid connection id with a link
-  index past that connection's links (34-588 per run, near the end of
-  their slot's count) -- and masking them stops the fault (3/3 clean).
-  The arena invariant (per group: every block id once among the held
-  blocks and the free stack) broke once, before a resize in E_23: block 0
-  (cell 0's reserve) in cell 14's table several times, ids 212-219
-  nowhere -- so a fix-up popped stack positions holding 0 instead of
-  those ids, and two slots then wrote one block (hence the mixed
-  records). Not the log move's 4 word stores (a 128-bit move: still
-  mixed), not `Ring._grow_arena` on the CPU (300 random growths keep the
-  invariant). Checking the invariant before AND after every resize slows
-  rounds to ~16 ms and the race doesn't show. Next: find what puts zeros
-  (or stale ids) at live stack positions -- a check on the device, cheap
-  enough to keep the timing (e.g. the fix-up verifying each popped id
-  against the group's tables, or a per-group bitmap of held ids). Also
-  fixed on the way: a resize now syncs after its work too (the
-  populations' next runs, on their own streams, didn't wait for it).
-
+- **Illegal address in PD14's volley** (closed 2026-11-22). A resize runs while a round is being launched
+  (a run's judging asks for it), and the round's populations' streams waited only for what the current
+  stream held when the round began: their kernels read the new rings before the resize's copies filled
+  them -- free stacks of zeros, two slots in one block, staging reading a mixed record. `_Launches.resize`
+  (and `_grow_cells`) now synchronize after the copies too. Every earlier check that synchronized hid it
+  (the caching allocator off, the host-side invariant check, the device-side arena check's rebuild); found
+  by the device-side arena check (`PopulationRuntime.arena_check`, fused.py ARENA_CHECK: silent, and still
+  no fault, with only its rebuild left -- which synchronizes) and confirmed 8/8 clean on the 4090 (before:
+  3/6 and 6/8 faulting). `tools/pd14_volley.py` (`--device-check`), `tools/pd14_volley_debug.patch` are the
+  tools from the hunt.
 - **Ring sizing** (2026-11-18). Every group's main and side runs live in
   one arena of 256-record blocks (`naer2/ring.py`; `fused.py`:
   `_append_links`, `_pool_fixup`, `_free_blocks`), sized at runtime

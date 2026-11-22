@@ -45,10 +45,10 @@ _STMTS = lambda src: ast.parse(src).body
 # (seed: the population's own, for random.*: RandomLoweringTransformer)
 FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "ctl", "status", "n_status", "sched",
               "sched_i", "ev", "slot_width", "received_ptr", "n_received_ptr", "log_ptr", "log_cap", "history", "hist_cap",
-              "trace_ptr", "seed")
+              "trace_ptr", "seed", "check_ptr")
 CONSTEXPRS = ("GROUP_SIZE", "K", "SK", "KP", "UNIFORM_SOURCES", "N_SLOTS", "LOG", "STREAM",
               "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "COUNT", "BATCH", "NSP", "TRACE",
-              "TRACE_CAP", "POOL_B")
+              "TRACE_CAP", "POOL_B", "ARENA_CHECK")
 DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "n_status", "sched_i", "log_cap", "hist_cap", "seed")
 
 
@@ -237,7 +237,7 @@ class FusedKernelTemplate:
                         for k in range(len(sites)))
         body = f'''n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                   parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
-                  GROUP_SIZE, TRACE, TRACE_CAP, POOL_B)
+                  GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK)
 if ok:
     # the node attrs receive touches (loaded first thing): the state through delivery
     state = {state_tuple}
@@ -247,7 +247,7 @@ if ok:
     state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                            n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive, GROUP_SIZE, N_SLOTS,
                            STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
-                           TRACE_CAP, POOL_B)
+                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK)
 {unpack}
     t = t_end
     time = t_end
@@ -310,7 +310,7 @@ def fused_run(
             fin = fin + 1
         else:
 {textwrap.indent(body, "            ")}
-    _run_status(status_run, ring, pid, run_id, fin > 0)
+    _run_status(status_run, ring, pid, run_id, fin > 0, check_ptr, ARENA_CHECK)
 
 
 @gluon.jit(do_not_specialize={list(DO_NOT_SPECIALIZE)!r})

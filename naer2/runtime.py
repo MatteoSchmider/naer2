@@ -156,6 +156,11 @@ class _Launches:
                 rt._judge_pending(None, wait=True)
             for rt in list(self.runtimes):
                 rt._apply_wanted()
+            # and once the resizes' copies are done: a resize runs while a round is being launched (a run's
+            # judging asks for it), and the round's populations' streams wait only for what the current stream
+            # held when the round began -- their kernels would read the new rings before the copies filled
+            # them (PD14's volley: free stacks of zeros, two slots in one block, an illegal address)
+            torch.cuda.synchronize()
         finally:
             self._resizing = False
 
@@ -235,6 +240,10 @@ class PopulationRuntime:
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
         self.seed = 0  # random.*'s stream (the population's own seed: Population.seed)
+        # a development aid: every block the pull pops and delivery frees checked on the device (fused.py:
+        # ARENA_CHECK -- pooled rings; arena_errors() the first violation); off: compiled out
+        self.arena_check = False
+        self._chk, self._chk_key = None, None
         self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
@@ -391,6 +400,50 @@ class PopulationRuntime:
         part.window.parts[id(self)] = part
         self._pending.append(part)
 
+    def _arena_check_buf(self) -> torch.Tensor:
+        """The arena check's buffer (fused.py: ARENA_CHECK): 16 words of the first violation, then a held count
+        per (group, block) -- rebuilt from the ring's tables whenever the ring's buffer or arena size changed
+        (an allocation, a resize: the device is idle then), the violation kept. Unchecked: a dummy word."""
+        if not (self.arena_check and self.ring is not None and self.ring.pool_b):
+            if self._chk is None or self._chk.numel() != 16:
+                self._chk = torch.zeros(16, dtype=torch.int32, device=self.device)
+            return self._chk
+        ring = self.ring
+        key = (ring.buf.data_ptr(), ring.pool_nb)
+        if self._chk_key != key:
+            g, S, nb, B = ring.n_groups, ring.n_slots, ring.pool_nb, ring.pool_b
+            dev = self.device
+            held = torch.zeros(g * nb, dtype=torch.int32, device=dev)
+            group = torch.arange(g * S, device=dev) // S
+            col = torch.arange(nb, device=dev)
+            for table, n in ((ring.table, ring.nblk.long()), (ring.side_table, (ring.side_count.long() + B - 1) // B)):
+                used = (col[None, :] < n[:, None]) & (table[:, :nb] >= 0)
+                idx = (group[:, None] * nb + table[:, :nb].long().clamp(min=0))[used]
+                held.index_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
+            errors = self._chk[:16] if self._chk is not None else torch.zeros(16, dtype=torch.int32, device=dev)
+            self._chk = torch.cat([errors, held])  # (on the current stream: the next launches after it)
+            self._chk_key = key
+        return self._chk
+
+    def _arena_raise(self, bits: int) -> None:
+        """A judged run's lost bits with the arena check's (4): raise with the violation it recorded -- before
+        the device faults on what the broken arena does next (the host still reads it then)."""
+        if bits & 4:
+            raise RuntimeError(f"the arena check found a violation in a ring ({self.n} neurons, run "
+                               f"{self.run_id}): {self.arena_errors()}")
+
+    def arena_errors(self) -> dict | None:
+        """The arena check's first violation (arena_check): its kind (pop: a popped block already held, or out
+        of the arena; free: a freed block not held), group, cell, block id, the count found, the round (pop) or
+        slot (free), and how many there were -- None if none."""
+        if self._chk is None:
+            return None
+        v = self._chk[:7].tolist()
+        if not v[0]:
+            return None
+        return dict(count=v[0], kind={1: "pop", 2: "free"}.get(v[1], v[1]), group=v[2], cell=v[3], block=v[4],
+                    found=v[5], when=v[6])
+
     def judge_windows(self, keep: int = 1) -> None:
         """Replayed windows pending at most `keep` (judged, waited for, oldest first, with any runs before
         them): a capture turn's buffers (its entries, its statuses) are the window's until it is judged, and
@@ -419,7 +472,8 @@ class PopulationRuntime:
             self.n, self.plan.plan, self.plan.n_conns, self.ring.buf, self.wmark, self.overrun, self._launches.ctl,
             status, self.status_slots, sched, sched_i,
             self.ev, self.ring.slot_width, self.received, self.n_received, self.log, self.log_cap,
-            self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log, self.seed]
+            self.history.buf, self.history.cap, self.trace.buf if self.trace is not None else self.log, self.seed,
+            self._arena_check_buf()]
         return args, num_warps, all(not (t.data_ptr() & 15) for t in state)
 
     def _launch(self, params, stream) -> None:
@@ -427,7 +481,7 @@ class PopulationRuntime:
         window: naer2/schedule.py; a rerun: _Launches.recover)."""
         args, num_warps, aligned = self._launch_args(params)
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
-        key = (num_warps, self.waves_per_eu, self.maxnreg, self.count_received, self.batch, self.stream_block,
+        key = (num_warps, self.waves_per_eu, self.maxnreg, self.arena_check, self.count_received, self.batch, self.stream_block,
                self.unroll, self.log_cap > 0)
         launch = self._launchers.get(key)
         if launch is not None and aligned:
@@ -482,7 +536,9 @@ class PopulationRuntime:
         if isinstance(run, _WindowPart):
             # per column, the most any group of any run wrote: blocks held, records logged, lost bits (any),
             # done (odd: stopped)
-            blocks, most, lost, _ = (int(v) for v in run.status_host.reshape(-1, 4).max(0))
+            blocks, most, _, _ = (int(v) for v in run.status_host.reshape(-1, 4).max(0))
+            lost = int(np.bitwise_or.reduce(run.status_host[:, :, 2], axis=None))
+            self._arena_raise(lost)
             if (run.status_host[:, :, 3] & 1).any():
                 self._launches.recover()
                 return
@@ -492,7 +548,9 @@ class PopulationRuntime:
                 self._launches.journal.pop(("window", id(window)), None)
             self._follow_need(blocks, most, lost, int(run.run_ids[-1]), len(run))
             return
-        blocks, most, lost, done = (int(v) for v in self._status_np[run % self.status_slots].max(0))
+        blocks, most, _, done = (int(v) for v in self._status_np[run % self.status_slots].max(0))
+        lost = int(np.bitwise_or.reduce(self._status_np[run % self.status_slots, :, 2]))
+        self._arena_raise(lost)
         if done & 1:
             self._launches.recover()
             return
@@ -505,7 +563,7 @@ class PopulationRuntime:
         module docstring. The general pull's lost links (a full side run, or a main run / arena out of room:
         it takes room one record at a time and can't stop) double that size."""
         ring = self.ring
-        main_full = side_full = lost > 0  # (the general pull: either kind grows)
+        main_full = side_full = (lost & 3) > 0  # (the general pull: either kind grows; 4: the arena check)
         if not ring.pool_b:
             longest = blocks
             main_cap = ring.main_cap
@@ -604,6 +662,7 @@ class PopulationRuntime:
         ring.grow(main_cap=main_cap, side_cap=side_cap)
         ring.flags[0] = 0
         ring.flags[3] = 0
+        torch.cuda.synchronize()  # (the copies done before any stream's next kernel: see _Launches.resize)
         for kind, cap in (("main", main_cap), ("side", side_cap)):
             if cap:
                 self.growths.append((run_id, kind, cap))
@@ -624,6 +683,7 @@ class PopulationRuntime:
             TRACE=self.trace.level if self.trace is not None else 0,
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
             POOL_B=self.ring.pool_b,
+            ARENA_CHECK=bool(self.arena_check and self.ring.pool_b),
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 
