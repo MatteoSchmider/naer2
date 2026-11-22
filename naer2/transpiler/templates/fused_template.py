@@ -26,8 +26,11 @@ connections with different receive code (D-6), more than one per-link attr
 """
 
 import ast
+import atexit
 import importlib.util
+import itertools
 import pathlib
+import shutil
 import textwrap
 import tempfile
 
@@ -197,7 +200,8 @@ class FusedKernelTemplate:
             final += TargetMaskTransformer(set(pop.dynamic_attrs), mask="mask").transform(stmts)
         final = GluonTransformer().transform(final)
 
-        source = self._module_source(attrs, state_attrs, later, recv_src, final, sites.sites, stage_e)
+        source = self._module_source(attrs, state_attrs, later, recv_src, final, sites.sites, stage_e,
+                                     stage_w=edge_attr is not None)
         kernel = _load(source, f"naer2_fused_{type(pop.instance).__name__}_{id(pop)}")
         return FusedKernel(source, kernel, attrs, state_attrs, edge_attr,
                            uniform_emission=all(sites.sites), stage_e=stage_e)
@@ -221,7 +225,7 @@ class FusedKernelTemplate:
                 + "".join(lines) + body_src + pack)
 
     @staticmethod
-    def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e) -> str:
+    def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e, stage_w=True) -> str:
         args = ",\n    ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS)
                               + [f"{c}: gl.constexpr" for c in CONSTEXPRS])
         names = ", ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS) + list(CONSTEXPRS))
@@ -247,7 +251,7 @@ if ok:
     state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                            n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive, GROUP_SIZE, N_SLOTS,
                            STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
-                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK)
+                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, {stage_w})
 {unpack}
     t = t_end
     time = t_end
@@ -333,9 +337,23 @@ def _uses_time(hook) -> bool:
                                     for stmt in hook.ast.body for n in ast.walk(stmt))
 
 
+_MODULE_DIR: pathlib.Path | None = None
+_MODULE_IDS = itertools.count()
+
+
+def module_path(name: str) -> pathlib.Path:
+    """Where a generated module's source goes: one directory per process (removed at exit -- the JIT reads a
+    kernel's source when its function is made, nothing reads the file after), a fresh name every time."""
+    global _MODULE_DIR
+    if _MODULE_DIR is None:
+        _MODULE_DIR = pathlib.Path(tempfile.mkdtemp(prefix="naer2-"))
+        atexit.register(shutil.rmtree, _MODULE_DIR, ignore_errors=True)
+    return _MODULE_DIR / f"{name}_{next(_MODULE_IDS)}.py"
+
+
 def _load(source: str, name: str):
     """The generated module, written to a file (the JIT reads kernel source from one) and imported."""
-    path = pathlib.Path(tempfile.mkdtemp()) / f"{name}.py"
+    path = module_path(name)
     path.write_text(source)
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)

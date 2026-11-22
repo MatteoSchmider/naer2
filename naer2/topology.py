@@ -107,6 +107,11 @@ class Topology:
     source_offsets  [N_src + 1] int64 — CSR row pointers
     target_indices  [n_links]   int64 — flat target node indices
 
+    Multapses -- the same target more than once in a row -- are kept as separate
+    links: each its own per-link values (weight, delay), delivered one by one, in
+    link order (an edge forward would run once per link; two of them in one
+    delivery stream block: D-8, TODO.md). Nothing merges or rejects them.
+
     TODO: parallelize build (multiprocessing → GPU); support Points source regions
     """
 

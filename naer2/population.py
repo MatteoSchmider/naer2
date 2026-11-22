@@ -499,11 +499,12 @@ class Population:
         Returns an incomplete ConnectionBuilder (no fabric/target yet) meant to
         be finished with >>, e.g. A @ {"potential": "src_pot"} >> edge @ pattern >> B.
 
-        TODO: this claims @ on every Population unconditionally, which is why
+        This claims @ on every Population unconditionally, which is why
         `>> B @ {mapping}` (bare, no parens) can't mean "post-target fabric_map
         on B" — @ binds tighter than >>, so `B @ {mapping}` evaluates first and
-        hits this method, treating B as a brand-new source. Post-target mapping
-        currently requires explicit parens: `(A >> edge @ pattern >> B) @ {...}`.
+        hits this method, treating B as a brand-new source (the chain then
+        raises, ConnectionBuilder.connect, naming the fix). Post-target mapping
+        requires explicit parens: `(A >> edge @ pattern >> B) @ {...}`.
         A prior design used deliberately different operator binding strengths
         (mirroring how | already binds looser than >> for delay()) to make bare
         post-target chaining just work; we dropped that in favor of the current

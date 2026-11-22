@@ -28,9 +28,10 @@ from test.networks.PD14.net import build, description
 RATE = dict(E_23=0.81, I_23=2.74, E_4=4.21, I_4=5.60, E_5=7.18, I_5=8.30, E_6=1.07, I_6=7.50)
 RES = 0.1  # ms: timestep, delay buckets and ring slots
 # model "pd14": ring run capacity per population (links per (group, slot) cell, G=256) -- the peak demand
-# through the thalamic volley at 700 ms (3.4k-9.3k, 30-45 rounds after it; quiet activity peaks at 160-350)
-# + 25%, in multiples of 256: ~2.2 GB of rings (2048 for all overflows ~7 rounds into the volley)
-PD14_MAIN_CAP = dict(E_23=7168, I_23=7168, E_4=8192, I_4=11776, E_5=9216, I_5=5760, E_6=7168, I_6=4352)
+# through the thalamic volley at 700 ms (9.0k-31.8k, 32-42 rounds after its onset; measured 2026-11-22 on the 4090,
+# the L4e -> L2/3e projection doubled: L2/3 joins the volley now) + 25%, in multiples of 256 -- several GB of
+# rings (fits a 24 GB card, not the 780M)
+PD14_MAIN_CAP = dict(E_23=34048, I_23=39936, E_4=11520, I_4=24320, E_5=33024, I_5=18944, E_6=14592, I_6=13568)
 
 
 class PD14:

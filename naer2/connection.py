@@ -165,6 +165,11 @@ class ConnectionBuilder:
             return self._set_fabric(Fabric(to))
         if to in pattern_types or type(to) in pattern_types or callable(to):
             return self.pattern(to)
+        if isinstance(to, ConnectionBuilder) and to._target is None and to._source_map is not None:
+            # `A >> edge >> B @ {...}`: @ binds tighter than >>, so `B @ {...}` became a new chain from B
+            raise ValueError(
+                "a mapping after the target needs parentheses: write (A >> edge >> B) @ {...} -- "
+                "`>> B @ {...}` reads as `>> (B @ {...})`, a new connection from B with a source mapping")
         raise ValueError(f"Cannot connect to {to!r}")
 
     def __rshift__(self, to) -> "ConnectionBuilder | Connection":
@@ -284,11 +289,12 @@ class Connection:
         # The edge is always already set by this point, so a dict here is
         # unambiguously a fabric_map (at()'s own disambiguation confirms this).
         #
-        # TODO: this only fires with the explicit parens shown above. Written
+        # This only fires with the explicit parens shown above. Written
         # bare — `A >> edge @ pattern >> B @ {"weight": "w"}` — @ binds tighter
         # than >>, so `B @ {"weight": "w"}` evaluates first, hits
         # Population.__matmul__, and produces a source_map builder for B as a
-        # brand-new source instead of a fabric_map on this Connection. A prior
+        # brand-new source instead of a fabric_map on this Connection
+        # (ConnectionBuilder.connect then raises, naming the parens). A prior
         # design used deliberately different operator binding strengths
         # (mirroring how | already binds looser than >> for delay(), enabling
         # `... >> B | 1.5` to work bare) so post-target @ would just work

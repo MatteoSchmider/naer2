@@ -166,3 +166,24 @@ def test_gap_history_grows_with_a_slow_consumer():
     runs_arrived = int((arrivals.floor() < ring.ring_pos).sum())
     assert runs_arrived > 10
     assert int(B.runtime.n_received.sum()) == runs_arrived * len(conn.fabric.topology)
+
+
+def test_a_receive_reading_no_edge_attr_loads_none():
+    """A consumer whose receive reads no edge attr (ed_relay: counts its links) -- the delivery stages no
+    per-link attr (fused.py _stage_records, STAGE_W off: no load, no table) and every link still arrives once."""
+    from test.nodes.ed_relay import ed_relay
+    torch.manual_seed(0)
+    A, B = commanded() * 40, ed_relay() * 60
+    A.timestep = 1.0
+    conn = A >> PD14_connection(0.3) >> B
+    conn.delay = 0.5
+    fires = torch.rand(40, generator=torch.Generator().manual_seed(1)) < 0.4
+    A.fire_now = fires.float()
+    assert "ARENA_CHECK, False)" in B.fused_kernel().source  # (the delivery: no per-link attr staged)
+    A.network.step(2.0)
+    offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
+    count = torch.zeros(60)
+    for s in fires.nonzero().flatten().tolist():
+        count.index_add_(0, tgt[offs[s]:offs[s + 1]], torch.ones(int(offs[s + 1] - offs[s])))
+    assert count.sum() > 0
+    assert torch.equal(B.count.cpu(), count)

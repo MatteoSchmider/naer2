@@ -21,13 +21,11 @@ block size). Worth it where the populations are alike and all run every round (P
 """
 
 import importlib.util
-import pathlib
-import tempfile
 
 import torch
 
 from .runtime import _direct_launch
-from .transpiler.templates.fused_template import CONSTEXPRS, DO_NOT_SPECIALIZE, FIXED_ARGS
+from .transpiler.templates.fused_template import CONSTEXPRS, DO_NOT_SPECIALIZE, FIXED_ARGS, module_path
 
 
 class FusedRound:
@@ -90,7 +88,7 @@ def fused_round(
         """The generated module, written to a file (the JIT reads kernel source from one), each population's
         body bound as _run<i> before the first compile."""
         name = f"naer2_fused_round_{id(self)}"
-        path = pathlib.Path(tempfile.mkdtemp()) / f"{name}.py"
+        path = module_path(name)
         path.write_text(source)
         spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)

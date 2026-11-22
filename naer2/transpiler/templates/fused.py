@@ -939,7 +939,7 @@ def _state_from_rows(state, GROUP_SIZE: gl.constexpr, LN: gl.constexpr):
 def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e, table, LW: gl.constexpr,
                    STREAM: gl.constexpr, U: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
                    LOG: gl.constexpr, STAGE_E: gl.constexpr, N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr,
-                   nb):
+                   nb, STAGE_W: gl.constexpr):
     """Links b0 .. b0 + STREAM of a slot's main run staged in LDS for the walk, each into its target warp's
     list: each record ONE 128-bit load, split into its fields in registers, the weight by link index through
     the connection's attribute pointer (a read-only LDS table); then a stable partition by target warp (one
@@ -968,8 +968,11 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e, t
     #   connection's block pointer (D-7): its variant's attrs into the stage's attr slots; here: the weight
     # The load is unconditional -- a connection whose receive reads no per-link attr still needs a
     #   valid attr block (or a constexpr that skips the load), else this reads past its topology
-    atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
-    w = gl.load(atp + l, mask=qv, other=0.0)
+    if STAGE_W:
+        atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
+        w = gl.load(atp + l, mask=qv, other=0.0)
+    else:  # (the receive reads no per-link attr: nothing to load)
+        w = gl.zeros_like(l).to(gl.float32)
     # GAP (forward): the transpiled edge forward goes here, on link lanes (one record per lane, rooted
     #   at qv -- the old template's lane_mask="_lk_valid"), its assigned attrs stored back at l before staging,
     #   so receive sees the updated values as in the no-delay template. The variant differs per LANE here
@@ -1434,7 +1437,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
              STREAM: gl.constexpr, U: gl.constexpr,
              SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG: gl.constexpr,
              COUNT: gl.constexpr, STAGE_E: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
-             POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr):
+             POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr, STAGE_W: gl.constexpr = True):
     """Phase 2 of program pid: its group's due slots k_lo..k_hi, every link
     through RECEIVE (see the module docstring); state: the tuple of node
     attrs receive touches, [GROUP_SIZE] tensors in the program's neuron
@@ -1470,7 +1473,8 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     #   attrs any variant's receive reads (here: the weight), D-7
     cq = gl.arange(0, MAX_CONNS, layout=LV)
     s_atp = gl.allocate_shared_memory(gl.int64, [MAX_CONNS], SM)
-    s_atp.store(gl.load(attr_addr + cq, mask=cq < n_conns, other=0))
+    if STAGE_W:  # (no per-link attr read: the table unused)
+        s_atp.store(gl.load(attr_addr + cq, mask=cq < n_conns, other=0))
     f_tgt = gl.allocate_shared_memory(gl.int32, [STREAM * NUM_WARPS], SM)
     f_w = gl.allocate_shared_memory(gl.float32, [STREAM * NUM_WARPS], SM)
     if LOG:
@@ -1522,7 +1526,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
             for b0 in range(0, nm, STREAM):
                 nq, n_w, n_max = _stage_records(main_src - 1, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e,
                                                 table, LW, STREAM, U, NUM_WARPS, GROUP_SIZE, LOG, STAGE_E, N_SLOTS,
-                                                main_cap, POOL_B, nb)
+                                                main_cap, POOL_B, nb, STAGE_W)
                 if TRACE:
                     n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
                 state, received, n_received = _walk(

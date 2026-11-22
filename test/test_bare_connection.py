@@ -81,3 +81,12 @@ def test_fabric_attr_assignment_still_works_unchecked_on_a_bare_connection():
     conn = A >> all_to_all >> B
     conn.fabric.anything_at_all = torch.rand(conn.shape)
     assert conn.fabric.anything_at_all.shape == conn.shape
+
+
+def test_a_bare_mapping_after_the_target_raises_naming_the_parens():
+    """`A >> edge >> B @ {...}` reads as `A >> edge >> (B @ {...})` (@ binds tighter than >>): a new chain from B
+    with a source mapping -- an error that says to write `(A >> edge >> B) @ {...}`."""
+    from test.networks.PD14.connection import PD14_connection
+    A, B = PD14_neuron(K_cortical=10) * 10, PD14_neuron(K_cortical=10) * 10
+    with pytest.raises(ValueError, match=r"needs parentheses"):
+        A >> PD14_connection(0.5) >> B @ {"weight": "w"}

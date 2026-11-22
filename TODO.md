@@ -18,21 +18,9 @@ comments and `naer2/transpiler/templates/limitations.md`; D-n are the decisions 
 
 ## Small changes
 
-- **Generated modules in /tmp**: every generated kernel module (`fused_template._load`, `fusion.FusedRound._load`)
-  leaves a directory behind (`tempfile.mkdtemp`, never removed) -- 1600+ after a few days of development; with
-  Triton's own cache (several GB) it nearly filled a disk. One directory per process, removed at exit (the JIT
-  only reads a kernel's source from its file while compiling).
-- **PD14's harness ring capacities** (`tools/pd14_setup.py`, `PD14_MAIN_CAP`) were sized for the old, weaker
-  volley (before the L4e -> L2/3e fix): re-measure them (the network's E_6 arena now peaks at ~1500 blocks, ~700
-  before).
-- **The per-link attr load is unconditional** (`_stage_records`): a connection whose receive reads no attr gets a
-  placeholder attr block (`fabric.PLACEHOLDER`); a constexpr skipping the load would save it.
-- **`random.*` in an edge hook** would draw by the neuron lane index, not the link's (RandomLoweringTransformer):
-  raise NotImplementedError there until edge hooks run on link lanes.
-- **Multapses** (duplicate targets in one row): delivered as separate links; forward runs per link (D-8 if in one
-  stream block). Not enforced or documented anywhere.
-- **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean post-target mapping because `@` binds
-  tighter than `>>`; TODOs in `Population.__matmul__` / `Connection.__matmul__` -- document it, or raise on it.
+(none open: 2026-11-22 closed the generated modules' temp directories, the harness's ring capacities, the
+unconditional per-link attr load, the bare post-target `@` (a clear error now), multapses (documented in
+`Topology`); `random.*` in edge hooks moved to the edge forward gap)
 
 ## Medium changes
 
@@ -42,7 +30,7 @@ comments and `naer2/transpiler/templates/limitations.md`; D-n are the decisions 
 - **The test suite**: fine for now, but testing matters more as the library matures -- work through it (structure,
   speed, coverage). Known so far: no direct unit tests for `AttrPrefixTransformer`, `SelfAttrTransformer`,
   `TargetMaskTransformer`, `GluonTransformer`, `UsedMemberFinder` / `AssignedMemberFinder` (only through the
-  generated kernels' tests); unused test fixtures (`ed_relay`, `lif_cd_weightless`, the two triplet STDP edges).
+  generated kernels' tests); unused test fixtures (`lif_cd_weightless`, the two triplet STDP edges).
 - **Construction and compile time**: measure, then cut -- the fused round kernel takes ~8 s to compile, PD14's first
   captured window ~8.7 s (compile and capture); needed to compare with NEST and GeNN (build times too).
 - **The step path's schedule entries** are read from pinned host memory (`PopulationRuntime.run`: the direct
@@ -97,7 +85,8 @@ comments and `naer2/transpiler/templates/limitations.md`; D-n are the decisions 
   - `test_fused_generated_gpu::test_gap_spikes_inside_delivery` -- D-3
   - `test_gap_receive_variants_per_connection` -- D-6
   - `test_gap_several_per_link_attrs` -- D-7
-  - `test_gap_edge_forward` -- edge forward on link lanes while staging, with D-8 documented in the code
+  - `test_gap_edge_forward` -- edge forward on link lanes while staging, with D-8 documented in the code;
+    `random.*` there must draw by the link, not the neuron lane (RandomLoweringTransformer's `offs`)
   - `test_gap_edge_forward_destination` -- D-9
   - `test_gap_source_attrs` -- D-10
   - `test_gap_edge_backward` -- D-11
