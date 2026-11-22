@@ -14,9 +14,9 @@ before the refactors.
   match NEST: the event-driven result is the more precise one, NEST's grid-based one approaches it as its
   timestep goes to 0. Precise spike times make the sources non-uniform: Brunel's deliveries go through the
   general pull -- the weakest path, covered by an established model next to PD14 on the uniform pull.
-- **External drive**: a Poisson population (the standard way): naer1's -- N_P = N_E + N_I sources, excitatory,
-  p = 0.1 into E and I, weight J, its rate set so the total external rate per neuron is Brunel's C_E eta nu_thr --
-  or N_P = N_E with p = epsilon (C_ext = C_E exactly, the rate eta nu_thr). The source has only update(), emitting
+- **External drive**: a Poisson population (the standard way): N_P = N_E sources, excitatory, p = epsilon into E
+  and I (C_ext = C_E exactly), weight J, the rate eta nu_thr (decided 2026-11-22; naer1's N_P = N_E + N_I with
+  p = 0.1 not taken). The source has only update(), emitting
   its next spike (precise, n2.spike(next_spike)); naer2 derives its timestep itself: the minimum delay of its
   outgoing connections (D) -- no explicit timestep. D on its connections too: one homogeneous delay everywhere.
 - **build(N, K=None, eta=2.0, g=5.0, ...)**: strong scaling by default (epsilon = 0.1 constant: C_E = epsilon
@@ -49,6 +49,8 @@ past), in emission order:
 
 ## The steps
 
+Order (2026-11-22): 1, 3, 2, 4, 5 -- the user's turn between every step.
+
 1. **Delivery times, one class** (done 2026-11-22: the constexprs T_A, T_C, T_B from `Population._delivery_time`;
    tests in test_fused_generated_gpu.py, `test_receive_time*`): the records back to the emission time; the population decides its mode (one
    homogeneous delay: e + D; any per-link delay: the slot's center or end, `Population.slot_time`; several
@@ -57,7 +59,10 @@ past), in emission order:
    slot's center and end, monotone times per target.
 2. **D-3, spikes inside delivery**: n2.spike() in receive into a per-program emission buffer, flushed into the
    history with the run's own spikes. Tests: the D-3 gap test, an event-driven relay firing on arrivals.
-3. **Several homogeneous delays**: the class dimension (pull: a link's cell by its connection's class; delivery: a
+3. **Several homogeneous delays** (done 2026-11-22: `Population._delay_classes`, `Ring.n_classes`, the constexpr
+   NC; delivery `_stage_merged` -- a block merge, every class's next STREAM records ranked by binary search in
+   LDS -- and `_merge_classes` for slots with side runs, one link at a time; tests `test_several_homogeneous_*`):
+   the class dimension (pull: a link's cell by its connection's class; delivery: a
    slot's classes merged by arrival). Tests: two connections with different delays, exact arrival order per
    target against a host reference.
 4. **A source's derived timestep**: an update() population without inputs runs every min outgoing delay. Tests:

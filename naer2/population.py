@@ -367,9 +367,10 @@ class Population:
             return  # no kernel ran: nothing pending
         self._runtime.settle()  # (a stopped run rerun first)
         ring = self._runtime.ring
-        pending = (ring.main_count + ring.side_count).view(ring.n_groups, ring.n_slots).amax(0).tolist()
-        for k in range(ring.ring_pos, ring.ring_pos + ring.n_slots):
-            if pending[k % ring.n_slots]:
+        pending = (ring.main_count + ring.side_count).view(ring.n_groups * ring.n_classes, ring.ring_slots)
+        pending = pending.amax(0).tolist()  # (per slot, over the groups and delay classes)
+        for k in range(ring.ring_pos, ring.ring_pos + ring.ring_slots):
+            if pending[k % ring.ring_slots]:
                 arrival = (k + 1) * ring.slot_width
                 if arrival not in self._run_times:
                     self._run_times.append(arrival)
@@ -425,15 +426,27 @@ class Population:
         """receive's time (T_A, T_C, T_B: T_A e + T_C k + T_B for a record emitted at e, delivered from slot k;
         D-1, BRUNEL.md, fused.py _deliver_link) by the incoming delays: one homogeneous delay D over every
         incoming link -- exact, e + D (emission order is arrival order); otherwise the slot's center or end
-        (slot_time), every link of a slot at one time. (Several homogeneous delays: the slot time for now, exact
-        once the ring has a delay-class dimension: BRUNEL.md, step 3.)"""
+        (slot_time), every link of a slot at one time. Several homogeneous delays: (1, 0, 0) -- exact too, each
+        delay class's delay added by delivery (a ring per class, merged by arrival: _delay_classes)."""
         delays = [self._homogeneous_delay(c) for c in self.incoming]
         if None not in delays and len(set(delays)) <= 1:
             return 1.0, 0.0, delays[0] if delays else 0.0
+        if self._delay_classes() is not None:  # (each class's delay added by delivery itself: _deliver, NC > 1)
+            return 1.0, 0.0, 0.0
         if self.slot_time not in ("center", "end"):
             raise ValueError(f"slot_time is 'center' or 'end', not {self.slot_time!r}")
         w = self._slot_width()
         return 0.0, w, (0.5 if self.slot_time == "center" else 1.0) * w
+
+    def _delay_classes(self) -> tuple[list[int], list[float]] | None:
+        """Several homogeneous delays (every incoming connection one delay value, not all the same; D-1,
+        BRUNEL.md): per connection its delay class, per class its delay (in increasing order) -- a ring per
+        class, merged by arrival at delivery. None otherwise (one value, or any per-link delays)."""
+        delays = [self._homogeneous_delay(c) for c in self.incoming]
+        if None in delays or len(set(delays)) <= 1:
+            return None
+        values = sorted(set(delays))
+        return [values.index(d) for d in delays], values
 
     def _slot_width(self) -> float:
         """The ring's slot width: the finest resolution its incoming
@@ -478,8 +491,11 @@ class Population:
         window = self.timestep if self.timestep is not None else w
         n_slots = math.ceil(longest / w) + math.ceil(window / w) + 3
         caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
-        self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, n_slots),
-                              min_delays=[self._min_delay(c) for c in self.incoming], **caps)
+        classes, class_delays = self._delay_classes() or (None, None)
+        cells = n_slots * (len(class_delays) if class_delays else 1)  # (a group's cells: a ring per class)
+        self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, cells),
+                              min_delays=[self._min_delay(c) for c in self.incoming], classes=classes,
+                              class_delays=class_delays, **caps)
         self._connected = True
 
     def run(self, t_start: float, t_end: float, deliver_until: float | None = None, round_id: int | None = None,

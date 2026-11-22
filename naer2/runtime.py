@@ -273,15 +273,21 @@ class PopulationRuntime:
 
     def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
                 main_cap: int | None = None, side_cap: int | None = None, pool: tuple[int, int] | None = None,
-                min_delays: list[float] | None = None):
+                min_delays: list[float] | None = None, classes: list[int] | None = None,
+                class_delays: list[float] | None = None):
         """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs.
         min_delays: per connection its minimum delay as the host schedules with it (a gated run's due time;
-        default 0)."""
+        default 0). classes, class_delays: several homogeneous delays (D-1, BRUNEL.md) -- per connection its
+        delay class, per class its delay: a ring of n_slots per class, delivered merged by arrival; None:
+        one class."""
         caps = {k: v for k, v in (("main_cap", main_cap), ("side_cap", side_cap)) if v}
-        self.ring = Ring(self.n_groups, n_slots, slot_width, self.device, pool=pool, **caps)
+        n_classes = len(class_delays) if class_delays else 1
+        self.ring = Ring(self.n_groups, n_slots * n_classes, slot_width, self.device, pool=pool, n_classes=n_classes,
+                         **caps)
         self.wmark = torch.full((self.n_groups,), -math.inf, device=self.device)
         self.plan = FusedPlan([s.history for s in sources], topologies, self.n_groups, self.device,
-                              min_delays=min_delays)
+                              min_delays=min_delays, classes=classes if n_classes > 1 else None,
+                              class_delays=class_delays if n_classes > 1 else None)
         # the event state (fused.py: _gate_skip, _ev_close): per run parity the delivery position, the runs
         # made, per group its first slot still holding records
         self.ev = torch.full((2, 2 + self.n_groups), 2147483647, device=self.device, dtype=torch.int32)
@@ -683,7 +689,7 @@ class PopulationRuntime:
             TRACE=self.trace.level if self.trace is not None else 0,
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
             POOL_B=self.ring.pool_b,
-            ARENA_CHECK=bool(self.arena_check and self.ring.pool_b),
+            ARENA_CHECK=bool(self.arena_check and self.ring.pool_b), NC=self.ring.n_classes,
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 

@@ -5,7 +5,9 @@ transpiler/templates/fused.py).
 
 One ring per target GROUP (the neurons one program owns). Slot k of a
 group's ring covers arrivals in [k * slot_width, (k + 1) * slot_width) and
-lives at index k % N_SLOTS: its CELL. Each cell holds
+lives at index k % N_SLOTS: its CELL (several delay classes, n_classes:
+a ring per class, class q's slot k at q * ring_slots + k % ring_slots --
+n_slots counts a group's cells). Each cell holds
   - a main run: records appended in emission order, and
   - a side run: out-of-order records (emission-delayed, or below the
     watermark), kept sorted by emission time by insertion.
@@ -140,14 +142,18 @@ class Ring:
 
     def __init__(self, n_groups: int, n_slots: int, slot_width: float, device,
                  main_cap: int = DEFAULT_MAIN_CAP, side_cap: int = DEFAULT_SIDE_CAP,
-                 pool: tuple[int, int] | None = None, log_cap: int | None = None):
+                 pool: tuple[int, int] | None = None, log_cap: int | None = None, n_classes: int = 1):
         """pool: (block, blocks) -- every group's main and side runs in one arena of `blocks` blocks of
         `block` records, a run taking blocks as it fills (through its block table) and giving them back once
         delivered; a run can grow to the whole arena (main_cap, side_cap ignored). Every main run keeps
         POOL_RESERVE blocks (it starts with them, and keeps them when delivered), so an arena needs more than
         n_slots x POOL_RESERVE blocks. log_cap: records a cell's overflow log takes per run (default:
-        pool_log_cap). None: every cell its own main_cap + side_cap records (see _rec)."""
+        pool_log_cap). None: every cell its own main_cap + side_cap records (see _rec). n_classes: delay
+        classes, a ring of n_slots / n_classes slots each (n_slots: a group's cells)."""
+        if n_slots % n_classes:
+            raise ValueError("a group's cells: a ring of slots per delay class")
         self.n_groups, self.n_slots, self.slot_width = n_groups, n_slots, slot_width
+        self.n_classes, self.ring_slots = n_classes, n_slots // n_classes
         self.pool_b, self.pool_nb = pool or (0, 1)
         self.log_cap = (log_cap if log_cap is not None else pool_log_cap(self.pool_b, self.pool_nb, n_slots)) \
             if self.pool_b else 0
@@ -351,8 +357,8 @@ class Ring:
             getattr(self, name).copy_(v)
         _hold_until_done(old_buf)
 
-    def cell(self, group: int, slot: int) -> int:
-        return group * self.n_slots + slot % self.n_slots
+    def cell(self, group: int, slot: int, cls: int = 0) -> int:
+        return group * self.n_slots + cls * self.ring_slots + slot % self.ring_slots
 
     def _fields(self, rec: torch.Tensor, cap: int, table=None):
         cells = self.n_groups * self.n_slots
@@ -388,7 +394,7 @@ class Ring:
             )
         if far:
             raise NotImplementedError(
-                f"an arrival lies at or beyond {self.n_slots} slots ahead of the ring "
+                f"an arrival lies at or beyond {self.ring_slots} slots ahead of the ring "
                 f"position (e.g. a long emission delay): the far-future list isn't implemented"
             )
         if uniform:

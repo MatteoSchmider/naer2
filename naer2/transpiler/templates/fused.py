@@ -123,10 +123,12 @@ class FusedPlan:
     delivery walk reads, and its group directory), the history's cap, the
     topology's source, segment, bucket and link counts, its most segments of
     one source, the directory's pair count and words per source, and the
-    last-read run ids (double-buffered by the consumer's run parity)."""
+    last-read run ids (double-buffered by the consumer's run parity); per
+    connection its minimum delay and its delay class, per class its delay."""
 
     def __init__(self, histories: list[EmissionHistory], topologies: list[SimulationTopology], n_groups: int, device,
-                 min_delays: list[float] | None = None):
+                 min_delays: list[float] | None = None, classes: list[int] | None = None,
+                 class_delays: list[float] | None = None):
         n = len(histories)
         if n > 256:
             raise ValueError("a consumer can take at most 256 incoming connections (8-bit connection id)")
@@ -139,7 +141,7 @@ class FusedPlan:
                 raise ValueError("every incoming topology must use the consumer's group layout")
         self.n_conns, self.histories, self.topologies = n, histories, topologies
         self.K = histories[0].K if histories else 3
-        plan = torch.zeros(21 * n, dtype=torch.int32)
+        plan = torch.zeros(23 * n, dtype=torch.int32)
         links = [t.link_addresses() for t in topologies]
         dirs = [t.directory() for t in topologies]
         plan[: 10 * n].view(torch.int64)[:] = torch.tensor(
@@ -155,6 +157,13 @@ class FusedPlan:
         # per connection its minimum delay as the host schedules with it (a gated run's due time: _gate_skip)
         plan[20 * n:21 * n] = torch.tensor(min_delays if min_delays is not None else [0.0] * n,
                                            dtype=torch.float32).view(torch.int32)
+        # the delay classes (several homogeneous delays, D-1: BRUNEL.md): per connection its class (its records'
+        # cells: _append_links), per class its delay (the first n_classes words: _deliver_classes)
+        if classes is not None:
+            if len(classes) != n or len(class_delays) > n:
+                raise ValueError("a class per connection, at most as many classes as connections")
+            plan[21 * n:22 * n] = torch.tensor(classes, dtype=torch.int32)
+            plan[22 * n:22 * n + len(class_delays)] = torch.tensor(class_delays, dtype=torch.float32).view(torch.int32)
         self.plan = plan.to(device)
 
 
@@ -547,13 +556,16 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
                   N_SLOTS: gl.constexpr, main_cap, LP2: gl.constexpr, LM: gl.constexpr,
                   SPK: gl.constexpr, MSEG: gl.constexpr,
                   TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
-                  POOL_B: gl.constexpr, nb):
+                  POOL_B: gl.constexpr, nb, cls, NC: gl.constexpr):
     """A block of spikes (uniform sources): every segment [a, b) of the
     ones going to the main runs claims a range of its slot's run in group
     g's ring -- the per-slot link counts live in LDS (s_cnt), the program
     being the run's only writer -- and writes one record per link there, in
     link order: (e, source word, link index, target). The block's segments
-    packed into tiles of one lane each (32 x NUM_WARPS)."""
+    packed into tiles of one lane each (32 x NUM_WARPS). cls: each spike's
+    connection's delay class (NC classes: N_SLOTS cells per group, NC rings of
+    N_SLOTS // NC slots -- class q's slot k in cell q N_SLOTS / NC + k % (N_SLOTS / NC))."""
+    NR: gl.constexpr = N_SLOTS // NC  # the ring's slots (a class's)
     # Packed tiles: the block's (spike, segment) pairs as one dense list, T = one lane each (no replicated
     # lanes) -- a tile's work follows the block's segments in all, not its spike with the most (a spike
     # reaches a group through a segment per delay bucket: up to ~20 in PD14, mostly 1-2 links each). A lane
@@ -575,6 +587,8 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
     t_st = _table((seg_start + zero).to(gl.int64), SMT)
     t_mean = _table((bucket_mean + zero).to(gl.int64), SMT)
     t_lt = _table((link_tgt + zero).to(gl.int64), SMT)
+    if NC > 1:
+        t_cls = _table(cls + zero, SMT)
     gl.barrier()
     lane = gl.arange(0, T, layout=LT)
     for f0 in range(0, n_pairs, T):
@@ -592,12 +606,15 @@ def _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, link_tgt,
             mean = pin(mean)
             n_ev = mark(trace, n_ev, 15, 0, TRACE_CAP)
         k = gl.maximum(gl.floor((e1 + mean) / slot_width).to(gl.int32), k_lo)
-        far = ok & (k - k_lo >= N_SLOTS)
+        far = ok & (k - k_lo >= NR)
         # the flags per lane (masked: normally no lane), not through reductions across warps
         gl.atomic_max(flags + 1 + gl.zeros_like(k), 1, mask=far)
         w = ok & ~far
         n_iter = gl.max(gl.where(w, n_l, 0), axis=0)  # before the full check: a bound
-        slot = k % N_SLOTS
+        if NC > 1:  # (its class's ring)
+            slot = t_cls.gather(sp, 0) * NR + k % NR
+        else:
+            slot = k % N_SLOTS
         old = s_cnt.atomic_scatter_add(gl.where(w, n_l, 0), slot, 0)  # the range's start (pooled: | blocks held)
         old = gl.convert_layout(old, LT)
         if POOL_B > 0:
@@ -748,7 +765,7 @@ def _gate_carry(plan, n_conns, ev, pid, run_id, n_groups, MAX_CONNS: gl.constexp
 
 @gluon.jit
 def _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS: gl.constexpr, NSP: gl.constexpr,
-              NUM_WARPS: gl.constexpr, POOL_B: gl.constexpr):
+              NUM_WARPS: gl.constexpr, POOL_B: gl.constexpr, NC: gl.constexpr = 1):
     """A run done: the event state for the next run -- the delivery position past this run's slots, and this
     group's first slot still holding records (after delivery: later per-link arrivals of spikes taken in)."""
     LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
@@ -757,8 +774,9 @@ def _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS: gl.constexpr
     rp = gl.maximum(k_lo, k_hi + 1)
     sl = gl.arange(0, NSP, layout=LV)
     live = sl < N_SLOTS
-    k = rp + sl
-    cell = pid * N_SLOTS + k % N_SLOTS
+    NR: gl.constexpr = N_SLOTS // NC  # (cell sl: class sl // NR's slot rp + sl % NR)
+    k = rp + sl % NR
+    cell = pid * N_SLOTS + (sl // NR) * NR + k % NR
     c = gl.load(main_count + cell, mask=live, other=0) + gl.load(side_count + cell, mask=live, other=0)
     first = gl.min(gl.where(live & (c > 0), k, EV_NONE), axis=0)
     src = ev + (run_id % 2) * (EV_HDR + n_groups)
@@ -1051,6 +1069,175 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
     return state, received, n_received
 
 
+# ------------------------------------------------- delivery: several delay classes (D-1, BRUNEL.md)
+#
+# A population whose incoming connections have several homogeneous delays: a ring per delay class (class q's slot
+# k in cell q NR + k % NR of its group, NR = N_SLOTS // NC), each class's records in emission order -- its arrival
+# order, e + D_q. A due slot's classes are merged by arrival (ties: the lower class first; within a class main
+# before side, as _merge_links), every link received at its exact arrival.
+
+
+@gluon.jit
+def _stage_merged(main_time, rec0, cell0, cur, nmv, dcls, cv, s_atp, s_arr, m_tgt, m_w, m_src, m_t, f_tgt, f_w,
+                  f_src, f_e, table, n_cells, LW: gl.constexpr, STREAM: gl.constexpr, U: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr,
+                  STAGE_E: gl.constexpr, N_SLOTS: gl.constexpr, POOL_B: gl.constexpr, nb, STAGE_W: gl.constexpr,
+                  NC: gl.constexpr):
+    """The next STREAM links of a due slot's classes in arrival order, staged for the walk as _stage_records
+    stages a run's (f_e: each link's arrival). An exact merge a block at a time: every class's next STREAM
+    records (from its cursor, cur: [MAX_CONNS] in cv's layout) are the candidates -- the merged next STREAM are
+    among them --, each candidate's rank among them its place in its class + a binary search into each other
+    class's (their arrivals in LDS, s_arr: sorted, padded with inf); the ranks below STREAM are taken, scattered
+    to their place (m_*: [2 STREAM], past STREAM the untaken's dump). Returns (the links taken, each warp's count,
+    the most, each class's taken count in cv's layout: the cursors' advance). (A record whose block is missing --
+    an arena that ran out, its links lost -- counts as arriving last: the order past it is undefined.)"""
+    NR: gl.constexpr = N_SLOTS // NC
+    LR: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [NUM_WARPS, 1], [1, 0])
+    LRQ: gl.constexpr = gl.SliceLayout(1, LR)
+    i = gl.arange(0, STREAM, layout=LRQ)
+    col = gl.arange(0, 4, layout=gl.SliceLayout(0, LR))
+    # 1. every class's candidates' arrivals into LDS
+    for c in gl.static_range(NC):
+        cur_c = gl.sum(gl.where(cv == c, cur, 0), axis=0)
+        nm_c = gl.sum(gl.where(cv == c, nmv, 0), axis=0)
+        d_c = gl.sum(gl.where(cv == c, dcls, 0.0), axis=0)
+        q = cur_c + i
+        rec, ok = _run_rec(cell0 + c * NR, q, n_cells, table, N_SLOTS, POOL_B, nb, POOL_RESERVE)
+        e = gl.load(main_time + 4 * rec, mask=(q < nm_c) & ok, other=float("inf"))
+        s_arr.scatter(e + d_c, c * STREAM + i, 0)
+    gl.barrier()
+    # 2. each candidate's rank; the taken ones to their place
+    taken = gl.zeros_like(cur)
+    for c in gl.static_range(NC):
+        cur_c = gl.sum(gl.where(cv == c, cur, 0), axis=0)
+        nm_c = gl.sum(gl.where(cv == c, nmv, 0), axis=0)
+        d_c = gl.sum(gl.where(cv == c, dcls, 0.0), axis=0)
+        q = cur_c + i
+        rec, ok = _run_rec(cell0 + c * NR, q, n_cells, table, N_SLOTS, POOL_B, nb, POOL_RESERVE)
+        qv = (q < nm_c) & ok
+        at = gl.multiple_of(4 * rec, 4)
+        words = gl.load(rec0 + at[:, None] + col[None, :], mask=qv[:, None] & (col[None, :] < 4), other=0)
+        el, st = gl.split(gl.reshape(words, [STREAM, 2, 2]))  # (e, link index), (source word, target)
+        e_i, l = gl.split(el)
+        srcw, t = gl.split(st)
+        a = gl.where(qv, gl.convert_layout(e_i, LRQ).to(gl.float32, bitcast=True) + d_c, float("inf"))
+        l = gl.convert_layout(l, LRQ)
+        srcw = gl.convert_layout(srcw, LRQ)
+        t = gl.convert_layout(t, LRQ)
+        rank = i
+        for c2 in gl.static_range(NC):
+            if c2 != c:  # the other class's candidates before this one: arriving earlier (a lower class: or as early)
+                pos = gl.zeros_like(i)
+                for stp in gl.static_range(12):  # (STREAM <= 4096: the steps past log2(STREAM) compiled out)
+                    if (STREAM >> (stp + 1)) > 0:
+                        probe = pos + (STREAM >> (stp + 1))
+                        v = s_arr.gather(c2 * STREAM + probe - 1, 0)
+                        if c2 < c:
+                            pos = gl.where(v <= a, probe, pos)
+                        else:
+                            pos = gl.where(v < a, probe, pos)
+                v = s_arr.gather(c2 * STREAM + pos, 0)
+                if c2 < c:
+                    pos = gl.where(v <= a, pos + 1, pos)
+                else:
+                    pos = gl.where(v < a, pos + 1, pos)
+                rank = rank + pos
+        take = qv & (rank < STREAM)
+        if STAGE_W:
+            atp = s_atp.gather(srcw >> 24, 0).to(gl.pointer_type(gl.float32))
+            w = gl.load(atp + l, mask=take, other=0.0)
+        else:
+            w = gl.zeros_like(l).to(gl.float32)
+        dst = gl.where(take, rank, STREAM + i)
+        m_tgt.scatter(t, dst, 0)
+        m_w.scatter(w, dst, 0)
+        if LOG:
+            m_src.scatter(srcw, dst, 0)
+        if STAGE_E:
+            m_t.scatter(a, dst, 0)
+        taken = gl.where(cv == c, gl.sum(take.to(gl.int32), axis=0), taken)
+    gl.barrier()
+    # 3. the merged block, partitioned by target warp as _stage_records does
+    n_take = gl.sum(taken, axis=0)
+    qv = i < n_take
+    t = m_tgt.gather(i, 0)
+    w = m_w.gather(i, 0)
+    NPW: gl.constexpr = GROUP_SIZE // NUM_WARPS
+    if NUM_WARPS == 1:
+        wq = gl.zeros_like(i)
+        rank = i
+    else:
+        wq = gl.where(qv, t // NPW, i % NUM_WARPS)
+        wi = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(0, LR))
+        oh = (wq[:, None] == wi[None, :]).to(gl.int32)
+        rank = gl.sum(oh * (gl.cumsum(oh, axis=0) - 1), axis=1)
+    wl = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(0, LR))
+    n_w = gl.convert_layout(gl.sum(((wq[:, None] == wl[None, :]) & qv[:, None]).to(gl.int32), axis=0), LW)
+    dst = (rank // U) * (NUM_WARPS * U) + wq * U + rank % U
+    f_tgt.scatter(gl.where(qv, t, -1), dst, 0)
+    f_w.scatter(w, dst, 0)
+    if LOG:
+        f_src.scatter(m_src.gather(i, 0), dst, 0)
+    if STAGE_E:
+        f_e.scatter(m_t.gather(i, 0), dst, 0)
+    gl.barrier()
+    return n_take, n_w, gl.max(n_w, axis=0), taken
+
+
+@gluon.jit
+def _merge_classes(main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell0, nmv, nsv, dcls,
+                   cv, n_cells, attr_addr, state, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
+                   table, side_table, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr,
+                   COUNT: gl.constexpr, N_SLOTS: gl.constexpr, POOL_B: gl.constexpr, nb, NC: gl.constexpr):
+    """A due slot's classes, some with side entries: every class's main and side runs merged by arrival one
+    link at a time (as _merge_links: the order (arrival, class, main first)), each received at its arrival."""
+    NR: gl.constexpr = N_SLOTS // NC
+    cellv = cell0 + cv * NR
+    im = gl.zeros_like(cv)
+    js = gl.zeros_like(cv)
+    for _ in range(gl.sum(nmv + nsv, axis=0)):
+        rm, okm = _run_rec(cellv, im, n_cells, table, N_SLOTS, POOL_B, nb, POOL_RESERVE)
+        rs, oks = _run_rec(cellv, js, n_cells, side_table, N_SLOTS, POOL_B, nb, 0)
+        mv = im < nmv
+        sv = js < nsv
+        mr = mv & okm  # a record whose block is missing (lost links): taken in turn, delivered to no one
+        sr = sv & oks
+        am = gl.load(main_time + 4 * rm, mask=mr, other=float("inf")) + dcls
+        as_ = gl.load(side_time + 4 * rs, mask=sr, other=float("inf")) + dcls
+        take_m = mv & (~sv | (am <= as_))
+        a_c = gl.where(take_m, am, as_)
+        has = mv | sv
+        a = gl.min(gl.where(has, a_c, float("inf")), axis=0)
+        csel = gl.min(gl.where(has & (a_c == a), cv, 1 << 30), axis=0)
+        sel = cv == csel
+        tm = gl.sum((sel & take_m).to(gl.int32), axis=0) > 0
+        at = 4 * gl.sum(gl.where(sel, gl.where(take_m, rm, rs), 0), axis=0)
+        okr = gl.sum((sel & gl.where(take_m, mr, sr)).to(gl.int32), axis=0) > 0
+        srcword = gl.where(tm, gl.load(main_src + at, mask=okr, other=0), gl.load(side_src + at, mask=okr, other=0))
+        l = gl.where(tm, gl.load(main_lo + at, mask=okr, other=0), gl.load(side_lo + at, mask=okr, other=0))
+        t = gl.where(tm, gl.load(main_n + at, mask=okr, other=-1), gl.load(side_n + at, mask=okr, other=-1))
+        im = im + (sel & take_m).to(gl.int32)
+        js = js + (sel & ~take_m).to(gl.int32)
+        w = gl.load(gl.load(attr_addr + (srcword >> 24)).to(gl.pointer_type(gl.float32)) + l)
+        state, received, n_received = _deliver_link(  # (the log: the arrival, as _stage_merged stages it)
+            state, t, w, srcword, a, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
+            RECEIVE, GROUP_SIZE, LOG, COUNT, a)
+    return state, received, n_received
+
+
+@gluon.jit
+def _release_cell(table, side_table, stack, tp, pid, cell, held, ns, nblk, lost_v, LV: gl.constexpr, nb,
+                  NUM_WARPS: gl.constexpr, chk, k, ARENA_CHECK: gl.constexpr, POOL_B: gl.constexpr):
+    """A delivered cell's blocks back on the group's free stack (pooled: the main run keeps its first
+    POOL_RESERVE blocks, the side run none). Returns the stack's new top."""
+    keep = gl.minimum(held, POOL_RESERVE)  # (fixed blocks: never missing, never given away)
+    tp = _free_blocks(table, stack, tp, pid, cell, keep, held, lost_v, LV, nb, NUM_WARPS, chk, k, ARENA_CHECK)
+    if held > keep:
+        gl.store(nblk + cell, keep)
+    tp = _free_blocks(side_table, stack, tp, pid, cell, 0, (ns + POOL_B - 1) // POOL_B, lost_v, LV, nb, NUM_WARPS,
+                      chk, k, ARENA_CHECK)
+    return tp
+
+
 # ------------------------------------------------- phase 1: the pull
 
 
@@ -1125,7 +1312,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
           SK: gl.constexpr, KP: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
           N_SLOTS: gl.constexpr, NSP: gl.constexpr,
           UNIFORM_SOURCES: gl.constexpr, BATCH: gl.constexpr, NUM_WARPS: gl.constexpr, GROUP_SIZE: gl.constexpr,
-          TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr):
+          TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr,
+          NC: gl.constexpr = 1):
     """Phase 1 of program pid: what the sources emitted since this consumer
     last read them, into the program's group's ring; returns (n_ev
     (tracing), ok). Not ok: the ring is too small for the run -- nothing
@@ -1150,6 +1338,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
      _watermark, flags, table, side_table, stack, top, nblk, lost, log_rec, ovf_cap, main_cap, side_cap,
      nb, stats) = _ring(ring, POOL_B)
     n_cells = n_groups * N_SLOTS
+    NR: gl.constexpr = N_SLOTS // NC  # the ring's slots; N_SLOTS: the cells per group (NC delay classes)
+    cls_plan = plan + 21 * n_conns  # per connection its delay class (FusedPlan)
 
     # No user code in the pull -- it only moves (e, source, link, target) records into the ring;
     #   every hook runs at delivery, in delivery order (strict per-link order)
@@ -1204,6 +1394,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
         tab_dwords = _table(j_dwords.to(gl.int64), SM)
         tab_W = _table(dwords_j, SM)
         tab_first = gl.allocate_shared_memory(gl.int32, [MAX_CJ], SM)  # per e-group: each pair's first spike
+        if NC > 1:
+            tab_cls = _table(gl.load(cls_plan + c_of, mask=vj, other=0), SM)
     if UNIFORM_SOURCES:
         # this group's per-slot link counts, in LDS for the pull's appends (it is their only writer)
         sl = gl.arange(0, NSP, layout=LV)
@@ -1265,12 +1457,16 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
                 has = b > a
                 violated = gl.maximum(violated, gl.max((tv & has & ~main).to(gl.int32), axis=0))
                 e_max = gl.maximum(e_max, gl.max(gl.where(main & has, e, float("-inf")), axis=0))
+                if NC > 1:
+                    cls_t = tab_cls.gather(cj_t, 0)
+                else:
+                    cls_t = 0
                 n_ev = _append_links(s, e, main, c_t, a, b, seg_start, seg_gb, bucket_mean,
                                      ltp_t, s_cnt, pid, k_lo, slot_width, n_cells,
                                      main_time, main_src, main_lo, main_n,
                                      flags, trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap,
                                      LP2, LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B,
-                                     nb)
+                                     nb, cls_t, NC)
                 if TRACE >= 2:
                     n_ev = mark(trace, n_ev, 13, gl.sum(gl.where(main, b - a, 0), axis=0), TRACE_CAP)
             wmark = gl.maximum(wmark, e_max)  # later e-groups are compared against this one
@@ -1302,6 +1498,10 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
             wend_r = gl.sum(gl.where(sel, wend, 0.0), axis=0)
             c = gl.sum(gl.where(sel, c_of, 0), axis=0)
             selc = ci == c
+            if NC > 1:
+                cls_r = gl.load(cls_plan + c)
+            else:
+                cls_r = 0
             nsrc_r = gl.sum(gl.where(selc, nsrc_c, 0), axis=0)
             _seg_offsets, seg_start, seg_gb, bucket_mean = topology_ptrs(
                 gl.sum(gl.where(selc, tbuf_c, 0), axis=0).to(gl.pointer_type(gl.int32)), nsrc_r,
@@ -1330,7 +1530,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
                     n_ev = _append_links(s, e, main, c, a, b, seg_start, seg_gb, bucket_mean, ltp_r, s_cnt, pid,
                                          k_lo, slot_width, n_cells, main_time, main_src, main_lo, main_n, flags,
                                          trace, n_ev, table, log_rec, ovf_cap, N_SLOTS, main_cap, LP2,
-                                         LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B, nb)
+                                         LM, SPK, MSEG, TRACE, TRACE_CAP, NUM_WARPS, GROUP_SIZE, POOL_B, nb,
+                                         cls_r, NC)
                 wmark = gl.maximum(wmark, e_max)  # the next run (later e) is compared against this one
                 gl.barrier()  # the run's appends are in before the next run's (main runs grow in e)
             else:
@@ -1346,10 +1547,10 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
                         n_l = gl.load(seg_start + sg + 1) - lo_l
                         mean = gl.load(bucket_mean + (gb & 0xFFFF))
                         k = gl.maximum(gl.floor((e + mean) / slot_width).to(gl.int32), k_lo)
-                        if k - k_lo >= N_SLOTS:
+                        if k - k_lo >= NR:
                             gl.atomic_max(flags + 1, 1)
                         else:
-                            cell = pid * N_SLOTS + k % N_SLOTS
+                            cell = pid * N_SLOTS + cls_r * NR + k % NR
                             to_main = (e >= wmark) & (e < wend_r)
                             for jl in range(0, n_l):  # one record per link, in link order
                                 l = lo_l + jl
@@ -1442,12 +1643,14 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
              SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG: gl.constexpr,
              COUNT: gl.constexpr, STAGE_E: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
              POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr, STAGE_W: gl.constexpr = True,
-             T_A: gl.constexpr = 1.0, T_C: gl.constexpr = 0.0, T_B: gl.constexpr = 0.0):
+             T_A: gl.constexpr = 1.0, T_C: gl.constexpr = 0.0, T_B: gl.constexpr = 0.0, NC: gl.constexpr = 1):
     """Phase 2 of program pid: its group's due slots k_lo..k_hi, every link
     through RECEIVE (see the module docstring); state: the tuple of node
     attrs receive touches, [GROUP_SIZE] tensors in the program's neuron
     layout (lane's). STAGE_E: the walk stages each record's time word too
-    (LOG, or a receive that reads time). Returns (state, n_ev)."""
+    (LOG, or a receive that reads time). NC > 1: several delay classes, each
+    slot's classes merged by arrival (_stage_merged, _merge_classes; the log's time word then the arrival,
+    not the emission). Returns (state, n_ev)."""
     # neurons over lanes and warps (the program's layout, LN); during delivery as rows, one per warp (LWN:
     # [NUM_WARPS, GROUP_SIZE // NUM_WARPS]) -- each warp walks the links to its own neurons (_walk)
     LT: gl.constexpr = gl.BlockedLayout([SPT, U], [32, 1], [NUM_WARPS, 1], [1, 0])
@@ -1490,6 +1693,16 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         f_e = gl.allocate_shared_memory(gl.float32, [STREAM * NUM_WARPS], SM)
     else:  # placeholder, never touched
         f_e = f_w
+    if NC > 1:  # the class merge's buffers (_stage_merged), the classes' delays (FusedPlan)
+        NR: gl.constexpr = N_SLOTS // NC
+        # (each class's candidates' arrivals; MAX_CONNS: a power of two, at least NC)
+        s_arr = gl.allocate_shared_memory(gl.float32, [MAX_CONNS * STREAM], SM)
+        m_tgt = gl.allocate_shared_memory(gl.int32, [2 * STREAM], SM)
+        m_w = gl.allocate_shared_memory(gl.float32, [2 * STREAM], SM)
+        m_src = gl.allocate_shared_memory(gl.int32, [2 * STREAM], SM)
+        m_t = gl.allocate_shared_memory(gl.float32, [2 * STREAM], SM)
+        cv = gl.arange(0, MAX_CONNS, layout=LV)  # (NC <= the connections)
+        dcls = gl.load((plan + 22 * n_conns + cv).to(gl.pointer_type(gl.float32)), mask=cv < NC, other=0.0)
     RW: gl.constexpr = [STREAM // U, NUM_WARPS * U]  # (a row: a walk step's [NUM_WARPS, U])
     r_tgt = f_tgt.reinterpret(gl.int32, RW, SM)
     r_w = f_w.reinterpret(gl.float32, RW, SM)
@@ -1503,10 +1716,9 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     received = _to_rows(received, NUM_WARPS, GROUP_SIZE, LWN)
     n_received = _to_rows(n_received, NUM_WARPS, GROUP_SIZE, LWN)
     gl.barrier()
-    # receive's time (D-1): T_A e + tk, tk the slot's term (see _deliver_link) -- a slot's records in emission
-    #   order, so per target non-decreasing either way
-    # GAP (BRUNEL.md, step 3): several homogeneous delays take the slot's time until the ring has a
-    #   delay-class dimension (exact arrival order by a merge of a slot's classes)
+    # receive's time (D-1): one class, T_A e + tk, tk the slot's term (see _deliver_link) -- a slot's records in
+    #   emission order, so per target non-decreasing either way; several classes (NC > 1), e + D_q, the slot's
+    #   classes merged by arrival (_stage_merged, _merge_classes)
     if POOL_B > 0:  # the group's free-stack top through the delivery, stored once at its end
         tp = gl.load(top + pid)
         lost_v = gl.load(lost)
@@ -1514,56 +1726,95 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         tp = gl.to_tensor(0)
         lost_v = gl.to_tensor(0)
     for k in range(k_lo, k_hi + 1):
-        cell = pid * N_SLOTS + k % N_SLOTS
-        tk = k.to(gl.float32) * T_C + T_B  # (the delivery time's per-slot term: _deliver_link)
-        nm = gl.minimum(gl.load(main_count + cell), main_cap)
-        ns = gl.minimum(gl.load(side_count + cell), side_cap)
-        if POOL_B > 0:
-            held = gl.load(nblk + cell)  # (for freeing below: read with the counts, its latency hidden)
-        else:
-            held = gl.to_tensor(0)
-        if TRACE:
-            nm = pin_s(nm)
-            n_ev = mark(trace, n_ev, 3, nm, TRACE_CAP)
-        if ns == 0:
-            # the slot's link records are its stream: STREAM links at a time
-            for b0 in range(0, nm, STREAM):
-                nq, n_w, n_max = _stage_records(main_src - 1, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e,
-                                                table, LW, STREAM, U, NUM_WARPS, GROUP_SIZE, LOG, STAGE_E, N_SLOTS,
-                                                main_cap, POOL_B, nb, STAGE_W)
-                if TRACE:
-                    n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
-                state, received, n_received = _walk(
-                    r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr,
-                    log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, tk, T_A)
-                if TRACE:
-                    state = _pin_first(state)
-                    n_ev = mark(trace, n_ev, 6, nq, TRACE_CAP)
-                gl.barrier()
+        if NC == 1:
+            cell = pid * N_SLOTS + k % N_SLOTS
+            tk = k.to(gl.float32) * T_C + T_B  # (the delivery time's per-slot term: _deliver_link)
+            nm = gl.minimum(gl.load(main_count + cell), main_cap)
+            ns = gl.minimum(gl.load(side_count + cell), side_cap)
+            if POOL_B > 0:
+                held = gl.load(nblk + cell)  # (for freeing below: read with the counts, its latency hidden)
+            else:
+                held = gl.to_tensor(0)
+            if TRACE:
+                nm = pin_s(nm)
+                n_ev = mark(trace, n_ev, 3, nm, TRACE_CAP)
+            if ns == 0:
+                # the slot's link records are its stream: STREAM links at a time
+                for b0 in range(0, nm, STREAM):
+                    nq, n_w, n_max = _stage_records(main_src - 1, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e,
+                                                    table, LW, STREAM, U, NUM_WARPS, GROUP_SIZE, LOG, STAGE_E, N_SLOTS,
+                                                    main_cap, POOL_B, nb, STAGE_W)
+                    if TRACE:
+                        n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
+                    state, received, n_received = _walk(
+                        r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr,
+                        log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, tk, T_A)
+                    if TRACE:
+                        state = _pin_first(state)
+                        n_ev = mark(trace, n_ev, 6, nq, TRACE_CAP)
+                    gl.barrier()
+                    if TRACE >= 3:
+                        n_ev = mark(trace, n_ev, 22, 0, TRACE_CAP)
+            else:  # side entries: merged one link at a time in the program's layout (rare: back and forth)
+                st1, r1, n1 = _merge_links(
+                    main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
+                    attr_addr, _state_from_rows(state, GROUP_SIZE, LN), _from_rows(received, GROUP_SIZE, LN),
+                    _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k, pid, log_ptr, log_e, log_cap, table,
+                    side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb, tk, T_A)
+                state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
+                received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
+                n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)
+            if POOL_B > 0:  # the delivered cell's blocks back on the group's free stack
+                tp = _release_cell(table, side_table, stack, tp, pid, cell, held, ns, nblk, lost_v, LV, nb, NUM_WARPS,
+                                   chk, k, ARENA_CHECK, POOL_B)
                 if TRACE >= 3:
-                    n_ev = mark(trace, n_ev, 22, 0, TRACE_CAP)
-        else:  # side entries: merged one link at a time in the program's layout (rare: back and forth)
-            st1, r1, n1 = _merge_links(
-                main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
-                attr_addr, _state_from_rows(state, GROUP_SIZE, LN), _from_rows(received, GROUP_SIZE, LN),
-                _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k, pid, log_ptr, log_e, log_cap, table,
-                side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb, tk, T_A)
-            state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
-            received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
-            n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)
-        if POOL_B > 0:  # the delivered cell's blocks back on the group's free stack
-            # the main run keeps its first POOL_RESERVE blocks, the side run none
-            keep = gl.minimum(held, POOL_RESERVE)  # (fixed blocks: never missing, never given away)
-            tp = _free_blocks(table, stack, tp, pid, cell, keep, held, lost_v, LV, nb, NUM_WARPS, chk, k,
-                              ARENA_CHECK)
-            if held > keep:
-                gl.store(nblk + cell, keep)
-            tp = _free_blocks(side_table, stack, tp, pid, cell, 0, (ns + POOL_B - 1) // POOL_B, lost_v, LV,
-                              nb, NUM_WARPS, chk, k, ARENA_CHECK)
-            if TRACE >= 3:
-                n_ev = mark(trace, n_ev, 23, pin_s(tp), TRACE_CAP)
-        gl.store(main_count + cell, 0)
-        gl.store(side_count + cell, 0)
+                    n_ev = mark(trace, n_ev, 23, pin_s(tp), TRACE_CAP)
+            gl.store(main_count + cell, 0)
+            gl.store(side_count + cell, 0)
+        else:  # several delay classes: the slot's cells merged by arrival
+            cell0 = pid * N_SLOTS + k % NR
+            cellv = cell0 + cv * NR
+            cvm = cv < NC
+            nmv = gl.minimum(gl.load(main_count + cellv, mask=cvm, other=0), main_cap)
+            nsv = gl.minimum(gl.load(side_count + cellv, mask=cvm, other=0), side_cap)
+            if POOL_B > 0:
+                heldv = gl.load(nblk + cellv, mask=cvm, other=0)
+            else:
+                heldv = gl.zeros_like(cv)
+            if TRACE:
+                n_ev = mark(trace, n_ev, 3, pin_s(gl.sum(nmv, axis=0)), TRACE_CAP)
+            if gl.sum(nsv, axis=0) == 0:
+                cur = gl.zeros_like(cv)
+                for b0 in range(0, gl.sum(nmv, axis=0), STREAM):
+                    nq, n_w, n_max, taken = _stage_merged(
+                        main_time, main_src - 1, cell0, cur, nmv, dcls, cv, s_atp, s_arr, m_tgt, m_w, m_src, m_t,
+                        f_tgt, f_w, f_src, f_e, table, n_cells, LW, STREAM, U, NUM_WARPS, GROUP_SIZE,
+                        LOG, STAGE_E, N_SLOTS, POOL_B, nb, STAGE_W, NC)
+                    cur = cur + taken
+                    state, received, n_received = _walk(
+                        r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid,
+                        log_ptr, log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, 0.0,
+                        1.0)  # (f_e: the arrival itself)
+                    gl.barrier()
+            else:
+                st1, r1, n1 = _merge_classes(
+                    main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell0, nmv, nsv,
+                    dcls, cv, n_cells, attr_addr, _state_from_rows(state, GROUP_SIZE, LN),
+                    _from_rows(received, GROUP_SIZE, LN), _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k,
+                    pid, log_ptr, log_e, log_cap, table, side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS,
+                    POOL_B, nb, NC)
+                state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
+                received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
+                n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)
+            for c in gl.static_range(NC):
+                cell = cell0 + c * NR
+                if POOL_B > 0:
+                    tp = _release_cell(table, side_table, stack, tp, pid, cell,
+                                       gl.sum(gl.where(cv == c, heldv, 0), axis=0),
+                                       gl.sum(gl.where(cv == c, nsv, 0), axis=0), nblk, lost_v, LV, nb, NUM_WARPS,
+                                       chk, k, ARENA_CHECK, POOL_B)
+                gl.store(main_count + cell, 0)
+                gl.store(side_count + cell, 0)
     if POOL_B > 0:
         gl.store(top + pid, tp)
     state = _state_from_rows(state, GROUP_SIZE, LN)

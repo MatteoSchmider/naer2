@@ -98,6 +98,46 @@ def test_planned_windows_gate_an_event_driven_consumer(delay, mode):
     assert made == B_step.runtime.runs_made() and made < 1 + gated  # (the first round's run + those due)
 
 
+def _two_delay_net(seed=0):
+    """Two sources into one consumer, each connection one homogeneous delay (0.5, 2.5): two delay classes."""
+    torch.manual_seed(seed)
+    A1, A2, B = commanded() * 40, commanded() * 30, commanded() * 60
+    A1.timestep = A2.timestep = 1.0
+    B.count_received = True
+    conns, fires = [], []
+    for i, (A, d) in enumerate(((A1, 0.5), (A2, 2.5))):
+        conn = A >> PD14_connection(0.3) >> B
+        conn.weight = torch.rand(conn.shape)
+        conn.delay = d
+        f = torch.rand(len(A.shape), generator=torch.Generator().manual_seed(seed + 1 + i)) < 0.4
+        A.fire_now = f.float()
+        conns.append(conn)
+        fires.append(f)
+    return A1.network, B, conns, fires
+
+
+@pytest.mark.parametrize("mode", ["step", "planned", "graph"])
+def test_several_homogeneous_delays_through_the_network(mode):
+    """Several homogeneous delays (D-1, BRUNEL.md step 3) end to end: the consumer's ring a ring per delay class,
+    scheduled from its pending slots across the classes (the 2.5 arrivals: only its ring knows them), every
+    link delivered -- stepped, and through planned and captured windows."""
+    network, B, conns, fires = _two_delay_net()
+    if mode == "step":
+        network.step(2.0)
+        assert B.runtime.ring.n_classes == 2
+        first, _ = _expected(conns[0], fires[0], 60)
+        assert int(B.runtime.n_received.sum()) == int(first.sum())  # the 0.5 links only, so far
+        network.step(2.0)
+    else:
+        network.step(0.05)
+        (network.run_planned if mode == "planned" else network.run_graph)(until=4.0)
+    B.check()
+    count = sum(_expected(c, f, 60)[0] for c, f in zip(conns, fires))
+    total = sum(_expected(c, f, 60)[1] for c, f in zip(conns, fires))
+    assert torch.equal(B.runtime.n_received.cpu().long(), count)
+    assert torch.allclose(B.current.cpu().double(), total, atol=1e-4)
+
+
 def test_tensors_move_to_the_network_device_lazily():
     network, A, B, _, _ = _net(0.5)
     assert A.fire_now.device.type == "cpu"

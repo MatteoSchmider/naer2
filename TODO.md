@@ -46,8 +46,9 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   the runtime raises.
 - **Group-local link targets as `uint8` / `int16`** (group sizes up to 256 / 65536): 2-4x less target memory at
   billions of synapses.
-- **D-1, several homogeneous delays exact** (BRUNEL.md, step 3): a delay-class dimension in the ring, a slot's
-  classes merged by arrival; until then such a population takes the slot's time.
+- **D-1, the delay classes' cost**: a ring per class (memory x classes, every class the longest delay's
+  slots); a slot with side runs (the general pull: timed sources) merges its classes one link at a time
+  (`_merge_classes`), the block merge (`_stage_merged`) reads every class's candidates twice -- both unmeasured.
 - **An event-driven test model**: a network to optimize the general (event-driven) path against -- planning,
   gated windows -- the way PD14 drove the clocked one.
 
@@ -103,8 +104,9 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   2026-11-22, BRUNEL.md) -- the records keep the emission time, in
   emission order; per target the times never step back. One homogeneous
   delay D over every incoming link: exact, e + D. Several homogeneous
-  values: exact once the ring has a delay-class dimension (a cell per
-  group, class and slot, merged by arrival). Per-link delays: every link
+  values: exact too -- a ring per delay class (a cell per group, class
+  and slot), a due slot's classes merged by arrival (ties: the smaller
+  delay first); the delivery log then records arrivals. Per-link delays: every link
   of a slot at the slot's time, its center by default, its end with
   `Population.slot_time = "end"`. A bare n2.spike() in receive fires at
   exactly that time.
