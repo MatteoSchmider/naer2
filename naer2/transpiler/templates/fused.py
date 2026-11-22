@@ -1272,6 +1272,165 @@ def _merge_classes(main_time, main_src, main_lo, main_n, side_time, side_src, si
     return state, received, n_received
 
 
+QLC = gl.constexpr(2048)  # links a segment block loads into LDS at once (_walk_segments)
+QJL = gl.constexpr(32)  # a segment's links taken side by side (its multapses: in layers)
+
+
+@gluon.jit
+def _merge_segments(main_time, rec0, cell0, cur, nmv, dcls, cv, s_arr, m_t, m_src, m_lo, m_n, table, n_cells,
+                    STREAM: gl.constexpr, NUM_WARPS: gl.constexpr, N_SLOTS: gl.constexpr, POOL_B: gl.constexpr, nb,
+                    head, t_cut):
+    """The next STREAM segment records of a population's queues (one a connection: cells cell0 + c) in arrival
+    order, each from its head + cursor, only what arrives before t_cut: the merge of _stage_merged (each queue's
+    next STREAM the candidates, a candidate's rank its place + a binary search into each other queue's), the
+    records placed whole at their rank -- m_t (arrival), m_src, m_lo (first link), m_n (links). Returns (the
+    records taken, each queue's taken count in cv's layout)."""
+    LR: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [NUM_WARPS, 1], [1, 0])
+    LRQ: gl.constexpr = gl.SliceLayout(1, LR)
+    i = gl.arange(0, STREAM, layout=LRQ)
+    col = gl.arange(0, 4, layout=gl.SliceLayout(0, LR))
+    for c in gl.static_range(N_SLOTS):
+        cur_c = gl.sum(gl.where(cv == c, cur + head, 0), axis=0)
+        nm_c = gl.sum(gl.where(cv == c, nmv, 0), axis=0)
+        d_c = gl.sum(gl.where(cv == c, dcls, 0.0), axis=0)
+        q = cur_c + i
+        rec, ok = _run_rec(cell0 + c, q, n_cells, table, N_SLOTS, POOL_B, nb, 0)
+        a = gl.load(main_time + 4 * rec, mask=(q < nm_c) & ok, other=float("inf")) + d_c
+        s_arr.scatter(gl.where(a < t_cut, a, float("inf")), c * STREAM + i, 0)
+    gl.barrier()
+    taken = gl.zeros_like(cur)
+    for c in gl.static_range(N_SLOTS):
+        cur_c = gl.sum(gl.where(cv == c, cur + head, 0), axis=0)
+        nm_c = gl.sum(gl.where(cv == c, nmv, 0), axis=0)
+        d_c = gl.sum(gl.where(cv == c, dcls, 0.0), axis=0)
+        q = cur_c + i
+        rec, ok = _run_rec(cell0 + c, q, n_cells, table, N_SLOTS, POOL_B, nb, 0)
+        qv = (q < nm_c) & ok
+        at = gl.multiple_of(4 * rec, 4)
+        words = gl.load(rec0 + at[:, None] + col[None, :], mask=qv[:, None] & (col[None, :] < 4), other=0)
+        el, st = gl.split(gl.reshape(words, [STREAM, 2, 2]))  # (e, first link), (source word, links)
+        e_i, lo = gl.split(el)
+        srcw, nl = gl.split(st)
+        a = gl.where(qv, gl.convert_layout(e_i, LRQ).to(gl.float32, bitcast=True) + d_c, float("inf"))
+        qv = qv & (a < t_cut)
+        a = gl.where(qv, a, float("inf"))
+        rank = i
+        for c2 in gl.static_range(N_SLOTS):
+            if c2 != c:
+                pos = gl.zeros_like(i)
+                for stp in gl.static_range(12):
+                    if (STREAM >> (stp + 1)) > 0:
+                        probe = pos + (STREAM >> (stp + 1))
+                        v = s_arr.gather(c2 * STREAM + probe - 1, 0)
+                        if c2 < c:
+                            pos = gl.where(v <= a, probe, pos)
+                        else:
+                            pos = gl.where(v < a, probe, pos)
+                v = s_arr.gather(c2 * STREAM + pos, 0)
+                if c2 < c:
+                    pos = gl.where(v <= a, pos + 1, pos)
+                else:
+                    pos = gl.where(v < a, pos + 1, pos)
+                rank = rank + pos
+        take = qv & (rank < STREAM)
+        dst = gl.where(take, rank, STREAM + i)
+        m_t.scatter(a, dst, 0)
+        m_src.scatter(gl.convert_layout(srcw, LRQ), dst, 0)
+        m_lo.scatter(gl.convert_layout(lo, LRQ), dst, 0)
+        m_n.scatter(gl.convert_layout(nl, LRQ), dst, 0)
+        taken = gl.where(cv == c, gl.sum(take.to(gl.int32), axis=0), taken)
+    gl.barrier()
+    return gl.sum(taken, axis=0), taken
+
+
+@gluon.jit
+def _walk_segments(n_take, m_t, m_src, m_lo, m_n, s_off, l_t, l_w, s_hw, s_hh, s_atp, s_ltp, state, received,
+                   n_received, lane, mask, pid, ectx, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr,
+                   STREAM: gl.constexpr, NUM_WARPS: gl.constexpr, COUNT: gl.constexpr, STAGE_W: gl.constexpr):
+    """A merged block's n_take segment records (_merge_segments: in arrival order) delivered: as many records as
+    QLC links hold at a time, their links loaded side by side into LDS (each segment's targets and weights,
+    contiguous in the topology), then the records one after another from there -- a segment's links (its
+    targets distinct, but for multapses: those in layers, in link order) received at once at their target
+    lanes, at the segment's arrival. state, received, n_received: the program's neuron layout (lane)."""
+    LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+    L: gl.constexpr = 32 * NUM_WARPS
+    LJ2: gl.constexpr = gl.BlockedLayout([1, QJL], [32, 1], [NUM_WARPS, 1], [1, 0])
+    rq = gl.arange(0, STREAM, layout=LV)
+    nv = gl.where(rq < n_take, m_n.gather(rq, 0), 0)
+    offv = gl.cumsum(nv, axis=0) - nv
+    s_off.store(offv)
+    gl.barrier()
+    fl = gl.arange(0, L, layout=LV)
+    jj = gl.arange(0, QJL, layout=gl.SliceLayout(1, LJ2))
+    ii = gl.arange(0, QJL, layout=gl.SliceLayout(0, LJ2))
+    jl = gl.arange(0, QJL, layout=LV)
+    one1 = gl.arange(0, 1, layout=LV)
+    r0 = gl.to_tensor(0)
+    while r0 < n_take:
+        # the records whose links fit QLC (at least one)
+        base = gl.sum(gl.where(rq == r0, offv, 0), axis=0)
+        fits = (rq >= r0) & (rq < n_take) & (offv + nv - base <= QLC)
+        r1 = gl.maximum(gl.max(gl.where(fits, rq + 1, 0), axis=0), r0 + 1)
+        n_links = gl.minimum(gl.sum(gl.where((rq >= r0) & (rq < r1), nv, 0), axis=0), QLC)
+        # their links into LDS: link f of the block -- its record by search over the offsets
+        for f0 in range(0, n_links, L):
+            f = f0 + fl
+            m = f < n_links
+            fa = base + f
+            r = gl.zeros_like(f)
+            for st in gl.static_range(12):
+                if (STREAM >> (st + 1)) > 0:
+                    probe = r + (STREAM >> (st + 1))
+                    r = gl.where((probe < n_take) & (s_off.gather(gl.minimum(probe, STREAM - 1), 0) <= fa), probe, r)
+            link = m_lo.gather(r, 0) + (fa - s_off.gather(r, 0))
+            conn = m_src.gather(r, 0) >> 24
+            lt = s_ltp.gather(conn, 0).to(gl.pointer_type(gl.int32))
+            t = _target_in(gl.load(lt + _target_word(link, GROUP_SIZE), mask=m, other=0), link, GROUP_SIZE)
+            if STAGE_W:
+                w = gl.load(s_atp.gather(conn, 0).to(gl.pointer_type(gl.float32)) + link, mask=m, other=0.0)
+            else:
+                w = gl.zeros_like(f).to(gl.float32)
+            l_t.scatter(t, gl.where(m, f, QLC + (f - f0)), 0)
+            l_w.scatter(w, gl.where(m, f, QLC + (f - f0)), 0)
+        gl.barrier()
+        # the records one after another, each segment's links at once
+        for r in range(r0, r1):
+            ri = one1 + r
+            a = gl.sum(m_t.gather(ri, 0), axis=0)
+            srcword = gl.sum(m_src.gather(ri, 0), axis=0)
+            n_r = gl.sum(m_n.gather(ri, 0), axis=0)
+            o_r = gl.sum(s_off.gather(ri, 0), axis=0) - base
+            for j0 in range(0, n_r, QJL):
+                j = j0 + jl
+                m = (j < n_r) & (o_r + j < QLC)
+                t = l_t.gather(gl.where(m, o_r + j, 0), 0)
+                w = l_w.gather(gl.where(m, o_r + j, 0), 0)
+                # a multapse: its links in layers, each its rank among the chunk's links to its target
+                t2 = gl.convert_layout(t, gl.SliceLayout(1, LJ2))
+                ti = gl.convert_layout(t, gl.SliceLayout(0, LJ2))
+                mi = gl.convert_layout(m, gl.SliceLayout(0, LJ2))
+                dup = (ti[None, :] == t2[:, None]) & (ii[None, :] < jj[:, None]) & mi[None, :]
+                rank = gl.convert_layout(gl.sum(dup.to(gl.int32), axis=1), LV)
+                n_layers = gl.max(gl.where(m, rank, -1), axis=0) + 1
+                for layer in range(0, n_layers):
+                    sel = m & (rank == layer)
+                    dst = gl.where(sel, t, GROUP_SIZE + j)
+                    s_hw.scatter(w, dst, 0)
+                    s_hh.scatter(sel.to(gl.int32), dst, 0)
+                    gl.barrier()
+                    hit = (s_hh.gather(lane, 0) > 0) & mask
+                    hw = s_hw.gather(lane, 0)
+                    state = RECEIVE(state, hit, a, hw, srcword, ectx, pid * GROUP_SIZE + lane)
+                    if COUNT:  # dev: the stand-in's bookkeeping (tests)
+                        received = gl.where(hit, received + hw, received)
+                        n_received = n_received + hit.to(gl.int32)
+                    gl.barrier()
+                    s_hh.scatter(gl.zeros_like(t), dst, 0)
+        gl.barrier()
+        r0 = r1
+    return state, received, n_received
+
+
 @gluon.jit
 def _shift_table(table, cell, nb, freed, held, LV: gl.constexpr, NUM_WARPS: gl.constexpr):
     """A queue's block table moved down by its freed blocks: entries freed .. held to 0 .. held - freed (the
@@ -1784,9 +1943,10 @@ def _qappend(n_w, s_se, s_sn, c, cell, n_cells, tail, held, tp, lack, pid, rec0,
              dir_offs, dir_first, dir_words, dwords_r, lt32, LV: gl.constexpr, NUM_WARPS: gl.constexpr,
              GROUP_SIZE: gl.constexpr, N_SLOTS: gl.constexpr, POOL_B: gl.constexpr, chk, when,
              ARENA_CHECK: gl.constexpr):
-    """A merged window's n_w spikes (s_se, s_sn: in (e, node) order), a tile at a time: each spike's links into
-    the group appended to the connection's queue (cell) in that order -- positions by a scan, the queue's new
-    blocks off the group's free stack (tp; none left: lack). Returns (tail, held, tp, lack)."""
+    """A merged window's n_w spikes (s_se, s_sn: in (e, node) order), a tile at a time: each spike's segment into
+    the group (its links there: one delay, one segment) appended to the connection's queue (cell) in that
+    order as one record -- positions by a scan, the queue's new blocks off the group's free stack (tp; none
+    left: lack). Returns (tail, held, tp, lack)."""
     L: gl.constexpr = 32 * NUM_WARPS
     lane = gl.arange(0, L, layout=LV)
     for u0 in range(0, n_w, L):
@@ -1798,8 +1958,11 @@ def _qappend(n_w, s_se, s_sn, c, cell, n_cells, tail, held, tp, lack, pid, rec0,
         has = m & (b > a)  # (one delay: one segment a spike and group)
         lo_l = gl.load(seg_start + a, mask=has, other=0)
         n_l = gl.where(has, gl.load(seg_start + a + 1, mask=has, other=0) - lo_l, 0)
-        base = tail + gl.cumsum(n_l, axis=0) - n_l
-        tail = tail + gl.sum(n_l, axis=0)
+        # one record per spike's segment into the group: (e, source word, its first link, its links) --
+        # delivery expands it (_walk_segments)
+        one = has.to(gl.int32)
+        pos = tail + gl.cumsum(one, axis=0) - one
+        tail = tail + gl.sum(one, axis=0)
         need = (tail + POOL_B - 1) // POOL_B
         while held < need:  # the queue's new blocks, off the group's free stack
             if (tp > 0) & (held < nb):
@@ -1813,15 +1976,9 @@ def _qappend(n_w, s_se, s_sn, c, cell, n_cells, tail, held, tp, lack, pid, rec0,
                 lack = lack + 1
             held = held + 1
         gl.barrier()  # (the table's new entries before this tile's reads)
-        srcw = (c << 24) | s
-        for j in range(0, gl.max(n_l, axis=0)):
-            w = has & (j < n_l)
-            pos = base + j
-            l = lo_l + j
-            tgt = _target_in(gl.load(lt32 + _target_word(l, GROUP_SIZE), mask=w, other=0), l, GROUP_SIZE)
-            blk = gl.load(table + cell * nb + pos // POOL_B, mask=w, other=0)
-            rec, ok = _blk_rec(cell, pos, n_cells, blk, N_SLOTS, POOL_B, nb)
-            _store_records(rec0, 4 * rec, e, srcw, l, tgt, w & ok & (lack == 0), NUM_WARPS)
+        blk = gl.load(table + cell * nb + pos // POOL_B, mask=has, other=0)
+        rec, ok = _blk_rec(cell, pos, n_cells, blk, N_SLOTS, POOL_B, nb)
+        _store_records(rec0, 4 * rec, e, (c << 24) | s, lo_l, n_l, has & ok & (lack == 0), NUM_WARPS)
     return tail, held, tp, lack
 
 
@@ -1935,6 +2092,8 @@ def _pull_queues(pid, n_groups, plan, n_conns, ring, oflags, ctl, round_id, pari
                          gl.minimum(gl.load(cnt_p + gv, mask=gvalid & (G_r > 0), other=0), R_r))
         n_run = gl.sum(cnt_g, axis=0)
         total += n_run
+        if TRACE >= 2:
+            n_ev = mark(trace, n_ev, 10, pin_s(n_run), TRACE_CAP)  # ("runs": a source run's spikes)
         # 1. its time histogram
         hist.store(gl.zeros_like(bq))
         s_cp.store(gl.cumsum(cnt_g, axis=0) - cnt_g)
@@ -1947,6 +2106,8 @@ def _pull_queues(pid, n_groups, plan, n_conns, ring, oflags, ctl, round_id, pari
             hist.atomic_scatter_add(m.to(gl.int32), _qbin(gl.where(m, e, lo), lo, inv), 0)
         gl.barrier()
         hv = hist.load(LV)
+        if TRACE >= 2:
+            n_ev = mark(trace, n_ev, 11, pin_s(gl.max(hv, axis=0)), TRACE_CAP)  # ("spikes": its histogram)
         cid = (gl.cumsum(hv, axis=0) - hv) // (QCH // 2)  # (each bin's chunk: a chunk at most QCH / 2 + a bin)
         n_ch = gl.max(gl.where(hv > 0, cid, -1), axis=0) + 1
         st_g = gl.zeros_like(gv)
@@ -1987,12 +2148,16 @@ def _pull_queues(pid, n_groups, plan, n_conns, ring, oflags, ctl, round_id, pari
                     s_se.scatter(ei, dst, 0)
                     s_sn.scatter(ni, dst, 0)
                 gl.barrier()
+                if TRACE >= 2:
+                    n_ev = mark(trace, n_ev, 12, n_k, TRACE_CAP)  # ("found": a chunk merged)
                 # 4. in that order: appended
                 tail, held, tp, lack = _qappend(n_k, s_se, s_sn, c, cell, n_cells, tail, held, tp, lack, pid, rec0,
                                                 table, stack, nb, seg_start, dir_offs, dir_first, dir_words, dwords_r,
                                                 lt32, LV, NUM_WARPS, GROUP_SIZE, N_SLOTS, POOL_B, chk, round_id,
                                                 ARENA_CHECK)
                 gl.barrier()
+                if TRACE >= 2:
+                    n_ev = mark(trace, n_ev, 13, pin_s(tail), TRACE_CAP)  # ("appended": the chunk's links)
             else:
                 # a chunk past QCH (a burst in one time bin, equal times): each spike's rank by merge path -- its
                 # place in its region's range + the spikes of every other region's before it (each sorted) --,
@@ -2138,27 +2303,43 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         tp = gl.to_tensor(0)
         lost_v = gl.to_tensor(0)
     if QUEUES:
-        # the queues merged by arrival, a stream block at a time, until nothing more arrives before t_cut
+        # the queues' segment records merged by arrival, a block at a time, until nothing more arrives before
+        # t_cut; each block's segments walked (_walk_segments) in the program's neuron layout
         cellv = pid * N_SLOTS + cv
         cvm = cv < N_SLOTS
         tails = gl.load(main_count + cellv, mask=cvm, other=0)
         heads = gl.load(side_count + cellv, mask=cvm, other=0)  # (a queue's head: its side count, Ring)
+        m_lo = gl.allocate_shared_memory(gl.int32, [2 * STREAM], SM)
+        s_off = gl.allocate_shared_memory(gl.int32, [STREAM], SM)
+        l_t = gl.allocate_shared_memory(gl.int32, [2 * QLC], SM)
+        l_w = gl.allocate_shared_memory(gl.float32, [2 * QLC], SM)
+        s_hw = gl.allocate_shared_memory(gl.float32, [2 * GROUP_SIZE], SM)
+        s_hh = gl.allocate_shared_memory(gl.int32, [2 * GROUP_SIZE], SM)
+        s_hh.store(gl.zeros([2 * GROUP_SIZE], gl.int32, layout=LV))
+        s_ltp = _table(gl.load(_link_target_addr + cq, mask=cq < n_conns, other=0), SM)
+        qstate = _state_from_rows(state, GROUP_SIZE, LN)
+        qrec = _from_rows(received, GROUP_SIZE, LN)
+        qnrec = _from_rows(n_received, GROUP_SIZE, LN)
+        gl.barrier()
         cur = gl.zeros_like(cv)
         more = gl.to_tensor(1)
         while more > 0:
-            nq, n_w, n_max, taken = _stage_merged(
-                main_time, main_src - 1, pid * N_SLOTS, cur, tails, dcls, cv, s_atp, s_arr, m_tgt, m_w, m_src, m_t,
-                f_tgt, f_w, f_src, f_e, table, n_cells, LW, STREAM, U, NUM_WARPS, GROUP_SIZE, LOG, STAGE_E, N_SLOTS,
-                POOL_B, nb, STAGE_W, N_SLOTS, heads, t_cut, 0)
+            nq, taken = _merge_segments(main_time, main_src - 1, pid * N_SLOTS, cur, tails, dcls, cv, s_arr, m_t,
+                                        m_src, m_lo, m_tgt, table, n_cells, STREAM, NUM_WARPS, N_SLOTS, POOL_B, nb,
+                                        heads, t_cut)
             cur = cur + taken
             more = nq
             if TRACE:
                 n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
-            state, received, n_received = _walk(
-                r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k_lo, pid, log_ptr,
-                log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, 0.0, 1.0, ectx,
-                node2)  # (f_e: the arrival itself)
+            qstate, qrec, qnrec = _walk_segments(nq, m_t, m_src, m_lo, m_tgt, s_off, l_t, l_w, s_hw, s_hh, s_atp,
+                                                 s_ltp, qstate, qrec, qnrec, lane, mask, pid, ectx, RECEIVE,
+                                                 GROUP_SIZE, STREAM, NUM_WARPS, COUNT, STAGE_W)
+            if TRACE:
+                n_ev = mark(trace, n_ev, 6, nq, TRACE_CAP)
             gl.barrier()
+        state = _state_to_rows(qstate, NUM_WARPS, GROUP_SIZE, LWN)
+        received = _to_rows(qrec, NUM_WARPS, GROUP_SIZE, LWN)
+        n_received = _to_rows(qnrec, NUM_WARPS, GROUP_SIZE, LWN)
         # each queue: its head on, its passed blocks back on the free stack, its table shifted down
         for c in gl.static_range(N_SLOTS):
             cell = pid * N_SLOTS + c
@@ -2345,20 +2526,35 @@ def _emit_delivered(fire, t, nodes, ectx):
     fire (the walk: a row per warp, each its own target lane; a merge: the one lane), so per row one masked
     atomic, none where nothing fires. nodes: the lanes' neurons; t: the spike time (broadcast to fire)."""
     p_count, h_count, h_min, h_node, h_time, h_overflow, hist_cap = ectx
-    AX: gl.constexpr = len(fire.shape) - 1
-    tt = t + gl.zeros_like(fire.to(gl.float32))
-    n = gl.sum(fire.to(gl.int32), axis=AX)
-    node = gl.sum(gl.where(fire, nodes, 0), axis=AX)
-    tm = gl.sum(gl.where(fire, tt, 0.0), axis=AX)
-    m = n > 0
-    zero = n * 0  # (n: a row per warp, or a scalar -- zeros_like takes no scalar)
-    pos = gl.atomic_add(p_count + zero, 1, mask=m)  # (GAP, SPIKES.md: the warps' order within the region)
-    gl.atomic_add(h_count + zero, 1, mask=m)
-    put = m & (pos < hist_cap)
-    gl.store(h_node + pos, node, mask=put)
-    gl.store(h_time + pos, tm, mask=put)
-    gl.atomic_min(h_min + zero, tm, mask=put)
-    gl.atomic_max(h_overflow + zero, 1, mask=m & (pos >= hist_cap))
+    if len(fire.shape) == 1:  # (the program's neurons: any number of lanes -- a segment's targets, _walk_segments)
+        # (each firing lane its place by an atomic -- the region is ordered at the run's end, _sort_region)
+        f = fire.to(gl.int32)
+        n1 = gl.sum(f, axis=0)
+        if n1 > 0:
+            zero1 = gl.zeros_like(f)
+            pos1 = gl.atomic_add(p_count + zero1, 1, mask=fire)
+            gl.atomic_add(h_count, n1)
+            put1 = fire & (pos1 < hist_cap)
+            tt1 = t + gl.zeros_like(f.to(gl.float32))
+            gl.store(h_node + pos1, nodes, mask=put1)
+            gl.store(h_time + pos1, tt1, mask=put1)
+            gl.atomic_min(h_min, gl.min(gl.where(put1, tt1, float("inf")), axis=0))
+            gl.atomic_max(h_overflow + zero1, 1, mask=fire & (pos1 >= hist_cap))
+    else:
+        AX: gl.constexpr = len(fire.shape) - 1
+        tt = t + gl.zeros_like(fire.to(gl.float32))
+        n = gl.sum(fire.to(gl.int32), axis=AX)
+        node = gl.sum(gl.where(fire, nodes, 0), axis=AX)
+        tm = gl.sum(gl.where(fire, tt, 0.0), axis=AX)
+        m = n > 0
+        zero = n * 0  # (n: a row per warp, or a scalar -- zeros_like takes no scalar)
+        pos = gl.atomic_add(p_count + zero, 1, mask=m)  # (GAP, SPIKES.md: the warps' order within the region)
+        gl.atomic_add(h_count + zero, 1, mask=m)
+        put = m & (pos < hist_cap)
+        gl.store(h_node + pos, node, mask=put)
+        gl.store(h_time + pos, tm, mask=put)
+        gl.atomic_min(h_min + zero, tm, mask=put)
+        gl.atomic_max(h_overflow + zero, 1, mask=m & (pos >= hist_cap))
 
 
 @gluon.jit
