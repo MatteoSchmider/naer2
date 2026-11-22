@@ -179,7 +179,7 @@ def test_a_receive_reading_no_edge_attr_loads_none():
     conn.delay = 0.5
     fires = torch.rand(40, generator=torch.Generator().manual_seed(1)) < 0.4
     A.fire_now = fires.float()
-    assert "ARENA_CHECK, False)" in B.fused_kernel().source  # (the delivery: no per-link attr staged)
+    assert "ARENA_CHECK, False, T_A" in B.fused_kernel().source  # (the delivery: no per-link attr staged)
     A.network.step(2.0)
     offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
     count = torch.zeros(60)

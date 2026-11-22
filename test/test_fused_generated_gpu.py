@@ -256,28 +256,33 @@ def _fires(n, seed):
     return torch.rand(n, generator=torch.Generator().manual_seed(seed)) < 0.3
 
 
-def _deliver_once(dst_pop, sources, attrs=None):
-    """sources: [(connection, fire mask)]: each source population (a stand-in
-    runtime, test/runtimes.py) fires its mask in round 0; the generated consumer runs rounds
-    0..2 (the spikes arrive in round 2); attrs: the per-link attrs the
-    topologies carry (default: the one the kernel stages). Returns
-    (consumer, topologies)."""
+def _deliver_once(dst_pop, sources, attrs=None, delay=0.2):
+    """sources: [(connection, fire mask or fire times)]: each source population (a stand-in
+    runtime, test/runtimes.py) fires in round 0 -- a mask at the round's start (1.0), or its
+    times (inf: silent); the generated consumer runs rounds 0..2 (the spikes arrive in round 2
+    at the default delay); attrs: the per-link attrs the topologies carry (default: the one the
+    kernel stages); delay: every connection's (a number, or per link). Returns (consumer,
+    topologies)."""
+    for conn, _ in sources:  # (the delays first: the kernel's delivery time follows from them, D-1)
+        conn.delay = delay
     gk = FusedKernelTemplate(dst_pop).build()
     n = len(dst_pop.shape)
     gen = _runtime(gk, dst_pop)
-    srcs = [commanded_runtime(len(conn._source.shape), group_size=G, device=DEVICE) for conn, _ in sources]
+    srcs = [commanded_runtime(len(conn._source.shape), uniform=fires.dtype == torch.bool, group_size=G, device=DEVICE)
+            for conn, fires in sources]  # (fire times: emission at them)
     if attrs is None:
         attrs = [gk.edge_attr] if gk.edge_attr is not None else []
     topos = []
     for conn, _ in sources:
-        conn.delay = 0.2
-        topos.append(conn.fabric.simulation(n, G, DEVICE, attrs=list(attrs)))
+        res = dst_pop._slot_width() if isinstance(delay, torch.Tensor) else None  # (per link: quantized at it)
+        topos.append(conn.fabric.simulation(n, G, DEVICE, resolution=res, attrs=list(attrs)))
     gen.connect(srcs, topos, n_slots=8, main_cap=8192)
     for r in range(3):
         t = round(1.0 + 0.1 * r, 6)
         gen.run(t, t + 0.1, round_id=r)
         for src, (_, fires) in zip(srcs, sources):
-            command(src, t, t + 0.1, torch.where(fires, t, math.inf) if r == 0 else None, round_id=r)
+            times = torch.where(fires, t, math.inf) if fires.dtype == torch.bool else fires
+            command(src, t, t + 0.1, times if r == 0 else None, round_id=r)
     gen.check()
     return gen, topos
 
@@ -354,19 +359,115 @@ def test_gap_source_attrs():
     assert torch.allclose(gen.state["acc"].cpu(), want, atol=1e-3)
 
 
-def test_gap_receive_time_is_the_arrival():
-    """TODO.md, D-1: receive's time is its link's arrival, e + its bucket's
-    mean delay (the record carries it) -- not the emission time e."""
+def test_receive_time_one_homogeneous_delay_is_exact():
+    """D-1 (BRUNEL.md): one homogeneous delay D over every incoming link -- receive's time is the arrival,
+    e + D exactly (emission order is arrival order). The sources fire at random times in [1.0, 1.1): every
+    target's last input is its latest arrival."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _arrival_recorder() * 300
     conn = src >> PD14_connection(0.1) >> dst
     fires = _fires(200, 7)
-    gen, _ = _deliver_once(dst, [(conn, fires)])
+    e = (1.0 + 0.1 * torch.rand(200, generator=torch.Generator().manual_seed(17))).float()
+    e = torch.where(fires, e, math.inf)
+    gen, _ = _deliver_once(dst, [(conn, e)], delay=0.15)
+    assert FusedKernelTemplate(dst).build().consts == dict(T_A=1.0, T_C=0.0, T_B=0.15)
+    arrival = e + torch.tensor(0.15, dtype=torch.float32)  # (fp32, as the kernel adds)
+    offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
+    want = torch.full((300,), -1.0)
+    for s in fires.nonzero().flatten().tolist():
+        idx = tgt[offs[s]:offs[s + 1]]
+        want[idx] = torch.maximum(want[idx], arrival[s].expand(len(idx)))
+    got = gen.state["last_input"].cpu()
+    assert int((want > 0).sum()) > 250  # (most targets reached: ~6 inputs each)
+    assert torch.equal(got, want), (got[:5], want[:5])
+
+
+def _per_link_delays(conn, lo, hi, seed):
+    g = torch.Generator().manual_seed(seed)
+    return lo + (hi - lo) * torch.rand(conn.shape, generator=g)
+
+
+@pytest.mark.parametrize("slot_time", ["center", "end"])
+def test_receive_time_per_link_delays_is_the_slot_s(slot_time):
+    """D-1: per-link delays -- every link of a slot delivered at the slot's time, its center (the default) or
+    its end (Population.slot_time). Fired at 1.0 with delays in [0.21, 0.29), every link lands in slot 12
+    ([1.2, 1.3) at a 0.1 slot width): its time 1.25, or 1.3."""
+    src, dst = PD14_neuron(K_cortical=2000) * 200, _arrival_recorder() * 300
+    conn = src >> PD14_connection(0.1) >> dst
+    dst.delay_resolution = 0.1
+    if slot_time != "center":
+        dst.slot_time = slot_time
+    fires = _fires(200, 9)
+    gen, _ = _deliver_once(dst, [(conn, fires)], delay=_per_link_delays(conn, 0.21, 0.29, 9))
+    w = torch.tensor(0.1, dtype=torch.float32)
+    tk = torch.tensor(12.0) * w + (0.5 if slot_time == "center" else 1.0) * w  # (fp32, as the kernel)
     reached = _expected(conn, fires, 300, torch.ones(len(conn.fabric.topology))) > 0
-    arrival = (torch.tensor(1.0, dtype=torch.float32) + torch.tensor(0.2, dtype=torch.float32)).item()
     got = gen.state["last_input"].cpu()
     assert reached.any()
-    assert torch.all(got[reached] == arrival), (got[reached][:5], arrival)
+    assert torch.all(got[reached] == tk), (got[reached][:5], tk)
     assert torch.all(got[~reached] == -1.0)
+
+
+@n2.node
+class _order_checker:
+    """Counts the inputs whose time steps back from the one before (D-1: never)."""
+
+    def __init__(self):
+        self.last_input: float = -1.0
+        self.back: float = 0.0
+        self.n: float = 0.0
+
+    def update(self, time: n2.time):
+        pass
+
+    def send(self, time: n2.time):
+        pass
+
+    def receive(self, time: n2.time, edge: n2.receives.edge, source: n2.receives.source):
+        if time < self.last_input:
+            self.back += 1.0
+        self.last_input = time
+        self.n += 1.0
+
+
+def _run_spread(dst, conns, delay, rounds=8):
+    """Every source fires once per round at a random time in it; the consumer runs `rounds` rounds."""
+    for conn in conns:
+        conn.delay = delay(conn) if callable(delay) else delay
+    gk = FusedKernelTemplate(dst).build()
+    n = len(dst.shape)
+    gen = _runtime(gk, dst)
+    sizes = [len(c._source.shape) for c in conns]
+    srcs = [commanded_runtime(k, uniform=False, group_size=G, device=DEVICE) for k in sizes]
+    res = dst._slot_width() if callable(delay) else None  # (per-link delays: quantized at the slot width)
+    topos = [c.fabric.simulation(n, G, DEVICE, resolution=res, attrs=[]) for c in conns]
+    gen.connect(srcs, topos, n_slots=8, main_cap=8192)
+    g = torch.Generator().manual_seed(23)
+    for r in range(rounds):
+        t = round(1.0 + 0.1 * r, 6)
+        gen.run(t, t + 0.1, round_id=r)
+        for src, k in zip(srcs, sizes):
+            times = torch.where(torch.rand(k, generator=g) < 0.3, t + 0.1 * torch.rand(k, generator=g), math.inf)
+            command(src, t, t + 0.1, times if r < rounds - 3 else None, round_id=r)
+    gen.check()
+    return gen
+
+
+@pytest.mark.parametrize("mode", ["homogeneous", "per_link"])
+def test_receive_times_never_step_back(mode):
+    """D-1: per target, receive's times are non-decreasing -- one homogeneous delay (exact arrivals, in
+    emission order) and per-link delays spanning slots (the slot times) alike; two connections, sources
+    firing at random times over several rounds."""
+    a, b = PD14_neuron(K_cortical=2000) * 200, PD14_neuron(K_cortical=2000) * 150
+    dst = _order_checker() * 300
+    ca, cb = a >> PD14_connection(0.1) >> dst, b >> PD14_connection(0.1) >> dst
+    if mode == "per_link":
+        dst.delay_resolution = 0.1
+        delay = lambda c: _per_link_delays(c, 0.1, 0.4, len(c._source.shape))
+    else:
+        delay = 0.15
+    gen = _run_spread(dst, [ca, cb], delay)
+    assert float(gen.state["n"].sum()) > 1000
+    assert float(gen.state["back"].sum()) == 0.0
 
 
 @n2.edge

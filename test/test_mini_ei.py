@@ -69,7 +69,9 @@ def test_signature_attr_pointers_then_fixed_args_then_constexprs(kernel_E, src_E
     attrs = [f"{a}_ptr" for a in kernel_E.attrs]
     assert sorted(kernel_E.attrs) == ["current", "last_time", "potential", "t_ref_end"]
     assert args == attrs + list(FIXED_ARGS) + list(CONSTEXPRS)
-    assert kernel_E.consts == {}, "PD14_neuron's static attrs are inlined as literals, not constexprs"
+    # PD14_neuron's static attrs are inlined as literals, not constexprs -- the kernel's own are receive's time
+    # map alone (D-1: the template's T_A, T_C, T_B)
+    assert set(kernel_E.consts) == {"T_A", "T_C", "T_B"}
     assert "-63.2438" in src_E  # V_rest at K_cortical 125
 
 

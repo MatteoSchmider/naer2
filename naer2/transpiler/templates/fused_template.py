@@ -22,7 +22,8 @@ when every site is bare. Not supported yet (NotImplementedError, each with
 its decision): n2.spike() inside delivery (D-3: needs the emission buffer),
 connections with different receive code (D-6), more than one per-link attr
 (D-7), edge forward hooks (HOOK(forward)), source.x (D-10), edge backward
-(D-11). Receive's time is still each record's e, not the arrival (D-1).
+(D-11). Receive's time follows the incoming delays (D-1, BRUNEL.md): the
+constexprs T_A, T_C, T_B (Population._delivery_time).
 """
 
 import ast
@@ -51,7 +52,7 @@ FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "ct
               "trace_ptr", "seed", "check_ptr")
 CONSTEXPRS = ("GROUP_SIZE", "K", "SK", "KP", "UNIFORM_SOURCES", "N_SLOTS", "LOG", "STREAM",
               "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "COUNT", "BATCH", "NSP", "TRACE",
-              "TRACE_CAP", "POOL_B", "ARENA_CHECK")
+              "TRACE_CAP", "POOL_B", "ARENA_CHECK", "T_A", "T_C", "T_B")
 DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "n_status", "sched_i", "log_cap", "hist_cap", "seed")
 
 
@@ -203,8 +204,11 @@ class FusedKernelTemplate:
         source = self._module_source(attrs, state_attrs, later, recv_src, final, sites.sites, stage_e,
                                      stage_w=edge_attr is not None)
         kernel = _load(source, f"naer2_fused_{type(pop.instance).__name__}_{id(pop)}")
+        # receive's time (D-1): its map from a record's emission time and slot, by the incoming delays
+        t_a, t_c, t_b = pop._delivery_time()
         return FusedKernel(source, kernel, attrs, state_attrs, edge_attr,
-                           uniform_emission=all(sites.sites), stage_e=stage_e)
+                           uniform_emission=all(sites.sites), stage_e=stage_e,
+                           consts=dict(T_A=float(t_a), T_C=float(t_c), T_B=float(t_b)))
 
     @staticmethod
     def _receive_source(state_attrs, body, edge_attr, hook) -> str:
@@ -251,7 +255,7 @@ if ok:
     state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                            n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive, GROUP_SIZE, N_SLOTS,
                            STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
-                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, {stage_w})
+                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, {stage_w}, T_A, T_C, T_B)
 {unpack}
     t = t_end
     time = t_end

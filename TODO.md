@@ -46,8 +46,8 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   the runtime raises.
 - **Group-local link targets as `uint8` / `int16`** (group sizes up to 256 / 65536): 2-4x less target memory at
   billions of synapses.
-- **D-1: receive's `time` is the link's arrival**, e + its bucket's mean delay (`test_gap_receive_time_is_the_arrival`):
-  the pull knows the mean when it appends, so the record's time word carries the arrival.
+- **D-1, several homogeneous delays exact** (BRUNEL.md, step 3): a delay-class dimension in the ring, a slot's
+  classes merged by arrival; until then such a population takes the slot's time.
 - **An event-driven test model**: a network to optimize the general (event-driven) path against -- planning,
   gated windows -- the way PD14 drove the clocked one.
 
@@ -99,14 +99,15 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
 
 ## Decisions (D-n, judged together 2026-11-14; referenced from the code)
 
-- **D-1 receive's `time` is the link's arrival, e + its bucket's mean
-  delay** (a gap today: it is e) -- NEST-like quantized behaviour is still
-  one line in the node's send. The pull knows the mean when it appends, so
-  the record's time word carries the arrival. *Limitation:* a slot's
-  records are in emission order, not arrival order, so links of different
-  buckets in one slot can reach a target out of arrival order by less than
-  one slot width (a receive-side integrator dropping dt < 0 sees time step
-  back).
+- **D-1 receive's `time` by the population's incoming delays** (revised
+  2026-11-22, BRUNEL.md) -- the records keep the emission time, in
+  emission order; per target the times never step back. One homogeneous
+  delay D over every incoming link: exact, e + D. Several homogeneous
+  values: exact once the ring has a delay-class dimension (a cell per
+  group, class and slot, merged by arrival). Per-link delays: every link
+  of a slot at the slot's time, its center by default, its end with
+  `Population.slot_time = "end"`. A bare n2.spike() in receive fires at
+  exactly that time.
 - **D-2 send runs after every delivery** (rooted at the target lane) and
   once more after update -- only where the delivery can change send's
   outcome: the connection's receive writes a node attr send reads

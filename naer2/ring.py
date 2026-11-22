@@ -43,8 +43,8 @@ import triton.language as tl
 # One ring per consumer population; n_slots covers its longest incoming delay (+ emission
 #   delay) at one slot width -- the finest resolution any of its incoming connections requires (D-12; the
 #   coarser connections could be optimized later); capacities per population, below
-# GAP (D-1): a record's time word carries the link's arrival, e + its bucket's mean delay, once
-#   the pull writes it
+# A record's time word is its emission time e; delivery computes receive's time from it and the slot
+#   (D-1, BRUNEL.md: e + D for one homogeneous delay, else the slot's center or end)
 # Run capacities: these defaults, per population (Population.main_cap / side_cap), each doubling after an
 # overflow (PopulationRuntime._grow_if_full; a burst like PD14's 902-spike thalamic volley lands in every slot of
 # its delay range at once).

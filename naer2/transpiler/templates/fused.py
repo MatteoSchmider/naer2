@@ -808,9 +808,13 @@ def _run_status(status, ring, pid, run_id, finished, chk, ARENA_CHECK: gl.conste
 # ------------------------------------------------- delivery helpers
 
 
+# receive's time (D-1, BRUNEL.md): T_A e + T_C k + T_B for a record emitted at e delivered from slot k -- by the
+# population's incoming delays: one homogeneous delay D (1, 0, D: exact, e + D -- emission order is arrival order);
+# any per-link delays (0, w, w / 2 or w: the slot's center or end -- every link of a slot at one time, so the
+# times a target sees never step back); (1, 0, 0) the emission time itself (the reference kernels)
 @gluon.jit
 def _deliver_link(state, t, w, srcword, e, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
-                  RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr):
+                  RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, rtime):
     """ONE link: t its target within the group (uniform over the program,
     -1 for none), w its weight, e its time word. Every lane compares
     against t and the target lane runs the receive. A multapse's weights
@@ -818,15 +822,15 @@ def _deliver_link(state, t, w, srcword, e, received, n_received, lane, mask, k, 
     hit = (lane == t) & mask
     # RECEIVE(state, hit, time, w, srcword) -> state is the transpiled receive, rooted at
     #   `hit` (MaskAliasTransformer's is_target: the one target lane); state: the node attrs it touches, as a
-    #   tuple; edge.x -> the link's staged value of x (here w); time = the link's arrival, e + its bucket's mean
-    #   delay (D-1); the code chosen by the link's receive variant, a scalar (warp-uniform) branch on its
+    #   tuple; edge.x -> the link's staged value of x (here w); time = rtime (D-1: the arrival e + D, or the
+    #   slot's time -- see above); the code chosen by the link's receive variant, a scalar (warp-uniform) branch on its
     #   connection id (D-6)
     # send runs here too, after every delivery, rooted at `hit` (D-2) -- and once more after
     #   update; only for connections whose receive writes a node attr send reads (fused_template's
     #   per-delivery send: PD14_neuron has none). GAP (D-3): its n2.spike() (and receive's) can fire any number of times
     #   per neuron and run (D-3): each spike appended to the program's emission buffer, its time the expression's
     # GAP (D-10): source.x is unsupported for now
-    state = RECEIVE(state, hit, e, w, srcword)
+    state = RECEIVE(state, hit, rtime, w, srcword)  # (rtime: the delivery time, _delivery_time; e: the emission)
     if COUNT:  # dev: the stand-in's bookkeeping (tests)
         received = gl.where(hit, received + w, received)
         n_received = n_received + hit.to(gl.int32)
@@ -854,15 +858,15 @@ def _pin_first(state):
 @gluon.jit
 def _walk(r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr, log_e,
           log_cap, LW: gl.constexpr, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, U: gl.constexpr,
-          NUM_WARPS: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, STAGE_E: gl.constexpr):
+          NUM_WARPS: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, STAGE_E: gl.constexpr, tk,
+          T_A: gl.constexpr):
     """The staged stream block (_stage_records): every warp its own list, the links to its own neurons in
     link order, U of them a broadcast LDS read ([NUM_WARPS, U]: each warp its row), received one by one by
     their target lanes. state, received, n_received: [NUM_WARPS, GROUP_SIZE // NUM_WARPS], a row per warp
     (_to_rows); n_w: each warp's links [NUM_WARPS] (LW), n_max the most; a list past its links: masked."""
     # GAP (D-7): one broadcast LDS read and one register select per staged attr slot (here: w);
     #   up to the most attrs any variant's receive reads (D-7)
-    # GAP (D-6, D-1): per link, its variant from srcword >> 24 (D-6) and its arrival time (D-1) are
-    #   selected alongside -- a variant is the same for all links of one source spike through one connection,
+    # GAP (D-6): per link, its variant from srcword >> 24 is selected alongside -- a variant is the same for all links of one source spike through one connection,
     #   but links of different spikes and connections interleave here, so the choice is made per link
     L3: gl.constexpr = gl.BlockedLayout([1, U], [1, 32], [NUM_WARPS, 1], [1, 0])  # a warp's row whole per thread
     SM2: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
@@ -890,7 +894,7 @@ def _walk(r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2
             hit = (lane2 == t[:, None]) & mask2 & live[:, None]
             # RECEIVE(state, hit, time, w, srcword) -> state: the transpiled receive (_deliver_link), rooted at
             #   `hit`, each warp's one target lane -- elementwise, every warp's link's values along its row
-            state = RECEIVE(state, hit, e[:, None], w[:, None], srcword)
+            state = RECEIVE(state, hit, (e * T_A + tk)[:, None], w[:, None], srcword)  # (the delivery time)
             if COUNT:  # dev: the stand-in's bookkeeping (tests)
                 received = gl.where(hit, received + w[:, None], received)
                 n_received = n_received + hit.to(gl.int32)
@@ -977,7 +981,7 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e, t
     #   at qv -- the old template's lane_mask="_lk_valid"), its assigned attrs stored back at l before staging,
     #   so receive sees the updated values as in the no-delay template. The variant differs per LANE here
     #   (unlike in the walk): each variant present in the block runs masked to its lanes (D-6); time = the
-    #   link's arrival (D-1)
+    #   delivery time (D-1, as in _walk)
     # LIMITATION (D-8): one link twice in one stream block (its
     #   source spiking in two runs taken in together) is read by both lanes before either stores: the later
     #   lane works on a stale value, and the last store wins, overwriting the changes of every forward call on
@@ -1012,13 +1016,13 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e, t
 def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
                  attr_addr, state, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap, table, side_table,
                  RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr,
-                 N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr, nb):
+                 N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr, nb, tk, T_A: gl.constexpr):
     """A slot with side entries: its main and side runs of link records
     merged by emission time with two cursors (main first on ties), each
     link received in order."""
-    # GAP (forward, D-1): as in _stage_records and _walk, one link at a
+    # GAP (forward): as in _stage_records and _walk, one link at a
     #   time (forward strictly sequential here: no D-8 limitation); the main/side merge by the records' time
-    #   word -- the arrival once the record carries it (D-1)
+    #   word, the emission time (receive's time computed from it, D-1)
     im = gl.to_tensor(0)
     js = gl.to_tensor(0)
     for _ in range(nm + ns):
@@ -1043,7 +1047,7 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
         w = gl.load(gl.load(attr_addr + (srcword >> 24)).to(gl.pointer_type(gl.float32)) + l)
         state, received, n_received = _deliver_link(
             state, t, w, srcword, e, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
-            RECEIVE, GROUP_SIZE, LOG, COUNT)
+            RECEIVE, GROUP_SIZE, LOG, COUNT, e * T_A + tk)
     return state, received, n_received
 
 
@@ -1437,7 +1441,8 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
              STREAM: gl.constexpr, U: gl.constexpr,
              SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG: gl.constexpr,
              COUNT: gl.constexpr, STAGE_E: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
-             POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr, STAGE_W: gl.constexpr = True):
+             POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr, STAGE_W: gl.constexpr = True,
+             T_A: gl.constexpr = 1.0, T_C: gl.constexpr = 0.0, T_B: gl.constexpr = 0.0):
     """Phase 2 of program pid: its group's due slots k_lo..k_hi, every link
     through RECEIVE (see the module docstring); state: the tuple of node
     attrs receive touches, [GROUP_SIZE] tensors in the program's neuron
@@ -1498,12 +1503,10 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     received = _to_rows(received, NUM_WARPS, GROUP_SIZE, LWN)
     n_received = _to_rows(n_received, NUM_WARPS, GROUP_SIZE, LWN)
     gl.barrier()
-    # GAP (D-1): every delivery's time is its link's arrival, e + its bucket's mean delay (D-1): the
-    #   pull knows the mean when it appends, so the record's time word carries the arrival (the main/side
-    #   decision on e is made by then)
-    # LIMITATION (D-1): a slot's records are in emission order, not arrival order -- links of different
-    #   buckets in one slot can reach a target out of arrival order by less than one slot width (a receive-side
-    #   integrator sees time step back)
+    # receive's time (D-1): T_A e + tk, tk the slot's term (see _deliver_link) -- a slot's records in emission
+    #   order, so per target non-decreasing either way
+    # GAP (BRUNEL.md, step 3): several homogeneous delays take the slot's time until the ring has a
+    #   delay-class dimension (exact arrival order by a merge of a slot's classes)
     if POOL_B > 0:  # the group's free-stack top through the delivery, stored once at its end
         tp = gl.load(top + pid)
         lost_v = gl.load(lost)
@@ -1512,6 +1515,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
         lost_v = gl.to_tensor(0)
     for k in range(k_lo, k_hi + 1):
         cell = pid * N_SLOTS + k % N_SLOTS
+        tk = k.to(gl.float32) * T_C + T_B  # (the delivery time's per-slot term: _deliver_link)
         nm = gl.minimum(gl.load(main_count + cell), main_cap)
         ns = gl.minimum(gl.load(side_count + cell), side_cap)
         if POOL_B > 0:
@@ -1531,7 +1535,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                     n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
                 state, received, n_received = _walk(
                     r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr,
-                    log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E)
+                    log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, tk, T_A)
                 if TRACE:
                     state = _pin_first(state)
                     n_ev = mark(trace, n_ev, 6, nq, TRACE_CAP)
@@ -1543,7 +1547,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                 main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
                 attr_addr, _state_from_rows(state, GROUP_SIZE, LN), _from_rows(received, GROUP_SIZE, LN),
                 _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k, pid, log_ptr, log_e, log_cap, table,
-                side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb)
+                side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb, tk, T_A)
             state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
             received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
             n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)

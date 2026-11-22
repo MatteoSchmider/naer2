@@ -122,6 +122,9 @@ class Population:
         # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
         # development aid -- off by default, a little work per delivered link
         self.count_received: bool = False
+        # receive's time where the incoming delays vary per link (D-1, BRUNEL.md): every link of a ring slot at
+        # one time, its "center" (statistically unbiased) or its "end" (causal: never before an actual arrival)
+        self.slot_time: str = "center"
         # random.* draws from this population's own stream (RandomLoweringTransformer): distinct by default
         # (populations numbered as they are made: the same network built the same way draws the same numbers),
         # the same stream where set equal
@@ -407,6 +410,30 @@ class Population:
     def _resolution(self, conn) -> float:
         """A connection's delay quantization: its own, else the network's."""
         return conn.resolution if conn.resolution is not None else self.network.resolution
+
+    def _homogeneous_delay(self, conn) -> float | None:
+        """A connection's delay where it has one value for every link (a number, or a tensor of one value), read
+        back as _min_delay does; None where it varies per link."""
+        d = getattr(conn.fabric, "delay", None)
+        if d is None or not isinstance(d, torch.Tensor):
+            return float(d) if d is not None else 0.0
+        if d.numel() and bool((d == d.reshape(-1)[0]).all()):
+            return self._min_delay(conn)
+        return None
+
+    def _delivery_time(self) -> tuple[float, float, float]:
+        """receive's time (T_A, T_C, T_B: T_A e + T_C k + T_B for a record emitted at e, delivered from slot k;
+        D-1, BRUNEL.md, fused.py _deliver_link) by the incoming delays: one homogeneous delay D over every
+        incoming link -- exact, e + D (emission order is arrival order); otherwise the slot's center or end
+        (slot_time), every link of a slot at one time. (Several homogeneous delays: the slot time for now, exact
+        once the ring has a delay-class dimension: BRUNEL.md, step 3.)"""
+        delays = [self._homogeneous_delay(c) for c in self.incoming]
+        if None not in delays and len(set(delays)) <= 1:
+            return 1.0, 0.0, delays[0] if delays else 0.0
+        if self.slot_time not in ("center", "end"):
+            raise ValueError(f"slot_time is 'center' or 'end', not {self.slot_time!r}")
+        w = self._slot_width()
+        return 0.0, w, (0.5 if self.slot_time == "center" else 1.0) * w
 
     def _slot_width(self) -> float:
         """The ring's slot width: the finest resolution its incoming
