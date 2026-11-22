@@ -114,7 +114,7 @@ def test_generated_pd14_poisson_matches_the_reference():
 
 @n2.node
 class _spiking_receiver:
-    """Fires from inside receive (D-3: needs the emission buffer)."""
+    """Integrates its inputs and fires from inside receive, at the input's time (D-3)."""
 
     def __init__(self):
         self.potential: float = 0.0
@@ -132,16 +132,78 @@ class _spiking_receiver:
             self.potential = 0.0
 
 
-def test_gap_spikes_inside_delivery():
-    """TODO.md, D-3: n2.spike() in receive (or in a send after every
-    delivery) needs the program's emission buffer -- the generator raises
-    NotImplementedError until it exists, and this test fails until then."""
-    src = PD14_neuron(K_cortical=2000) * 100
-    dst = _spiking_receiver() * 100
+@n2.node
+class _bare_spiking_receiver:
+    """The same with a bare n2.spike(): at exactly the delivery time (D-3)."""
+
+    def __init__(self):
+        self.potential: float = 0.0
+
+    def update(self, time: n2.time):
+        pass
+
+    def send(self, time: n2.time):
+        pass
+
+    def receive(self, time: n2.time, edge: n2.receives.edge, source: n2.receives.source):
+        self.potential += edge.weight
+        if self.potential > 1.0:
+            n2.spike()
+            self.potential = 0.0
+
+
+def _spiking_run(node, weight, delay=0.15, seed=41, uniform=False, history_cap=1200):
+    """Sources fire once, at random times in [1.0, 1.1) (uniform: at 1.0 -- the batched pull, the walk); the
+    consumer (weight on every link, one
+    homogeneous delay: exact arrivals) runs rounds 0..3, its history taking history_cap spikes a run. Returns (consumer, fire times, connection, every
+    spike it emitted as (e, node))."""
+    src, dst = PD14_neuron(K_cortical=2000) * 200, node() * 300
     conn = src >> PD14_connection(0.1) >> dst
-    conn.weight = torch.rand(conn.shape)
+    conn.weight = torch.full(conn.shape, weight)
+    conn.delay = delay
     gk = FusedKernelTemplate(dst).build()
-    assert not gk.uniform_emission  # n2.spike(time): emission at the delivery's time
+    assert not gk.uniform_emission  # spikes at the delivery's time
+    gen = PopulationRuntime(gk, 300, group_size=G, device=DEVICE, state=_defaults(dst), history_cap=history_cap)
+    srcs = commanded_runtime(200, uniform=uniform, group_size=G, device=DEVICE)
+    gen.connect([srcs], [conn.fabric.simulation(300, G, DEVICE, attrs=["weight"])], n_slots=8, main_cap=8192)
+    g = torch.Generator().manual_seed(seed)
+    at = torch.full((200,), 1.0) if uniform else 1.0 + 0.1 * torch.rand(200, generator=g)
+    fire = torch.where(torch.rand(200, generator=g) < 0.3, at, math.inf).float()
+    spikes = []
+    for r in range(4):
+        t = round(1.0 + 0.1 * r, 6)
+        gen.run(t, t + 0.1, round_id=r)
+        spikes += gen.emitted()
+        command(srcs, t, t + 0.1, fire if r == 0 else None, round_id=r)
+    return gen, fire, conn, spikes
+
+
+@pytest.mark.parametrize("uniform", [False, True], ids=["timed", "uniform"])
+@pytest.mark.parametrize("node", [_spiking_receiver, _bare_spiking_receiver], ids=["spike(time)", "bare"])
+def test_spikes_inside_delivery(node, uniform):
+    """D-3: n2.spike() in receive fires at the delivery -- explicit (its time) or bare (the delivery time
+    itself): every link 0.4, so a target fires at every third input, at that input's arrival (fp32 e + D,
+    in arrival order), any number of times a run -- against a host reference. Timed sources: the general
+    pull, side runs, the one-link merge; uniform: the walk (a row per warp)."""
+    gen, fire, conn, spikes = _spiking_run(node, 0.4, uniform=uniform)
+    gen.check()
+    offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
+    arrivals = [[] for _ in range(300)]
+    arr = fire + torch.tensor(0.15, dtype=torch.float32)
+    for s in torch.isfinite(fire).nonzero().flatten().tolist():
+        for j in tgt[offs[s]:offs[s + 1]].tolist():
+            arrivals[j].append(arr[s].item())
+    want = sorted((a, j) for j in range(300) for a in sorted(arrivals[j])[2::3])
+    assert len(want) > 100 and any(len(a) >= 6 for a in arrivals)  # (some fire twice)
+    assert sorted(spikes) == want
+
+
+def test_spikes_inside_delivery_past_the_history_cap_raise():
+    """D-3: neurons firing on every input (~6 a run here) emit more than the history's default cap, one spike
+    per neuron and run -- the rest are lost, and check() raises."""
+    gen, _, _, _ = _spiking_run(_spiking_receiver, 1.5, history_cap=None)
+    with pytest.raises(RuntimeError, match="more than its history"):
+        gen.check()
 
 
 # The remaining gaps run end to end once closed: every source fires once (round 0), its spikes reach the

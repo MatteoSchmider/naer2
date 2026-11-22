@@ -119,6 +119,9 @@ class Population:
         # (Network._plan_histories), 3 without a network step
         self.history_depth: int | None = None
         self._derived_depth: int = 3
+        # the spikes one run can emit (its history's cap); None: one per neuron -- more where neurons fire inside
+        # delivery, any number of times a run (D-3); past it the run's spikes are lost and check() raises
+        self.history_cap: int | None = None
         # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
         # development aid -- off by default, a little work per delivered link
         self.count_received: bool = False
@@ -405,7 +408,8 @@ class Population:
         kernel = self.fused_kernel()
         self._runtime = PopulationRuntime(kernel, len(self.shape), group_size=self.group_size,
                                           depth=self.history_depth or self._derived_depth, device=device,
-                                          state={a: getattr(self, a) for a in kernel.attrs})
+                                          state={a: getattr(self, a) for a in kernel.attrs},
+                                          history_cap=self.history_cap)
         self._runtime.seed = self.seed
 
     def _resolution(self, conn) -> float:

@@ -8,9 +8,11 @@ naer2/transpiler/templates/fused_template.py, or written by hand --
 test/fused_reference.py, the reference) calls
 
   _pull(...)                  phase 1, no user code at all
-  _deliver(state, RECEIVE)    phase 2, RECEIVE(state, hit, time, w, srcword)
-                              -> state a constexpr gluon.jit function, state
-                              the tuple of node attrs receive touches
+  _deliver(state, RECEIVE)    phase 2, RECEIVE(state, hit, time, w, srcword,
+                              ectx, nodes) -> state a constexpr gluon.jit
+                              function, state the tuple of node attrs
+                              receive touches; ectx, nodes: for its
+                              n2.spike() (_emit_delivered, D-3)
   (update, send: the entry's own code, then)
   _emit_spikes(fires, e)      one n2.spike() site's spikes into the history,
                               then _emit_close() once (_emit: both, one site)
@@ -832,7 +834,8 @@ def _run_status(status, ring, pid, run_id, finished, chk, ARENA_CHECK: gl.conste
 # times a target sees never step back); (1, 0, 0) the emission time itself (the reference kernels)
 @gluon.jit
 def _deliver_link(state, t, w, srcword, e, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
-                  RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, rtime):
+                  RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, rtime,
+                  ectx):
     """ONE link: t its target within the group (uniform over the program,
     -1 for none), w its weight, e its time word. Every lane compares
     against t and the target lane runs the receive. A multapse's weights
@@ -845,10 +848,11 @@ def _deliver_link(state, t, w, srcword, e, received, n_received, lane, mask, k, 
     #   connection id (D-6)
     # send runs here too, after every delivery, rooted at `hit` (D-2) -- and once more after
     #   update; only for connections whose receive writes a node attr send reads (fused_template's
-    #   per-delivery send: PD14_neuron has none). GAP (D-3): its n2.spike() (and receive's) can fire any number of times
-    #   per neuron and run (D-3): each spike appended to the program's emission buffer, its time the expression's
+    #   per-delivery send: PD14_neuron has none). Its n2.spike() (and receive's) fires any number of times per
+    #   neuron and run (D-3): straight into the run's history (_emit_delivered; ectx: its slot, nodes: the lanes'
+    #   neurons)
     # GAP (D-10): source.x is unsupported for now
-    state = RECEIVE(state, hit, rtime, w, srcword)  # (rtime: the delivery time, _delivery_time; e: the emission)
+    state = RECEIVE(state, hit, rtime, w, srcword, ectx, pid * GROUP_SIZE + lane)  # (rtime: the delivery time)
     if COUNT:  # dev: the stand-in's bookkeeping (tests)
         received = gl.where(hit, received + w, received)
         n_received = n_received + hit.to(gl.int32)
@@ -877,7 +881,7 @@ def _pin_first(state):
 def _walk(r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr, log_e,
           log_cap, LW: gl.constexpr, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, U: gl.constexpr,
           NUM_WARPS: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr, STAGE_E: gl.constexpr, tk,
-          T_A: gl.constexpr):
+          T_A: gl.constexpr, ectx, node2):
     """The staged stream block (_stage_records): every warp its own list, the links to its own neurons in
     link order, U of them a broadcast LDS read ([NUM_WARPS, U]: each warp its row), received one by one by
     their target lanes. state, received, n_received: [NUM_WARPS, GROUP_SIZE // NUM_WARPS], a row per warp
@@ -912,7 +916,7 @@ def _walk(r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2
             hit = (lane2 == t[:, None]) & mask2 & live[:, None]
             # RECEIVE(state, hit, time, w, srcword) -> state: the transpiled receive (_deliver_link), rooted at
             #   `hit`, each warp's one target lane -- elementwise, every warp's link's values along its row
-            state = RECEIVE(state, hit, (e * T_A + tk)[:, None], w[:, None], srcword)  # (the delivery time)
+            state = RECEIVE(state, hit, (e * T_A + tk)[:, None], w[:, None], srcword, ectx, node2)  # (the delivery time)
             if COUNT:  # dev: the stand-in's bookkeeping (tests)
                 received = gl.where(hit, received + w[:, None], received)
                 n_received = n_received + hit.to(gl.int32)
@@ -1034,7 +1038,7 @@ def _stage_records(rec0, cell, b0, nm, n_cells, s_atp, f_tgt, f_w, f_src, f_e, t
 def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
                  attr_addr, state, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap, table, side_table,
                  RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr, COUNT: gl.constexpr,
-                 N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr, nb, tk, T_A: gl.constexpr):
+                 N_SLOTS: gl.constexpr, main_cap, POOL_B: gl.constexpr, nb, tk, T_A: gl.constexpr, ectx):
     """A slot with side entries: its main and side runs of link records
     merged by emission time with two cursors (main first on ties), each
     link received in order."""
@@ -1065,7 +1069,7 @@ def _merge_links(main_time, main_src, main_lo, main_n, side_time, side_src, side
         w = gl.load(gl.load(attr_addr + (srcword >> 24)).to(gl.pointer_type(gl.float32)) + l)
         state, received, n_received = _deliver_link(
             state, t, w, srcword, e, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
-            RECEIVE, GROUP_SIZE, LOG, COUNT, e * T_A + tk)
+            RECEIVE, GROUP_SIZE, LOG, COUNT, e * T_A + tk, ectx)
     return state, received, n_received
 
 
@@ -1187,7 +1191,7 @@ def _stage_merged(main_time, rec0, cell0, cur, nmv, dcls, cv, s_atp, s_arr, m_tg
 def _merge_classes(main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell0, nmv, nsv, dcls,
                    cv, n_cells, attr_addr, state, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
                    table, side_table, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, LOG: gl.constexpr,
-                   COUNT: gl.constexpr, N_SLOTS: gl.constexpr, POOL_B: gl.constexpr, nb, NC: gl.constexpr):
+                   COUNT: gl.constexpr, N_SLOTS: gl.constexpr, POOL_B: gl.constexpr, nb, NC: gl.constexpr, ectx):
     """A due slot's classes, some with side entries: every class's main and side runs merged by arrival one
     link at a time (as _merge_links: the order (arrival, class, main first)), each received at its arrival."""
     NR: gl.constexpr = N_SLOTS // NC
@@ -1220,7 +1224,7 @@ def _merge_classes(main_time, main_src, main_lo, main_n, side_time, side_src, si
         w = gl.load(gl.load(attr_addr + (srcword >> 24)).to(gl.pointer_type(gl.float32)) + l)
         state, received, n_received = _deliver_link(  # (the log: the arrival, as _stage_merged stages it)
             state, t, w, srcword, a, received, n_received, lane, mask, k, pid, log_ptr, log_e, log_cap,
-            RECEIVE, GROUP_SIZE, LOG, COUNT, a)
+            RECEIVE, GROUP_SIZE, LOG, COUNT, a, ectx)
     return state, received, n_received
 
 
@@ -1638,8 +1642,8 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
 
 @gluon.jit
 def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr, n_received_ptr,
-             log_ptr, log_cap, trace, n_ev, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr, N_SLOTS: gl.constexpr,
-             STREAM: gl.constexpr, U: gl.constexpr,
+             log_ptr, log_cap, trace, n_ev, ectx, RECEIVE: gl.constexpr, GROUP_SIZE: gl.constexpr,
+             N_SLOTS: gl.constexpr, STREAM: gl.constexpr, U: gl.constexpr,
              SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG: gl.constexpr,
              COUNT: gl.constexpr, STAGE_E: gl.constexpr, TRACE: gl.constexpr, TRACE_CAP: gl.constexpr,
              POOL_B: gl.constexpr, chk, ARENA_CHECK: gl.constexpr, STAGE_W: gl.constexpr = True,
@@ -1648,7 +1652,8 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     through RECEIVE (see the module docstring); state: the tuple of node
     attrs receive touches, [GROUP_SIZE] tensors in the program's neuron
     layout (lane's). STAGE_E: the walk stages each record's time word too
-    (LOG, or a receive that reads time). NC > 1: several delay classes, each
+    (LOG, or a receive that reads time). ectx: the run's history slot for spikes inside delivery (_emit_ctx;
+    () without any). NC > 1: several delay classes, each
     slot's classes merged by arrival (_stage_merged, _merge_classes; the log's time word then the arrival,
     not the emission). Returns (state, n_ev)."""
     # neurons over lanes and warps (the program's layout, LN); during delivery as rows, one per warp (LWN:
@@ -1711,6 +1716,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
     wi = gl.arange(0, NUM_WARPS, layout=LW)
     ji = gl.arange(0, NPW, layout=gl.SliceLayout(0, LWN))
     lane2 = wi[:, None] * NPW + ji[None, :]
+    node2 = pid * GROUP_SIZE + lane2  # (the rows' neurons: receive's n2.spike())
     mask2 = _to_rows(mask.to(gl.int32), NUM_WARPS, GROUP_SIZE, LWN) > 0
     state = _state_to_rows(state, NUM_WARPS, GROUP_SIZE, LWN)
     received = _to_rows(received, NUM_WARPS, GROUP_SIZE, LWN)
@@ -1748,7 +1754,8 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                         n_ev = mark(trace, n_ev, 5, nq, TRACE_CAP)
                     state, received, n_received = _walk(
                         r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid, log_ptr,
-                        log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, tk, T_A)
+                        log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, tk, T_A, ectx,
+                    node2)
                     if TRACE:
                         state = _pin_first(state)
                         n_ev = mark(trace, n_ev, 6, nq, TRACE_CAP)
@@ -1760,7 +1767,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                     main_time, main_src, main_lo, main_n, side_time, side_src, side_lo, side_n, cell, nm, ns, n_cells,
                     attr_addr, _state_from_rows(state, GROUP_SIZE, LN), _from_rows(received, GROUP_SIZE, LN),
                     _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k, pid, log_ptr, log_e, log_cap, table,
-                    side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb, tk, T_A)
+                    side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS, main_cap, POOL_B, nb, tk, T_A, ectx)
                 state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
                 received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
                 n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)
@@ -1794,7 +1801,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                     state, received, n_received = _walk(
                         r_tgt, r_w, r_src, r_e, n_w, n_max, state, received, n_received, lane2, mask2, k, pid,
                         log_ptr, log_e, log_cap, LW, RECEIVE, GROUP_SIZE, U, NUM_WARPS, LOG, COUNT, STAGE_E, 0.0,
-                        1.0)  # (f_e: the arrival itself)
+                        1.0, ectx, node2)  # (f_e: the arrival itself)
                     gl.barrier()
             else:
                 st1, r1, n1 = _merge_classes(
@@ -1802,7 +1809,7 @@ def _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, 
                     dcls, cv, n_cells, attr_addr, _state_from_rows(state, GROUP_SIZE, LN),
                     _from_rows(received, GROUP_SIZE, LN), _from_rows(n_received, GROUP_SIZE, LN), lane, mask, k,
                     pid, log_ptr, log_e, log_cap, table, side_table, RECEIVE, GROUP_SIZE, LOG, COUNT, N_SLOTS,
-                    POOL_B, nb, NC)
+                    POOL_B, nb, NC, ectx)
                 state = _state_to_rows(st1, NUM_WARPS, GROUP_SIZE, LWN)
                 received = _to_rows(r1, NUM_WARPS, GROUP_SIZE, LWN)
                 n_received = _to_rows(n1, NUM_WARPS, GROUP_SIZE, LWN)
@@ -1843,8 +1850,8 @@ def _emit_spikes(fires, e, offs, history, hist_cap, run_id, K: gl.constexpr, SPT
     _n_fire = fires.to(gl.int32)
     _local_pos = gl.convert_layout(gl.cumsum(gl.convert_layout(_n_fire, LS), axis=0), fires.type.layout) - _n_fire
     n_emit = gl.sum(_n_fire, axis=0)
-    # GAP (D-3): the history's cap is no longer one spike per neuron (D-3); a run's spikes beyond it raise
-    #   the overflow flag
+    # GAP (D-3): the history's cap is one spike per neuron and run (EmissionHistory's default); a run's spikes
+    #   beyond it set the overflow flag (the runtime raises: PopulationRuntime.check)
     slot = run_id % K
     (h_tag, h_count, h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, slot, K, hist_cap)
     base = gl.atomic_add(h_count, n_emit)  # this site's place in the run's flat list
@@ -1854,6 +1861,37 @@ def _emit_spikes(fires, e, offs, history, hist_cap, run_id, K: gl.constexpr, SPT
     gl.store(h_node + base + _local_pos, offs, mask=put)
     gl.store(h_time + base + _local_pos, e, mask=put)
     gl.atomic_min(h_min, gl.min(gl.where(put, e, float("inf")), axis=0))
+
+
+@gluon.jit
+def _emit_ctx(history, hist_cap, run_id, K: gl.constexpr):
+    """The run's history slot, for spikes inside delivery (_emit_delivered): (count, earliest, nodes, times,
+    overflow, cap)."""
+    (_h_tag, h_count, _h_wend, h_min, h_node, h_time, h_overflow) = history_ptrs(history, run_id % K, K, hist_cap)
+    return (h_count, h_min, h_node, h_time, h_overflow, hist_cap)
+
+
+@gluon.jit
+def _emit_delivered(fire, t, nodes, ectx):
+    """An n2.spike() site inside delivery (D-3: in receive, or a send after every delivery): the lanes in fire
+    spike at t, straight into the run's history (ectx: _emit_ctx) -- the history is a flat list per run in no
+    order, and a run's slot is read only after the run. One link a step: at most one lane fires per row of
+    fire (the walk: a row per warp, each its own target lane; a merge: the one lane), so per row one masked
+    atomic, none where nothing fires. nodes: the lanes' neurons; t: the spike time (broadcast to fire)."""
+    h_count, h_min, h_node, h_time, h_overflow, hist_cap = ectx
+    AX: gl.constexpr = len(fire.shape) - 1
+    tt = t + gl.zeros_like(fire.to(gl.float32))
+    n = gl.sum(fire.to(gl.int32), axis=AX)
+    node = gl.sum(gl.where(fire, nodes, 0), axis=AX)
+    tm = gl.sum(gl.where(fire, tt, 0.0), axis=AX)
+    m = n > 0
+    zero = n * 0  # (n: a row per warp, or a scalar -- zeros_like takes no scalar)
+    pos = gl.atomic_add(h_count + zero, 1, mask=m)
+    put = m & (pos < hist_cap)
+    gl.store(h_node + pos, node, mask=put)
+    gl.store(h_time + pos, tm, mask=put)
+    gl.atomic_min(h_min + zero, tm, mask=put)
+    gl.atomic_max(h_overflow + zero, 1, mask=m & (pos >= hist_cap))
 
 
 @gluon.jit

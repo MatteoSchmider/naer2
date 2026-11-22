@@ -215,7 +215,7 @@ class PopulationRuntime:
     tensor; default 0)."""
 
     def __init__(self, kernel, n: int, group_size: int = 256, depth: int = 3, device="cuda",
-                 state: dict | None = None):
+                 state: dict | None = None, history_cap: int | None = None):
         self.kernel, self.n, self.group_size, self.device = kernel, n, group_size, torch.device(device)
         self.n_groups = -(-n // group_size)
         self.state = {}
@@ -227,8 +227,9 @@ class PopulationRuntime:
                 self.state[a] = v if v.device == self.device else v.to(self.device)
             else:
                 self.state[a] = torch.full((n,), float(v), device=self.device)
-        # depth from the scheduler (naer2/history.py)
-        self.history = EmissionHistory(n, depth, self.device)
+        # depth from the scheduler (naer2/history.py); history_cap: the spikes a run can emit (default: one per
+        # neuron -- D-3: more where neurons fire inside delivery)
+        self.history = EmissionHistory(n, depth, self.device, cap=history_cap)
         self.run_id = 0
         # dev aids: the template's receive counters (count_received: off by default, a little work per
         # link), delivery log, trace
@@ -708,6 +709,9 @@ class PopulationRuntime:
         if int(self.overrun[0]):
             raise RuntimeError("a consumer fell behind a source's emission history: a run was overwritten "
                                "before it was read (raise the history depth K)")
+        if int(self.history.overflow[0]):  # (D-3: a neuron can fire more than once a run, inside delivery)
+            raise RuntimeError(f"a run emitted more than its history's {self.history.cap} spikes: the rest were "
+                               f"lost (raise Population.history_cap; TODO.md, D-3)")
 
     # ---- inspection
 

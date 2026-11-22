@@ -16,10 +16,10 @@ Builds a 4-population network exercising:
 
 The DSL side (fan-in, port routing, the maps) is checked directly. The
 generated fused kernels (Population.fused_kernel): A's -- no incoming
-connections, every spike site in update / send -- is checked on its source;
-B, C and D need what the template doesn't generate yet (a spike inside
-delivery, D-3; edge forward hooks; source attrs, D-10), so they are one gap
-test, failing until those close (TODO.md).
+connections, every spike site in update / send -- is checked on its source,
+and B's, a spike inside delivery (D-3); C and D need what the template
+doesn't generate yet (edge forward hooks; source attrs, D-10), so they are
+one gap test, failing until those close (TODO.md).
 
 No GPU: generating a kernel only builds its source and the gluon.jit
 function.
@@ -104,14 +104,24 @@ def test_lowered_completely(src_A):
     assert "n2.spike" not in src_A and "tl." not in src_A and "self." not in src_A
 
 
+def test_a_spike_inside_delivery_generates(pops):
+    """B: pos_receive's n2.spike() (D-3) -- emitted inside delivery, straight into the history; every hook
+    lowered, the edge map reversed."""
+    k = pops["B"].fused_kernel()
+    assert k.edge_attr == "weight" and not k.uniform_emission
+    assert "_emit_delivered(" in k.source and "_emit_ctx(history, hist_cap, run_id, K)" in k.source
+    for leftover in ("edge.w", "n2.spike", "math.", "tl."):
+        assert leftover not in k.source
+
+
 # ------------------------------------------------------------ gaps (fail until closed)
 
 
-@pytest.mark.parametrize("label", ["B", "C", "D"])
+@pytest.mark.parametrize("label", ["C", "D"])
 def test_gap_coverage_network_generates(pops, label):
-    """TODO.md: B -- a spike inside delivery (pos_receive, D-3); C -- an
-    edge forward hook, source.src_pot (D-10); D -- three connections, one
-    with an edge forward hook. Every hook lowered, the maps reversed."""
+    """TODO.md: C -- an edge forward hook, source.src_pot (D-10); D -- three
+    connections, one with an edge forward hook. Every hook lowered, the maps
+    reversed."""
     k = pops[label].fused_kernel()  # raises NotImplementedError today
     assert k.edge_attr == "weight"
     for leftover in ("edge.w", "source.src_pot", "n2.spike", "math.", "tl."):

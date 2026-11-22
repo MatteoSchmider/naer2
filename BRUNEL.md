@@ -57,8 +57,10 @@ Order (2026-11-22): 1, 3, 2, 4, 5 -- the user's turn between every step.
    homogeneous values: the slot time until step 3); the kernel computes receive's time (a constexpr mode, the
    delay and slot geometry as arguments). Tests: the D-1 gap test (one delay: exact), a per-link-delay case at the
    slot's center and end, monotone times per target.
-2. **D-3, spikes inside delivery**: n2.spike() in receive into a per-program emission buffer, flushed into the
-   history with the run's own spikes. Tests: the D-3 gap test, an event-driven relay firing on arrivals.
+2. **D-3, spikes inside delivery** (done 2026-11-22, differently: each spike straight into the run's history,
+   fused.py `_emit_delivered`; `Population.history_cap`; tests `test_spikes_inside_delivery*`, the coverage
+   network's B): n2.spike() in receive into a per-program emission buffer, flushed into the history with the
+   run's own spikes. Tests: the D-3 gap test, an event-driven relay firing on arrivals.
 3. **Several homogeneous delays** (done 2026-11-22: `Population._delay_classes`, `Ring.n_classes`, the constexpr
    NC; delivery `_stage_merged` -- a block merge, every class's next STREAM records ranked by binary search in
    LDS -- and `_merge_classes` for slots with side runs, one link at a time; tests `test_several_homogeneous_*`):

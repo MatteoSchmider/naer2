@@ -17,9 +17,11 @@ fused_reference.py) -- see TODO.md for the decisions (D-n) it follows.
 
 Hook bodies go through HookTranspiler as for the old templates, then
 GluonTransformer (tl -> gl). n2.spike() lowers to a fire mask and an
-emission-time tensor per site (bare: t_start, D-4); UNIFORM_EMISSION holds
-when every site is bare. Not supported yet (NotImplementedError, each with
-its decision): n2.spike() inside delivery (D-3: needs the emission buffer),
+emission-time tensor per site (bare: t_start, D-4), flushed after send;
+inside delivery (receive, a send after every delivery: D-3) straight into
+the run's history (fused.py _emit_delivered; bare: the delivery time).
+UNIFORM_EMISSION holds when every site is bare and none is inside
+delivery. Not supported yet (NotImplementedError, each with its decision):
 connections with different receive code (D-6), more than one per-link attr
 (D-7), edge forward hooks (HOOK(forward)), source.x (D-10), edge backward
 (D-11). Receive's time follows the incoming delays (D-1, BRUNEL.md): the
@@ -58,7 +60,9 @@ DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "n_status", "sched_i", "log_cap", "
 
 class _SpikeSites:
     """The fused lowering of n2.spike(): each site's fire mask and emission
-    time, kept as _fire<k> / _e<k> for the entry to flush after send."""
+    time, kept as _fire<k> / _e<k> for the entry to flush after send; inside
+    delivery (D-3) each site emits right there (_emit_delivered: receive's
+    ectx and nodes)."""
 
     def __init__(self, where: str):
         self.where = where  # "final" (update / send after update) or "delivery"
@@ -66,9 +70,8 @@ class _SpikeSites:
 
     def __call__(self, mask: str, time_expr: str, bare: bool) -> list[ast.stmt]:
         if self.where == "delivery":
-            raise NotImplementedError(
-                "n2.spike() inside delivery (in receive, or a send that runs after every delivery) needs the "
-                "program's emission buffer -- not implemented yet (TODO.md, D-3)")
+            self.sites.append(False)  # (a spike at the delivery's time: never the window's start)
+            return _STMTS(f"_emit_delivered({mask}, ({time_expr}), nodes, ectx)")
         k = len(self.sites)
         self.sites.append(bare)
         return _STMTS(f"_fire{k} = {mask}\n_e{k} = ({time_expr}) + gl.zeros([GROUP_SIZE], gl.float32, layout=LN)")
@@ -172,22 +175,23 @@ class FusedKernelTemplate:
         state_attrs = [a for a in attrs if a in touched]
         later = [a for a in attrs if a not in touched]
 
-        # ---- receive (and the per-delivery send), rooted at hit
+        # ---- receive (and the per-delivery send), rooted at hit; a bare n2.spike() there: at the delivery time
         recv_body: list[ast.stmt] = []
         stage_e = False
+        delivery_sites = _SpikeSites("delivery")
         if hook is not None:
-            recv_body += HookTranspiler(hook, ctx, spike_lowering=_SpikeSites("delivery"),
-                                        default_spike_time="t_start").emit_for_spike_loop(
+            recv_body += HookTranspiler(hook, ctx, spike_lowering=delivery_sites,
+                                        default_spike_time="time").emit_for_spike_loop(
                 set(pop.dynamic_attrs), fabric_map=conn._fabric_map if conn else None,
                 source_map=conn._source_map if conn else None,
                 edge_static_attrs=conn.fabric.constant_attrs if conn else {}, source_static_attrs={})
             if send_after_delivery:
-                send_d = HookTranspiler(send, ctx, spike_lowering=_SpikeSites("delivery"),
-                                        default_spike_time="t_start").emit()
+                send_d = HookTranspiler(send, ctx, spike_lowering=delivery_sites,
+                                        default_spike_time="time").emit()
                 send_d = MaskAliasTransformer().transform(send_d)
                 recv_body += TargetMaskTransformer(set(pop.dynamic_attrs)).transform(send_d)
             recv_body = GluonTransformer().transform(recv_body)
-            stage_e = _uses_time(hook)
+            stage_e = _uses_time(hook) or bool(delivery_sites.sites)  # (a spike there: at the delivery time)
         recv_src = self._receive_source(state_attrs, recv_body, edge_attr, hook)
 
         # ---- update, then send, once per run (time = t = t_end), rooted at the group's mask
@@ -202,12 +206,12 @@ class FusedKernelTemplate:
         final = GluonTransformer().transform(final)
 
         source = self._module_source(attrs, state_attrs, later, recv_src, final, sites.sites, stage_e,
-                                     stage_w=edge_attr is not None)
+                                     stage_w=edge_attr is not None, emit_delivered=bool(delivery_sites.sites))
         kernel = _load(source, f"naer2_fused_{type(pop.instance).__name__}_{id(pop)}")
         # receive's time (D-1): its map from a record's emission time and slot, by the incoming delays
         t_a, t_c, t_b = pop._delivery_time()
         return FusedKernel(source, kernel, attrs, state_attrs, edge_attr,
-                           uniform_emission=all(sites.sites), stage_e=stage_e,
+                           uniform_emission=all(sites.sites) and not delivery_sites.sites, stage_e=stage_e,
                            consts=dict(T_A=float(t_a), T_C=float(t_c), T_B=float(t_b)))
 
     @staticmethod
@@ -215,7 +219,7 @@ class FusedKernelTemplate:
         unpack = f"    ({', '.join(state_attrs)},) = state\n" if state_attrs else ""
         pack = f"    return ({', '.join(state_attrs)},)\n" if state_attrs else "    return state\n"
         if hook is None:
-            return ("@gluon.jit\ndef _receive(state, hit, time, w, srcword):\n"
+            return ("@gluon.jit\ndef _receive(state, hit, time, w, srcword, ectx, nodes):\n"
                     "    \"\"\"No receive (no incoming connection carries one).\"\"\"\n    return state\n")
         time_name = hook.parameter_type_to_name.get(_time_type())
         lines = [unpack, "    is_target = hit\n"]
@@ -224,12 +228,13 @@ class FusedKernelTemplate:
         if edge_attr is not None:
             lines.append(f"    edge_{edge_attr} = w\n")
         body_src = "".join("    " + line + "\n" for stmt in body for line in ast.unparse(stmt).splitlines())
-        return ("@gluon.jit\ndef _receive(state, hit, time, w, srcword):\n"
+        return ("@gluon.jit\ndef _receive(state, hit, time, w, srcword, ectx, nodes):\n"
                 f"    \"\"\"The transpiled receive ({hook.function.__qualname__}), rooted at hit.\"\"\"\n"
                 + "".join(lines) + body_src + pack)
 
     @staticmethod
-    def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e, stage_w=True) -> str:
+    def _module_source(attrs, state_attrs, later, recv_src, final, sites, stage_e, stage_w=True,
+                       emit_delivered=False) -> str:
         args = ",\n    ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS)
                               + [f"{c}: gl.constexpr" for c in CONSTEXPRS])
         names = ", ".join([f"{a}_ptr" for a in attrs] + list(FIXED_ARGS) + list(CONSTEXPRS))
@@ -243,6 +248,8 @@ class FusedKernelTemplate:
         stores = "".join(f"    gl.store({a}_ptr + offs, {a}, mask=mask)\n" for a in attrs)
         flush = "".join(f"    _emit_spikes(_fire{k}, _e{k}, offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)\n"
                         for k in range(len(sites)))
+        # spikes inside delivery (D-3): the run's history slot, for receive's _emit_delivered
+        ectx = "_emit_ctx(history, hist_cap, run_id, K)" if emit_delivered else "()"
         body = f'''n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                   parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH, NUM_WARPS,
                   GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, NC)
@@ -253,7 +260,7 @@ if ok:
         state = _pin_first(state)
         n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
     state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
-                           n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive, GROUP_SIZE, N_SLOTS,
+                           n_received_ptr, log_ptr, log_cap, trace, n_ev, {ectx}, _receive, GROUP_SIZE, N_SLOTS,
                            STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
                            TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, {stage_w}, T_A, T_C, T_B, NC)
 {unpack}
@@ -273,7 +280,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
-from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_spikes, _pin_first, _pull, _pull_headers,
+from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_ctx, _emit_delivered, _emit_spikes,
+                                              _pin_first, _pull, _pull_headers,
                                               _rand, _randn, _run_done, _run_entry, _status_slot, _run_gate,
                                               _run_status, _gate_skip, _gate_carry, _ev_close)
 

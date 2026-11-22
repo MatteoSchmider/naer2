@@ -20,14 +20,14 @@ from naer2.transpiler.templates.fused_template import DO_NOT_SPECIALIZE, FusedKe
 
 
 @gluon.jit
-def _receive_current(state, hit, time, w, srcword):
+def _receive_current(state, hit, time, w, srcword, ectx, nodes):
     """PD14_neuron.receive: current += edge.weight."""
     (current,) = state
     return (gl.where(hit, current + w, current),)
 
 
 @gluon.jit
-def _receive_none(state, hit, time, w, srcword):
+def _receive_none(state, hit, time, w, srcword, ectx, nodes):
     """PD14_poisson: no receive."""
     return state
 
@@ -78,7 +78,7 @@ def pd14_neuron_kernel(
                 state = _pin_first(state)
                 n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
             state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
-                                   n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_current, GROUP_SIZE, N_SLOTS,
+                                   n_received_ptr, log_ptr, log_cap, trace, n_ev, (), _receive_current, GROUP_SIZE, N_SLOTS,
                                    STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
                                    TRACE_CAP, POOL_B, check_ptr, 0)
             (current,) = state
@@ -157,7 +157,7 @@ def pd14_poisson_kernel(
             if TRACE:
                 n_ev = mark(trace, n_ev, 1, 0, TRACE_CAP)
             state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
-                                   n_received_ptr, log_ptr, log_cap, trace, n_ev, _receive_none, GROUP_SIZE, N_SLOTS,
+                                   n_received_ptr, log_ptr, log_cap, trace, n_ev, (), _receive_none, GROUP_SIZE, N_SLOTS,
                                    STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG, TRACE,
                                    TRACE_CAP, POOL_B, check_ptr, 0)
 

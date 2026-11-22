@@ -16,8 +16,8 @@ work runs through A, most feature gaps through B and the generator.
   (phase 3).
 - **D-1: receive's time by the incoming delays** (exact e + D for homogeneous delays, else the slot's time;
   BRUNEL.md) -- an event-driven LIF integrates to each arrival (Brunel needs it).
-- **D-3: spikes inside delivery** (n2.spike() in receive: a per-program emission buffer) -- an event-driven
-  LIF fires on an arrival (Brunel needs it); also unblocks the counter node and the coverage network's D-3 gap.
+- **D-3: spikes inside delivery** (n2.spike() in receive, straight into the run's history) -- an event-driven
+  LIF fires on an arrival (Brunel needs it); also the coverage network's B.
 - **Construction and compile time: a baseline** -- measured now, cut after both refactors.
 
 ## 2. Refactor A, then what builds on it

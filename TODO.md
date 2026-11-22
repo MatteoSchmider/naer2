@@ -83,16 +83,15 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   (longest delay + one window + 3) revisited with a long-time-range event-driven network.
 - **Feature gaps**, each a failing test until closed (the generator raises NotImplementedError naming the decision,
   or the values are wrong), each checking the closed behaviour end to end:
-  - `test_fused_generated_gpu::test_gap_spikes_inside_delivery` -- D-3
-  - `test_gap_receive_variants_per_connection` -- D-6
+  - `test_fused_generated_gpu::test_gap_receive_variants_per_connection` -- D-6
   - `test_gap_several_per_link_attrs` -- D-7
   - `test_gap_edge_forward` -- edge forward on link lanes while staging, with D-8 documented in the code;
     `random.*` there must draw by the link, not the neuron lane (RandomLoweringTransformer's `offs`)
   - `test_gap_edge_forward_destination` -- D-9
   - `test_gap_source_attrs` -- D-10
   - `test_gap_edge_backward` -- D-11
-  - `test_coverage::test_gap_coverage_network_generates[B/C/D]` -- the coverage network through D-3, edge forward
-    and D-10
+  - `test_coverage::test_gap_coverage_network_generates[C/D]` -- the coverage network through edge forward and
+    D-10
 - **PD14 with a Poisson background, against NEST and GeNN**: the published model exists with a DC drive (this one:
   V_rest shifted) and with a Poisson one; both, compared directly with NEST (its most rigorous settings) and GeNN
   (2023, Poisson drive on an RTX 4090: real-time factor 0.272, ~27 us wall clock per 0.1 ms round) -- accuracy,
@@ -115,11 +114,17 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   outcome: the connection's receive writes a node attr send reads
   (`ReadMemberFinder`). PD14_neuron: no per-delivery send.
 - **D-3 any number of spikes per neuron and run** (n2.spike() in receive,
-  in the per-delivery send, at several send sites; a gap inside delivery
-  today) -- appended to the program's emission buffer, flushed into the
-  history with one count atomic; the history's cap per population, a run
-  beyond it raises the overflow flag.
-- **D-4 bare n2.spike() emits at the window's start, t_start.**
+  in the per-delivery send, at several send sites) -- revised 2026-11-22:
+  inside delivery each spike goes straight into the run's history (one
+  masked atomic per firing lane, at most one per warp and link step:
+  fused.py `_emit_delivered`), not through a per-program buffer -- the
+  history is a flat list in no order, and spikes are rare next to links.
+  The history's cap per population (`Population.history_cap`, default one
+  spike per neuron and run); a run beyond it loses the rest and check()
+  raises. Open: the cost in the walk (three warp reductions per site and
+  link step), measured with Brunel.
+- **D-4 bare n2.spike() emits at the window's start, t_start** -- inside
+  delivery at exactly the delivery time (BRUNEL.md).
 - **D-5 two flags:** `uniform_emission` (this population's own spikes,
   every n2.spike() bare; `FusedKernel.uniform_emission`) and
   `uniform_sources` (all its sources', the batched pull;
