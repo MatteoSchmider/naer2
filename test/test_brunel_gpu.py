@@ -38,7 +38,11 @@ class _checked_neuron:
         pass
 
     def send(self, time: n2.time):
-        pass
+        if self.V >= self.theta:
+            n2.spike(time)
+            self.V = self.V_r
+            self.t_ref_end = time + self.t_ref
+            self.last_time = time + self.t_ref
 
     def receive(self, time: n2.time, edge: n2.receives.edge, source: n2.receives.source):
         self.inputs += 1.0
@@ -47,11 +51,6 @@ class _checked_neuron:
                 self.back += 1.0
             self.V = self.V * math.exp((self.last_time - time) / self.tau) + edge.weight
             self.last_time = time
-            if self.V >= self.theta:
-                n2.spike(time)
-                self.V = self.V_r
-                self.t_ref_end = time + self.t_ref
-                self.last_time = time + self.t_ref
 
 
 def _run(network, pops, until, D=1.5):

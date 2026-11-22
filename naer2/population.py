@@ -128,6 +128,9 @@ class Population:
         # the spikes one run can emit (its history's cap); None: one per neuron -- more where neurons fire inside
         # delivery, any number of times a run (D-3); past it the run's spikes are lost and check() raises
         self.history_cap: int | None = None
+        # the slotted ring's records per segment (a source's links into a group in one record, the walk expanding
+        # it) instead of per link -- queues always hold segments (SPIKES.md)
+        self.segment_records: bool = __import__("os").environ.get("NAER2_SEG") == "1"  # (EXPERIMENT)
         # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
         # development aid -- off by default, a little work per delivered link
         self.count_received: bool = False
@@ -490,6 +493,7 @@ class Population:
                                           state={a: getattr(self, a) for a in kernel.attrs},
                                           history_cap=self.history_cap)
         self._runtime.seed = self.seed
+        self._runtime.segment_records = self.segment_records
 
     def _resolution(self, conn) -> float:
         """A connection's delay quantization: its own, else the network's."""

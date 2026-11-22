@@ -80,7 +80,7 @@ def test_only_plastic_synapses_have_edge_state(pops):
 def test_a_population_without_connections_has_no_receive(pops, src_A):
     k = pops["A"].fused_kernel()
     assert k.attrs == ["potential"] and k.state_attrs == [] and k.edge_attr is None
-    assert '"""No receive (no incoming connection carries one)."""' in src_A
+    assert 'def _receive(state, hit, time, w, srcword, ectx, nodes):\n    """Nothing (no incoming connection carries one)."""' in src_A
 
 
 def test_every_update_and_send_spike_site_is_emitted(src_A):

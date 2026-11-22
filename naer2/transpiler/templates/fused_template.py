@@ -54,7 +54,7 @@ FIXED_ARGS = ("n_neurons", "plan", "n_conns", "ring", "wmark_ptr", "oflags", "ct
               "trace_ptr", "seed", "check_ptr")
 CONSTEXPRS = ("GROUP_SIZE", "K", "SK", "KP", "UNIFORM_SOURCES", "N_SLOTS", "LOG", "STREAM",
               "U", "SPT", "NUM_WARPS", "MAX_CONNS", "LOG_CJ", "COUNT", "BATCH", "NSP", "TRACE",
-              "TRACE_CAP", "POOL_B", "ARENA_CHECK", "T_A", "T_C", "T_B", "NC", "QUEUES", "GP")
+              "TRACE_CAP", "POOL_B", "ARENA_CHECK", "T_A", "T_C", "T_B", "NC", "QUEUES", "GP", "SEG")
 DO_NOT_SPECIALIZE = ("n_neurons", "n_conns", "n_status", "sched_i", "log_cap", "hist_cap", "seed")
 
 
@@ -182,11 +182,12 @@ class FusedKernelTemplate:
 
         # ---- receive (and the per-delivery send), rooted at hit; a bare n2.spike() there: at the delivery time
         recv_body: list[ast.stmt] = []
+        send_body: list[ast.stmt] = []
         stage_e = False
         delivery_sites = _SpikeSites("delivery")
         if hook is not None:
-            recv_body += HookTranspiler(hook, ctx, spike_lowering=delivery_sites,
-                                        default_spike_time="time").emit_for_spike_loop(
+            recv_body = HookTranspiler(hook, ctx, spike_lowering=delivery_sites,
+                                       default_spike_time="time").emit_for_spike_loop(
                 set(pop.dynamic_attrs), fabric_map=conn._fabric_map if conn else None,
                 source_map=conn._source_map if conn else None,
                 edge_static_attrs=conn.fabric.constant_attrs if conn else {}, source_static_attrs={})
@@ -194,10 +195,16 @@ class FusedKernelTemplate:
                 send_d = HookTranspiler(send, ctx, spike_lowering=delivery_sites,
                                         default_spike_time="time").emit()
                 send_d = MaskAliasTransformer().transform(send_d)
-                recv_body += TargetMaskTransformer(set(pop.dynamic_attrs)).transform(send_d)
+                send_body = GluonTransformer().transform(
+                    TargetMaskTransformer(set(pop.dynamic_attrs)).transform(send_d))
             recv_body = GluonTransformer().transform(recv_body)
             stage_e = _uses_time(hook) or bool(delivery_sites.sites)  # (a spike there: at the delivery time)
-        recv_src = self._receive_source(state_attrs, recv_body, edge_attr, hook)
+        # receive and the per-delivery send as one (the link walks: send after every link), and apart (the batch
+        # walk: receive every input, send once a neuron's inputs at one time are in -- fused.py _walk_batch)
+        recv_src = (self._receive_source("_receive", state_attrs, recv_body + send_body, edge_attr, hook)
+                    + "\n\n" + self._receive_source("_receive1", state_attrs, recv_body, edge_attr, hook)
+                    + "\n\n" + self._receive_source("_send1", state_attrs, send_body, edge_attr,
+                                                     hook if send_body else None))
 
         # ---- update, then send, once per run (time = t = t_end), rooted at the group's mask
         sites = _SpikeSites("final")
@@ -223,12 +230,12 @@ class FusedKernelTemplate:
                            consts=dict(T_A=float(t_a), T_C=float(t_c), T_B=float(t_b)))
 
     @staticmethod
-    def _receive_source(state_attrs, body, edge_attr, hook) -> str:
+    def _receive_source(name, state_attrs, body, edge_attr, hook) -> str:
         unpack = f"    ({', '.join(state_attrs)},) = state\n" if state_attrs else ""
         pack = f"    return ({', '.join(state_attrs)},)\n" if state_attrs else "    return state\n"
         if hook is None:
-            return ("@gluon.jit\ndef _receive(state, hit, time, w, srcword, ectx, nodes):\n"
-                    "    \"\"\"No receive (no incoming connection carries one).\"\"\"\n    return state\n")
+            return (f"@gluon.jit\ndef {name}(state, hit, time, w, srcword, ectx, nodes):\n"
+                    "    \"\"\"Nothing (no incoming connection carries one).\"\"\"\n    return state\n")
         time_name = hook.parameter_type_to_name.get(_time_type())
         lines = [unpack, "    is_target = hit\n"]
         if time_name and time_name != "time":
@@ -236,8 +243,9 @@ class FusedKernelTemplate:
         if edge_attr is not None:
             lines.append(f"    edge_{edge_attr} = w\n")
         body_src = "".join("    " + line + "\n" for stmt in body for line in ast.unparse(stmt).splitlines())
-        return ("@gluon.jit\ndef _receive(state, hit, time, w, srcword, ectx, nodes):\n"
-                f"    \"\"\"The transpiled receive ({hook.function.__qualname__}), rooted at hit.\"\"\"\n"
+        return (f"@gluon.jit\ndef {name}(state, hit, time, w, srcword, ectx, nodes):\n"
+                f"    \"\"\"The transpiled receive ({hook.function.__qualname__}) -- and / or its per-delivery send "
+                f"({name}) --, rooted at hit.\"\"\"\n"
                 + "".join(lines) + body_src + pack)
 
     @staticmethod
@@ -266,7 +274,7 @@ class FusedKernelTemplate:
 else:
     n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
                       parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
-                      NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, NC)
+                      NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, NC, SEG)
 if ok:
     # the node attrs receive touches (loaded first thing): the state through delivery
     state = {state_tuple}
@@ -276,7 +284,8 @@ if ok:
     state, n_ev = _deliver(state, pid, n_groups, plan, n_conns, ring, k_lo, k_hi, offs, lane, mask, received_ptr,
                            n_received_ptr, log_ptr, log_cap, trace, n_ev, {ectx}, _receive, GROUP_SIZE, N_SLOTS,
                            STREAM, U, SPT, NUM_WARPS, MAX_CONNS, LOG, COUNT, LOG or {stage_e}, TRACE,
-                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, {stage_w}, T_A, T_C, T_B, NC, QUEUES, t_end)
+                           TRACE_CAP, POOL_B, check_ptr, ARENA_CHECK, {stage_w}, T_A, T_C, T_B, NC, QUEUES, t_end, SEG, _receive1,
+                           _send1)
 {unpack}
     t = t_end
     time = t_end

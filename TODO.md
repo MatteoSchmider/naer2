@@ -1,5 +1,23 @@
 # naer2 — status and plan
 
+## Open in the working tree (segment records and the batch walk, uncommitted experiment, 2026-11-22)
+
+- **The batch walk writes no delivery log** (`_walk_batch`): the log-based tests (test_fused_gpu's end-to-end,
+  link-width and every-other-round tests) can't check segment records.
+- **`NAER2_SEG`**: a temporary environment flag flipping `segment_records`' default (runtime.py, population.py) --
+  the PD14 measurements' switch; to go once the record format is decided.
+- **The step-3 delay-class path** (`NC`, `_stage_merged`'s classes, `_merge_classes`, `Population._delay_classes`):
+  superseded by queues, and broken with segment records -- to remove.
+- **Exact ties** (found 2026-11-22: Brunel at N = 5000 and 50k jumped to ~330 Hz): delta synapses with one delay
+  fire whole cascades at bit-identical times; with the threshold checked in receive, simultaneous inputs applied
+  one by one (E before I) let excitation win. Now Brunel's check is in send, and the batch walk runs a neuron's
+  per-delivery send once its inputs at one time are in (`_receive1` / `_send1`; the link walks still per link).
+  Open: D-3 (spikes from receive) wants a model with heterogeneous delays and event-driven dynamics to test with;
+  fp32 time merges distinct events on long runs (~1 us at 10 s).
+- **PD14 with segment records**: 36.9 us a round (link records 21.1): the link walk's staging buffers still
+  allocated beside the batch walk's (45.8 KB LDS, 46 spills) -- occupancy.
+
+
 Every population runs one fused Gluon kernel per run (pull intake, delivery, update, send, emission),
 generated from its hooks (`naer2/transpiler/templates/fused.py` the fixed template -- what limits optimizing it
 further: `limitations.md` next to it -- and `fused_template.py` its generator), on its runtime

@@ -51,6 +51,7 @@ selects the compiled variant and dropped when the buffers change.
 import collections
 import contextlib
 import math
+import os
 import time
 import warnings
 import weakref
@@ -241,6 +242,8 @@ class PopulationRuntime:
         self.count_received = False
         self.stream_block, self.unroll = WALK["stream"], WALK["unroll"]
         self.waves_per_eu = 0
+        # the slotted ring's records: per link (False) or per segment (True: _walk_segments; a queue's always)
+        self.segment_records = os.environ.get("NAER2_SEG") == "1"  # (EXPERIMENT: the default flipped for a run)
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
         self.seed = 0  # random.*'s stream (the population's own seed: Population.seed)
@@ -708,7 +711,7 @@ class PopulationRuntime:
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
             POOL_B=self.ring.pool_b,
             ARENA_CHECK=bool(self.arena_check and self.ring.pool_b), NC=self.ring.n_classes,
-            QUEUES=self.queues, GP=p2(max([max(h.G if h.regions else 1, 1) for h in self.plan.histories], default=1)),
+            SEG=self.segment_records, QUEUES=self.queues, GP=p2(max([max(h.G if h.regions else 1, 1) for h in self.plan.histories], default=1)),
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 
