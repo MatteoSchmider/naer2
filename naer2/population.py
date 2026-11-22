@@ -37,8 +37,9 @@ class Population:
         # This population's own clock: a run every timestep (its window
         # [t, t + timestep)). None (default): an update() population runs as
         # far as its inputs' horizon allows, an event-driven one when an
-        # arrival is due (see _next_run_time). A population with update()
-        # dynamics and no incoming connections needs one (_check_schedulable).
+        # arrival is due (see _next_run_time); an update() population without
+        # incoming connections (a source) every smallest delay of its outgoing
+        # ones (_own_timestep).
         self.timestep = timestep
 
         # The ring's slot width; None (default): the finest resolution of the
@@ -91,6 +92,7 @@ class Population:
         # The scheduler's hot path, fixed for one Network.step (_prepare_step): (connection, source, minimum
         # delay) per incoming connection, event-driven, update() dynamics.
         self._ins: list = []
+        self._clock: float | None = None  # its clock for the step (_own_timestep)
         self._is_event_driven: bool = False
         self._autonomous: bool = False
 
@@ -179,10 +181,64 @@ class Population:
     def _event_driven(self) -> bool:
         return self.timestep is None and not self.has_autonomous_dynamics
 
+    def _own_timestep(self) -> float | None:
+        """The population's clock: its explicit timestep; else, for update() dynamics without incoming
+        connections (a source: e.g. a Poisson generator), the smallest delay of its outgoing connections
+        (BRUNEL.md, step 4) -- a run [t, t + D) emits nothing a consumer receives before t + D, so no consumer
+        ever waits on a run of it it couldn't have had (and the longest window that holds for). None: no clock
+        of its own (event-driven, an update() population its inputs bound, a source without outgoing
+        connections or with a zero delay)."""
+        if self.timestep is not None:
+            return self.timestep
+        if not (self.has_autonomous_dynamics and not self.incoming):
+            return None
+        d = min((pop._min_delay(c) for pop in self.network.populations for c in pop.incoming if c._source is self),
+                default=0.0)
+        return d if d > 0 else None
+
+    def _max_window(self) -> float:
+        """The longest window a run of this population can have: its clock (_own_timestep); else at most, over
+        its incoming connections, a source's longest window + the connection's minimum delay (its window ends at
+        its input bound, min over the sources' horizons + their delays: a horizon no further than a run of the
+        source past its start) -- a fixed point over the network (cycles bounded by any clocked path); inf
+        without one."""
+        pops = list(self.network.populations)
+        clocks = {p: p._own_timestep() for p in pops}
+        W = {p: clocks[p] if clocks[p] is not None else math.inf for p in pops}
+        for _ in range(len(pops) + 1):
+            changed = False
+            for p in pops:
+                if clocks[p] is not None or not p.incoming:
+                    continue
+                v = min(W.get(c._source, math.inf) + p._min_delay(c) for c in p.incoming)
+                if v < W[p]:
+                    W[p], changed = v, True
+            if not changed:
+                break
+        return W[self]
+
+    def _ring_window(self) -> float:
+        """The window the ring covers ahead of a run's start: its own clock (else the slot width), and every
+        source's run's (an intake can take in a whole run, its spikes spanning its window): a clocked source's
+        clock (exact), an event-driven one's longest window (_max_window). LIMITATION: an update() source
+        without a clock (bounded by its inputs, e.g. PD14's neurons) counts as one slot width -- in lockstep
+        with a clock its runs are (the fixed point's bound would be loose there: 2-3x PD14's 0.1)."""
+        w = self._slot_width()
+        own = self._own_timestep()
+        windows = [own if own is not None else w]
+        for c in self.incoming:
+            src = c._source
+            if src._own_timestep() is not None:
+                windows.append(src._own_timestep())
+            elif src._event_driven and math.isfinite(src._max_window()):
+                windows.append(src._max_window())
+        return max(windows)
+
     def _prepare_step(self) -> None:
         """Start of a Network.step: what its rounds look up constantly, cached for the step (incoming
-        connections, their sources and minimum delays; event-driven; update() dynamics) -- the scheduler's
-        Python is a good part of a round's host time."""
+        connections, their sources and minimum delays; event-driven; update() dynamics; its clock) -- the
+        scheduler's Python is a good part of a round's host time."""
+        self._clock = self._own_timestep()
         self._ins = [(c, c._source, self._min_delay(c)) for c in self.incoming]
         self._is_event_driven = self._event_driven
         self._autonomous = self.has_autonomous_dynamics
@@ -259,13 +315,14 @@ class Population:
         self._run_times, self._read_run = run_times, read_run
 
     def _check_schedulable(self) -> None:
-        """An update() population needs a clock: its own timestep, or
-        inputs bounding how far it may integrate."""
-        if self.timestep is None and self.has_autonomous_dynamics and not self.incoming:
+        """An update() population needs a clock: its own timestep, its
+        outgoing connections' smallest delay (a source), or inputs bounding
+        how far it may integrate."""
+        if self.has_autonomous_dynamics and not self.incoming and self._own_timestep() is None:
             raise ValueError(
                 f"{type(self.instance).__name__} population has update() dynamics but "
-                f"neither an explicit timestep nor incoming connections, so nothing "
-                f"determines how far each update may integrate: set population.timestep."
+                f"neither an explicit timestep, nor incoming connections, nor outgoing ones with a nonzero "
+                f"delay, so nothing determines how far each update may integrate: set population.timestep."
             )
 
     def _min_delay(self, conn) -> float:
@@ -318,14 +375,15 @@ class Population:
         changes". Never earlier than the network's current time.
 
           - never run yet: 0.0, for every population
-          - explicit timestep: its horizon (last run + timestep)
+          - a clock (explicit timestep, or a source's derived one): its horizon
+            (last run + timestep)
           - update() dynamics, no timestep: as soon as its input bound is
             past its horizon, i.e. it can integrate further
           - event-driven: its earliest pending arrival, once the input
             bound has reached it"""
         if self.last_update == -math.inf:
             return 0.0
-        if self.timestep is not None:
+        if self._clock is not None:
             return self._horizon
         if self._autonomous:
             if self._bound > self._horizon and not _same_time(self._bound, self._horizon):
@@ -346,7 +404,7 @@ class Population:
             return None
         self.last_update = t
         self._run_id += 1
-        window_end = t + self.timestep if self.timestep is not None else self._bound
+        window_end = t + self._clock if self._clock is not None else self._bound
         self._window = (t, window_end)
         if not self._is_event_driven:
             self._horizon = window_end
@@ -372,8 +430,10 @@ class Population:
         ring = self._runtime.ring
         pending = (ring.main_count + ring.side_count).view(ring.n_groups * ring.n_classes, ring.ring_slots)
         pending = pending.amax(0).tolist()  # (per slot, over the groups and delay classes)
+        ring.first_pending = math.inf  # (none: the ring is empty -- its next run starts from its own start)
         for k in range(ring.ring_pos, ring.ring_pos + ring.ring_slots):
             if pending[k % ring.ring_slots]:
+                ring.first_pending = k
                 arrival = (k + 1) * ring.slot_width
                 if arrival not in self._run_times:
                     self._run_times.append(arrival)
@@ -490,10 +550,11 @@ class Population:
             topologies.append(conn.fabric.simulation(
                 len(self.shape), self.group_size, device, resolution=self._resolution(conn),
                 attrs=[kernel.edge_attr] if kernel.edge_attr is not None else []))
-        # the ring covers the longest incoming delay (its bucket mean) and one run's window ahead
+        # the ring covers the longest incoming delay (its bucket mean) and one run's window ahead -- its own, or a
+        # source's, the longer: one intake can take in a source's run whose spikes span its window, so arrivals
+        # reach up to a source window + the longest delay past this run's start (_max_window)
         longest = max((float(t.bucket_mean.max()) for t in topologies), default=0.0)
-        window = self.timestep if self.timestep is not None else w
-        n_slots = math.ceil(longest / w) + math.ceil(window / w) + 3
+        n_slots = math.ceil(longest / w) + math.ceil(self._ring_window() / w - 1e-9) + 3
         caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
         classes, class_delays = self._delay_classes() or (None, None)
         cells = n_slots * (len(class_delays) if class_delays else 1)  # (a group's cells: a ring per class)

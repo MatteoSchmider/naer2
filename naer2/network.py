@@ -340,7 +340,7 @@ class Network:
         for pop in pops:
             for conn in pop.incoming:
                 src = conn._source
-                reads, runs = pop.timestep or self.resolution, src.timestep or self.resolution
+                reads, runs = pop._own_timestep() or self.resolution, src._own_timestep() or self.resolution
                 depth = max(depth, 2 + math.ceil(reads / runs - 1e-9))
         for pop in pops:
             pop._derived_depth = depth

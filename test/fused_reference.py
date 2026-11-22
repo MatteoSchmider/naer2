@@ -64,8 +64,8 @@ def pd14_neuron_kernel(
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
     if gated != 0:
         k_lo = gl.load(ev + parity * (2 + n_groups))
-    skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
-                      MAX_CONNS, NUM_WARPS)
+    skip, t_start = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, t_end, slot_width, n_groups,
+                               SK, KP, MAX_CONNS, NUM_WARPS)
     fin = gl.to_tensor(0)
     if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
@@ -145,8 +145,8 @@ def pd14_poisson_kernel(
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
     if gated != 0:
         k_lo = gl.load(ev + parity * (2 + n_groups))
-    skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
-                      MAX_CONNS, NUM_WARPS)
+    skip, t_start = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, t_end, slot_width, n_groups,
+                               SK, KP, MAX_CONNS, NUM_WARPS)
     fin = gl.to_tensor(0)
     if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,

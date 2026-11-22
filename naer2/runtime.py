@@ -330,6 +330,10 @@ class PopulationRuntime:
                 self._judge(self._pending.popleft())
         self.run_id += 1
         k_lo, k_hi = self.ring.ring_pos, self.delivers_until(deliver_until if deliver_until is not None else t_end)
+        if self.ring.first_pending is not None:  # its ring empty before: from its first pending slot, at most
+            # its own start's (an event-driven population idle past its ring's length; gated runs: _run_from)
+            k_lo = max(k_lo, min(self.ring.first_pending, int(t_start // self.ring.slot_width), k_hi))
+            self.ring.first_pending = None  # (this run's pull adds records)
         slot = self.run_id % self.status_slots  # (free: its previous run judged above)
         write_entry(self._sched_np[slot], self.run_id, round_id if round_id is not None else self.run_id, k_lo,
                     k_hi, t_start, t_end)

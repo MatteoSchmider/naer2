@@ -283,7 +283,7 @@ from naer2.trace import mark, trace_begin
 from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_ctx, _emit_delivered, _emit_spikes,
                                               _pin_first, _pull, _pull_headers,
                                               _rand, _randn, _run_done, _run_entry, _status_slot, _run_gate,
-                                              _run_status, _gate_skip, _gate_carry, _ev_close)
+                                              _run_status, _gate_skip, _gate_carry, _ev_close, _run_from)
 
 
 {recv_src}
@@ -313,10 +313,11 @@ def fused_run(
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)  # this run's status slot
-    if gated != 0:  # a gated run delivers from where the population's last run left off (event state)
-        k_lo = gl.load(ev + parity * (2 + n_groups))
-    skip = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK, KP,
-                      MAX_CONNS, NUM_WARPS)
+    if gated != 0:  # a gated run delivers from where the population's last run left off (event state) -- or
+        # later, where its ring holds nothing before (an idle event-driven population: from its run, _run_from)
+        k_lo = _run_from(ev, parity, pid, n_groups, gl.load(ev + parity * (2 + n_groups)), k_hi, t_start, slot_width)
+    skip, t_start = _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, t_end, slot_width, n_groups,
+                               SK, KP, MAX_CONNS, NUM_WARPS)
     fin = gl.to_tensor(0)
     if _run_gate(ring, ctl, pid, run_id):
         if skip:  # gated, nothing due: an empty run (published, done), everything carried over

@@ -80,7 +80,10 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   (Population attrs do), writing into one in place isn't without a settle() first.
 - **Scheduling**: adaptive implicit scheduling -- no explicit `Network.resolution` / `Connection.resolution` / slot
   width, derived from the populations' and connections' own timing instead of a 0.1 ms default; `n_slots`
-  (longest delay + one window + 3) revisited with a long-time-range event-driven network.
+  (longest delay + the longest of its own and its sources' windows + 3: `Population._ring_window`) revisited with
+  a long-time-range event-driven network -- an update() source without a clock (bounded by its inputs, PD14's
+  neurons) counts as one slot width there (its true bound is loose: 2-3x PD14's 0.1); a gated run's start at
+  its due time costs the PD14 kernel one VGPR (AMD ISA: 105 -> 106, 92 -> 93; to time on the 4090).
 - **Feature gaps**, each a failing test until closed (the generator raises NotImplementedError naming the decision,
   or the values are wrong), each checking the closed behaviour end to end:
   - `test_fused_generated_gpu::test_gap_receive_variants_per_connection` -- D-6

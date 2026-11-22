@@ -138,6 +138,91 @@ def test_several_homogeneous_delays_through_the_network(mode):
     assert torch.allclose(B.current.cpu().double(), total, atol=1e-4)
 
 
+def _periodic_net(delays=(0.5,), period=0.7, seed=0):
+    """An update()-only source with precise spike times and no timestep (test/nodes/periodic_source.py: each
+    neuron at its phase, then every period) into event-driven consumers, one per delay."""
+    from test.nodes import periodic_source
+
+    torch.manual_seed(seed)
+    A = periodic_source(period=period) * 50
+    phases = 0.05 + 0.6 * torch.rand(50)
+    A.next_spike = phases.clone()
+    conns, Bs = [], []
+    for d in delays:
+        B = commanded() * 60
+        B.count_received = True
+        conn = A >> PD14_connection(0.3) >> B
+        conn.weight = torch.rand(conn.shape)
+        conn.delay = d
+        conns.append(conn)
+        Bs.append(B)
+    return A.network, A, Bs, conns, phases
+
+
+def _periodic_expected(conn, phases, period, delay, until):
+    """Per target, the links of every spike (phase + k period) arriving before `until`, and their weights."""
+    offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
+    weight = conn.fabric.weight.cpu().double()
+    count, total = torch.zeros(60, dtype=torch.int64), torch.zeros(60, dtype=torch.float64)
+    for s in range(len(phases)):
+        n = 0
+        while float(phases[s]) + period * n + delay < until - 1e-6:
+            count.index_add_(0, tgt[offs[s]:offs[s + 1]], torch.ones(int(offs[s + 1] - offs[s]), dtype=torch.int64))
+            total.index_add_(0, tgt[offs[s]:offs[s + 1]], weight[offs[s]:offs[s + 1]])
+            n += 1
+    return count, total
+
+
+@pytest.mark.parametrize("mode", ["step", "planned", "graph"])
+def test_a_source_runs_every_smallest_outgoing_delay(mode):
+    """BRUNEL.md, step 4: an update() population without inputs or a timestep (a source) runs every smallest
+    delay of its outgoing connections (0.3 here, of 0.3 and 0.5): its runs [t, t + 0.3), every spike at its
+    exact time -- each consumer receives exactly the spikes arriving before its last window's end, stepped,
+    planned and captured."""
+    network, A, Bs, conns, phases = _periodic_net(delays=(0.5, 0.3))
+    if mode == "step":
+        network.step(5.0)
+    else:
+        network.step(0.05)
+        (network.run_planned if mode == "planned" else network.run_graph)(until=5.0)
+    assert A.timestep is None and A._own_timestep() == 0.3
+    assert A.runtime.runs_made() == round(A._horizon / 0.3)
+    for B, conn, d in zip(Bs, conns, (0.5, 0.3)):
+        B.check()
+        count, total = _periodic_expected(conn, phases, 0.7, d, B._window[1])
+        assert count.sum() > 1000
+        assert torch.equal(B.runtime.n_received.cpu().long(), count), (d, B._window)
+        assert torch.allclose(B.current.cpu().double(), total, atol=1e-3)
+
+
+def test_a_source_without_outgoing_delay_needs_a_timestep():
+    from test.nodes import periodic_source
+
+    A = periodic_source() * 10
+    with pytest.raises(ValueError, match="set population.timestep"):
+        A.network.step(1.0)
+
+
+@pytest.mark.parametrize("mode", ["step", "planned", "graph"])
+def test_an_event_driven_consumer_idle_longer_than_its_ring(mode):
+    """An event-driven consumer idle past its ring's length (its inputs arrive around 0.6, then 3.6; the ring:
+    13 slots of 0.1): its next run starts from its own start, not its last run's end -- the slots between are
+    empty, the later arrivals aren't far future (stepped: Ring.first_pending; gated: fused.py _run_from).
+    (Idle much longer, its sources' runs outgrow its history: the slow-consumer gap, test_gap_history_grows.)"""
+    network, A, (B,), (conn,), phases = _periodic_net(delays=(0.5,), period=3.0)
+    if mode == "step":
+        network.step(5.0)
+    else:
+        network.step(0.05)
+        (network.run_planned if mode == "planned" else network.run_graph)(until=5.0)
+    B.check()
+    assert B.runtime.ring.ring_slots * B.runtime.ring.slot_width < 2.0
+    count, total = _periodic_expected(conn, phases, 3.0, 0.5, B._window[1])
+    assert int(count.sum()) == 2 * len(conn.fabric.topology)  # (both spikes of every source)
+    assert torch.equal(B.runtime.n_received.cpu().long(), count)
+    assert torch.allclose(B.current.cpu().double(), total, atol=1e-3)
+
+
 def test_tensors_move_to_the_network_device_lazily():
     network, A, B, _, _ = _net(0.5)
     assert A.fire_now.device.type == "cpu"

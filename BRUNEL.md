@@ -67,7 +67,13 @@ Order (2026-11-22): 1, 3, 2, 4, 5 -- the user's turn between every step.
    the class dimension (pull: a link's cell by its connection's class; delivery: a
    slot's classes merged by arrival). Tests: two connections with different delays, exact arrival order per
    target against a host reference.
-4. **A source's derived timestep**: an update() population without inputs runs every min outgoing delay. Tests:
-   a Poisson source with no timestep set.
+4. **A source's derived timestep** (done 2026-11-22: `Population._own_timestep`; tests in test_network_step.py
+   with test/nodes/periodic_source.py): an update() population without inputs runs every min outgoing delay.
+   Tests: a Poisson source with no timestep set. Three gaps it exposed, closed with it (they hit any clocked
+   source with precise spike times): the ring now covers a source's run (one intake can take in a whole run:
+   `_ring_window`), an idle event-driven consumer starts from its own run, not its last one's end (stepped:
+   `Ring.first_pending`; gated: fused.py `_run_from`), and a gated run skips only with nothing due in its window
+   -- else it starts at the due time (fused.py `_gate_skip`: a launch planned at the earliest possible time,
+   a precise source's arrival a little later, skipped before).
 5. **Brunel A**: the neuron, the Poisson source, a fixed in-degree pattern, build(); tests at small N (exact
    deliveries, rates in the asynchronous irregular regime); a run at scale on the 4090.

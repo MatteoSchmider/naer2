@@ -6,6 +6,7 @@ from .ed_relay import ed_relay
 from .lif_cd import lif_cd
 from .lif_cd_weightless import lif_cd_weightless
 from .lif_ed import lif_ed
+from .periodic_source import periodic_source
 from .relay import relay
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "lif_cd",
     "lif_cd_weightless",
     "lif_ed",
+    "periodic_source",
     "relay",
 ]

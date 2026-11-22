@@ -709,15 +709,19 @@ EV_NONE = gl.constexpr(2147483647)
 
 
 @gluon.jit
-def _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, n_groups, SK: gl.constexpr,
+def _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, t_end, slot_width, n_groups, SK: gl.constexpr,
                KP: gl.constexpr, MAX_CONNS: gl.constexpr, NUM_WARPS: gl.constexpr):
-    """Whether a gated run (an event-driven population's planned launch: Network.plan) has nothing due at its
-    time t_start, as the host would decide it (Population._next_run_time): due is the earliest of (A) every
-    fresh source run with spikes -- its earliest emission + its connection's minimum delay (intake's) -- and
-    (B) the end of the first slot still holding records after the population's last run (any group's:
-    _note_pending_arrivals'). Every program decides alike (from the same headers and event state). An
-    ungated run never skips."""
+    """(skip, start) of a gated run (an event-driven population's planned launch: Network.plan): its due time,
+    as the host would decide it (Population._next_run_time), is the earliest of (A) every fresh source run with
+    spikes -- its earliest emission + its connection's minimum delay (intake's) -- and (B) the end of the first
+    slot still holding records after the population's last run (any group's: _note_pending_arrivals'). Nothing
+    due before its window's end: skip. Else the run starts at the due time, if later than its planned start --
+    a launch is planned at the earliest time an arrival could be due (sources with precise spike times: a little
+    later), and covers its window: the run exactly the stepped one (its start, its bare spikes, its first
+    slot). Every program decides alike (from the same headers and event state). An ungated run never skips,
+    starts as planned."""
     skip = gated != 0
+    start = t_start
     if gated != 0:
         LV: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
         MAX_CJ: gl.constexpr = MAX_CONNS * KP
@@ -744,8 +748,9 @@ def _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, slot_width, 
             v = gl.load(evp + EV_HDR + g0 + gi, mask=g0 + gi < n_groups, other=EV_NONE)
             first = gl.minimum(first, gl.min(v, axis=0))
         due = gl.minimum(due, gl.where(first < EV_NONE, (first + 1).to(gl.float32) * slot_width, float("inf")))
-        skip = due > t_start + 1e-6 * gl.maximum(gl.abs(t_start), 1.0)
-    return skip
+        skip = due >= t_end - 1e-6 * gl.maximum(gl.abs(t_end), 1.0)  # (due at its end: the next window's)
+        start = gl.maximum(t_start, due)
+    return skip, start
 
 
 @gluon.jit
@@ -786,6 +791,19 @@ def _ev_close(ev, ring, pid, run_id, k_lo, k_hi, n_groups, N_SLOTS: gl.constexpr
     gl.store(dst, rp)
     gl.store(dst + 1, gl.load(src + 1) + 1)
     gl.store(dst + EV_HDR + pid, first)
+
+
+@gluon.jit
+def _run_from(ev, parity, pid, n_groups, k_lo, k_hi, t_start, slot_width):
+    """The slot a gated run of program pid starts from -- its delivery's first and its pull's ring base
+    (arrivals before it go into it: late; at or past the ring's length past it: far): k_lo (where the
+    population's last run left off), or later where the group's ring holds nothing before -- its first slot
+    still holding records (_ev_close), at most the run's planned start's slot (and k_hi). An event-driven
+    population idle for a while starts at its run, not at its last run's end: the slots between are empty,
+    and arrivals a ring's length past that end aren't far. (A stepped run: the host's, Ring.first_pending.)"""
+    first = gl.load(ev + parity * (EV_HDR + n_groups) + EV_HDR + pid)
+    ks = gl.floor(t_start / slot_width).to(gl.int32)
+    return gl.maximum(k_lo, gl.minimum(gl.minimum(first, ks), k_hi))
 
 
 @gluon.jit
