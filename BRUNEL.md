@@ -77,3 +77,19 @@ Order (2026-11-22): 1, 3, 2, 4, 5 -- the user's turn between every step.
    a precise source's arrival a little later, skipped before).
 5. **Brunel A**: the neuron, the Poisson source, a fixed in-degree pattern, build(); tests at small N (exact
    deliveries, rates in the asynchronous irregular regime); a run at scale on the 4090.
+   Done 2026-11-22 (test/networks/Brunel; test_brunel_gpu.py at N = 5000, K = 1000; tools/brunel_run.py,
+   tools/brunel_reference.py). At Brunel's N = 12500, 400 ms (780M): E 37.7 Hz, I 37.9 Hz, CV(ISI) 0.44,
+   activity std/mean 0.59 (fast oscillations ~100-140 Hz); an independent time-driven reference (dt 0.05 ms)
+   37.6 / 37.8 Hz, CV 0.42, 0.51 -- the model's own state at this size (small N, C_E 160: mean-driven, regular,
+   ~80 Hz, as its theory says). Speed: ~135 ms wall per simulated ms (780M, N = 5000): the general pull,
+   sequential per spike (phase 2). What it found, fixed with it:
+   - **Horizons of slot-end runs**: an event-driven population with records pending in its ring runs at the
+     slot's end, but with exact delivery times (D-1) fires anywhere in the slot -- its horizon was the run time,
+     so consumers ran past spikes still to come (~1e-4 of the inputs stepped back in time). Now a run time's
+     earliest spike, `Population._floors` (the slot's start), bounds the horizon, stepped and planned.
+   - **random.* at a second call site** didn't compile (its salt past int32): XORed in 64 bits.
+   - **Arenas from the start**: the general pull can't stop a run whose arena runs out -- the start's burst lost
+     links; Brunel's build sizes them (`ring_in_flight` 0.25).
+   - **while loops** (the Poisson source: every spike of a run in one loop): lowered by IfTransformer to a masked
+     loop while any lane's condition holds; its spike sites emit where they stand, random.* inside keys on the
+     iteration (test_while_lowering.py).

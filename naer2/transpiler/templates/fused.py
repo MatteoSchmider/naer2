@@ -1882,6 +1882,16 @@ def _emit_spikes(fires, e, offs, history, hist_cap, run_id, K: gl.constexpr, SPT
 
 
 @gluon.jit
+def _any_lane(m):
+    """Whether any lane of the mask m is set: a lowered while loop's test (IfTransformer) -- m [GROUP_SIZE] (the
+    program's neurons) or [NUM_WARPS, GROUP_SIZE // NUM_WARPS] (delivery's rows, in receive)."""
+    x = m.to(gl.int32)
+    if len(x.shape) == 2:
+        x = gl.max(x, axis=1)
+    return gl.max(x, axis=0) > 0
+
+
+@gluon.jit
 def _emit_ctx(history, hist_cap, run_id, K: gl.constexpr):
     """The run's history slot, for spikes inside delivery (_emit_delivered): (count, earliest, nodes, times,
     overflow, cap)."""

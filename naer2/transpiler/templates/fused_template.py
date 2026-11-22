@@ -66,12 +66,17 @@ class _SpikeSites:
 
     def __init__(self, where: str):
         self.where = where  # "final" (update / send after update) or "delivery"
-        self.sites: list[bool] = []  # per site: bare
+        self.sites: list[bool] = []  # per site: bare (the flushed ones, _fire<k> / _e<k>)
+        self.loop_sites: list[bool] = []  # per site inside a while loop (emitted where it stands): bare
 
-    def __call__(self, mask: str, time_expr: str, bare: bool) -> list[ast.stmt]:
+    def __call__(self, mask: str, time_expr: str, bare: bool, in_loop: bool = False) -> list[ast.stmt]:
         if self.where == "delivery":
             self.sites.append(False)  # (a spike at the delivery's time: never the window's start)
             return _STMTS(f"_emit_delivered({mask}, ({time_expr}), nodes, ectx)")
+        if in_loop:  # (fires any number of times: into the history at once, D-3)
+            self.loop_sites.append(bare)
+            return _STMTS(f"_emit_spikes({mask}, ({time_expr}) + gl.zeros([GROUP_SIZE], gl.float32, layout=LN), "
+                          f"offs, history, hist_cap, run_id, K, SPT, NUM_WARPS)")
         k = len(self.sites)
         self.sites.append(bare)
         return _STMTS(f"_fire{k} = {mask}\n_e{k} = ({time_expr}) + gl.zeros([GROUP_SIZE], gl.float32, layout=LN)")
@@ -211,7 +216,8 @@ class FusedKernelTemplate:
         # receive's time (D-1): its map from a record's emission time and slot, by the incoming delays
         t_a, t_c, t_b = pop._delivery_time()
         return FusedKernel(source, kernel, attrs, state_attrs, edge_attr,
-                           uniform_emission=all(sites.sites) and not delivery_sites.sites, stage_e=stage_e,
+                           uniform_emission=all(sites.sites) and all(sites.loop_sites) and not delivery_sites.sites,
+                           stage_e=stage_e,
                            consts=dict(T_A=float(t_a), T_C=float(t_c), T_B=float(t_b)))
 
     @staticmethod
@@ -280,7 +286,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from naer2.trace import mark, trace_begin
-from naer2.transpiler.templates.fused import (_deliver, _emit_close, _emit_ctx, _emit_delivered, _emit_spikes,
+from naer2.transpiler.templates.fused import (_any_lane, _deliver, _emit_close, _emit_ctx, _emit_delivered, _emit_spikes,
                                               _pin_first, _pull, _pull_headers,
                                               _rand, _randn, _run_done, _run_entry, _status_slot, _run_gate,
                                               _run_status, _gate_skip, _gate_carry, _ev_close, _run_from)

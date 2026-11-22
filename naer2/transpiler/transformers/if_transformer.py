@@ -26,6 +26,24 @@ class IfTransformer(ast.NodeTransformer):
     exactly the set of lanes this statement should treat as firing, so the
     lowering itself needs no is_target-awareness of its own.
 
+    while <cond>: body  →  a loop for as long as any lane's condition holds,
+    each lane in it until its own fails (and never again -- so the loop's
+    counter is every active lane's own iteration):
+
+        _it0 = tl.to_tensor(0)
+        _m0 = mask & (<cond>)
+        while _any_lane(_m0):
+            <body, rooted at _m0>
+            _it0 = _it0 + 1
+            _m0 = _m0 & (<cond>)
+
+    (_any_lane: the template's reduction over the mask, whatever its shape;
+    _it0: the loop's counter, named by RandomLoweringTransformer so random.*
+    inside draws anew every iteration -- n2_loop_var.) n2.spike() inside a
+    loop lowers through spike_lowering(..., in_loop=True): a site that fires
+    any number of times, emitted where it stands. No else, break, continue
+    or return in a loop.
+
     ast.Assign  → tl.where on the branch mask.
     ast.AugAssign → expanded to BinOp then tl.where.
     A top-level n2.spike() (outside any if) is the same emission rooted at "mask".
@@ -38,6 +56,8 @@ class IfTransformer(ast.NodeTransformer):
         hook without n2.spike()).
         default_spike_time: a bare n2.spike()'s time."""
         self._counter = 0
+        self._loops = 0  # while loops around the statement being lowered
+        self._loop_vars = 0
         self.spike_lowering = spike_lowering
         self.default_spike_time = default_spike_time
 
@@ -77,6 +97,8 @@ class IfTransformer(ast.NodeTransformer):
         bare = not node.value.args and not node.value.keywords
         if self.spike_lowering is None:
             raise ValueError("n2.spike() needs a spike_lowering to lower it with")
+        if self._loops:
+            return self.spike_lowering(mask, time_expr, bare, in_loop=True)
         return self.spike_lowering(mask, time_expr, bare)
 
     def _lower_body(self, stmts: list[ast.stmt], mask: str) -> list[ast.stmt]:
@@ -99,6 +121,8 @@ class IfTransformer(ast.NodeTransformer):
                 result += self._lower_spike(stmt, mask)
             elif isinstance(stmt, ast.If):
                 result += self._lower_if(stmt, mask)
+            elif isinstance(stmt, ast.While):
+                result += self._lower_while(stmt, mask)
             else:
                 result.append(stmt)
         return result
@@ -115,8 +139,32 @@ class IfTransformer(ast.NodeTransformer):
                 result += self._lower_body(node.orelse, neg)
         return result
 
+    def _lower_while(self, node: ast.While, parent_mask: str) -> list[ast.stmt]:
+        if node.orelse:
+            raise NotImplementedError("while ... else isn't lowered")
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Break, ast.Continue, ast.Return)):
+                raise NotImplementedError(f"{type(sub).__name__.lower()} in a while loop isn't lowered: each lane "
+                                          f"leaves the loop when its condition fails")
+        it = getattr(node, "n2_loop_var", None)
+        if it is None:
+            it = f"_itw{self._loop_vars}"
+            self._loop_vars += 1
+        mask = self._fresh_mask()
+        cond = ast.unparse(node.test)
+        result = list(_STMTS(f"{it} = tl.to_tensor(0)\n{mask} = {parent_mask} & ({cond})"))
+        self._loops += 1
+        body = self._lower_body(node.body, mask)
+        self._loops -= 1
+        body += _STMTS(f"{it} = {it} + 1\n{mask} = {mask} & ({cond})")
+        loop = ast.While(test=ast.parse(f"_any_lane({mask})", mode="eval").body, body=body, orelse=[])
+        return result + [loop]
+
     def visit_If(self, node: ast.If) -> list[ast.stmt]:
         return self._lower_if(node, "mask")
+
+    def visit_While(self, node: ast.While) -> list[ast.stmt]:
+        return self._lower_while(node, "mask")
 
     def visit_Expr(self, node: ast.Expr) -> ast.AST | list[ast.stmt]:
         # A top-level n2.spike() (not under any if) fires every lane the hook

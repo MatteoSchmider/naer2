@@ -46,6 +46,9 @@ class RandomLoweringTransformer(StmtTransformer):
         argument) in the key's high 32 bits: two populations draw their own
         streams (different by default, the same when their seeds are set
         equal) -- test_populations_draw_their_own_random_numbers.
+      - inside a while loop, its iteration (the loop's counter, which this
+        transformer names on the While node, n2_loop_var, for IfTransformer
+        to keep): the same call site draws anew every iteration.
 
     ALSO NOT HANDLED: `offs` is GROUP_SIZE-shaped (one lane per neuron);
     nothing here checks which lane space the surrounding code actually runs
@@ -57,6 +60,16 @@ class RandomLoweringTransformer(StmtTransformer):
 
     def __init__(self):
         self._call_site = 0
+        self._loops: list[str] = []  # the enclosing while loops' counters, outermost first
+        self._n_loops = 0
+
+    def visit_While(self, node: ast.While) -> ast.AST:
+        node.n2_loop_var = f"_it{self._n_loops}"  # (IfTransformer's counter for this loop: its name)
+        self._n_loops += 1
+        self._loops.append(node.n2_loop_var)
+        self.generic_visit(node)
+        self._loops.pop()
+        return node
 
     def _seed_expr(self) -> str:
         salt = self._call_site
@@ -64,7 +77,12 @@ class RandomLoweringTransformer(StmtTransformer):
         # a 64-bit Philox key: the population's seed (the kernel's `seed` argument, Population.seed) in the
         # high 32 bits, the time's bits (XOR the call site's salt) in the low ones -- no two populations'
         # streams meet, whatever their times
-        low = "t.to(tl.int32, bitcast=True)" if salt == 0 else f"(t.to(tl.int32, bitcast=True) ^ {salt * 0x9E3779B1})"
+        # (the salt XORed in 64 bits: a 32-bit salt doesn't fit an int32 constant -- the second call site's,
+        # 0x9E3779B1, already doesn't)
+        low = ("t.to(tl.int32, bitcast=True)" if salt == 0
+               else f"(t.to(tl.int32, bitcast=True).to(tl.int64) ^ {(salt * 0x9E3779B1) & 0xFFFFFFFF})")
+        for depth, it in enumerate(self._loops):  # (inside loops: each one's iteration, mixed in)
+            low = f"({low}.to(tl.int64) ^ ({it}.to(tl.int64) * {(0x85EBCA6B + depth * 0xC2B2AE35) & 0xFFFFFFFF}))"
         return f"((seed.to(tl.int64) << 32) | ({low}.to(tl.int64) & 0xFFFFFFFF))"
 
     @staticmethod

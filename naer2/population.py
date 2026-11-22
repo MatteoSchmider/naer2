@@ -79,6 +79,10 @@ class Population:
         self._horizon: float = 0.0
         self._bound: float = math.inf
         self._run_times: list[float] = []
+        # a run time's earliest spike where it is earlier (a slot-end run: its slot's records arrive, and fire,
+        # anywhere in the slot -- D-1's exact times; the horizon must be no later: _relax_horizon); an exact
+        # run time (a source run's earliest emission + the minimum delay) is its own
+        self._floors: dict[float, float] = {}
         self._min_delays: dict = {}
         self._max_delays: dict = {}
         # Intake bookkeeping: _run_id counts this population's runs (0 =
@@ -270,8 +274,12 @@ class Population:
             if not self._is_event_driven:
                 continue  # its own clock or its inputs' horizon runs it: no summary needed
             if planning:  # (Network.plan: every time an arrival of this source run could make a run due)
-                self._run_times.extend(r for r in self._possible_run_times(conn, source, min_delay)
-                                       if not any(_same_time(r, q) for q in self._run_times))
+                for r, floor in self._possible_run_times(conn, source, min_delay):
+                    q = next((q for q in self._run_times if _same_time(r, q)), None)
+                    if q is None:
+                        self._run_times.append(q := r)
+                    if floor < self._floors.get(q, q):
+                        self._floors[q] = floor
                 continue
             n, earliest = source._emission_summary()  # a host sync (TODO.md, D-13)
             if n:
@@ -279,16 +287,18 @@ class Population:
         # (The spikes themselves: the fused kernel's pull takes them in at
         # this population's next run, straight from the sources' histories.)
 
-    def _possible_run_times(self, conn, source, min_delay: float) -> list[float]:
+    def _possible_run_times(self, conn, source, min_delay: float) -> list[tuple[float, float]]:
         """(Network.plan) Every time a spike of the source's last run [ts, te) through conn could make this
         event-driven population's run due, without knowing its spikes: ts + the minimum delay (intake's,
         exact for a source emitting at its window's start), and the end of every slot an arrival in
-        [ts + min delay, te + max delay] can land in (_note_pending_arrivals')."""
+        [ts + min delay, te + max delay] can land in (_note_pending_arrivals') -- each with its earliest
+        spike (a slot's: its start, or ts + the minimum delay)."""
         ts, te = source._window
         w = self._slot_width()
         k0 = math.floor((ts + min_delay) / w + 1e-9)
         k1 = math.floor((te + self._max_delay(conn)) / w + 1e-9)
-        return [ts + min_delay] + [round((k + 1) * w, 12) for k in range(k0, k1 + 1)]
+        return [(ts + min_delay, ts + min_delay)] + [(round((k + 1) * w, 12), max(round(k * w, 12), ts + min_delay))
+                                                     for k in range(k0, k1 + 1)]
 
     def _max_delay(self, conn) -> float:
         """Largest delay on `conn` (0.0 if it has none), cached (as _min_delay)."""
@@ -307,11 +317,11 @@ class Population:
     def _schedule_state(self) -> tuple:
         """Everything Network.step's scheduling changes (Network.plan restores it)."""
         return (self.last_update, self._run_id, getattr(self, "_window", None), self._horizon, self._bound,
-                list(self._run_times), dict(self._read_run), self._summary)
+                list(self._run_times), dict(self._read_run), self._summary, dict(self._floors))
 
     def _restore_schedule(self, state: tuple) -> None:
         (self.last_update, self._run_id, self._window, self._horizon, self._bound, run_times, read_run,
-         self._summary) = state
+         self._summary, self._floors) = state
         self._run_times, self._read_run = run_times, read_run
 
     def _check_schedulable(self) -> None:
@@ -364,7 +374,8 @@ class Population:
                 bound = b
         horizon = self._horizon
         if self._is_event_driven and self.last_update != -math.inf:
-            horizon = min(bound, min(self._run_times, default=math.inf))
+            # (its spikes no earlier than its runs' earliest: a slot-end run's, its slot's start -- _floors)
+            horizon = min(bound, min((self._floors.get(r, r) for r in self._run_times), default=math.inf))
         changed = bound != self._bound or horizon != self._horizon
         self._bound, self._horizon = bound, horizon
         return changed
@@ -411,6 +422,8 @@ class Population:
         self._run_times = [
             r for r in self._run_times if r > window_end and not _same_time(r, window_end)
         ]
+        if self._floors:
+            self._floors = {r: f for r, f in self._floors.items() if r in self._run_times}
 
         if launch:
             self.run(t, window_end, round_id=self.network.round_id, stream=stream)
@@ -434,9 +447,10 @@ class Population:
         for k in range(ring.ring_pos, ring.ring_pos + ring.ring_slots):
             if pending[k % ring.ring_slots]:
                 ring.first_pending = k
-                arrival = (k + 1) * ring.slot_width
+                arrival = (k + 1) * ring.slot_width  # (a run at the slot's end; its spikes from its start on)
                 if arrival not in self._run_times:
                     self._run_times.append(arrival)
+                self._floors[arrival] = min(self._floors.get(arrival, arrival), k * ring.slot_width)
                 return
 
     # ------------------------------------------------------------------ the fused kernel's runtime
