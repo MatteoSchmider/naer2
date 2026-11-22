@@ -57,6 +57,9 @@ if GRAPH:
     print(f"graph: simulated {sim:.1f} ms in {wall:.2f} s ({1000 * wall / sim:.2f} ms wall per ms, "
           f"{1e6 * wall / max(network.round_id - r0, 1):.0f} us per round, {network.round_id - r0} rounds); runs",
           {k: p.runtime.runs_made() for k, p in pops.items()})
+    import resource
+    print(f"memory: GPU peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, host peak "
+          f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.1f} GiB")
     sys.exit(0)
 t0, t = time.time(), D
 while t < T - 1e-9:

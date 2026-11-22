@@ -1,5 +1,22 @@
 # naer2 — status and plan
 
+## Next (decided 2026-11-22)
+
+1. **A short kernel refactor** -- before refactors A and B (PLAN.md), which stay open after it, then the rest.
+   Around segment records and the batch walk (one walk, one record format for queues and slots); the fused round
+   the default everywhere (Brunel: not slower, ~3% faster), the unfused path removed in a later refactor.
+2. **PD14's registers with segment records** (168 a thread, 46 spills; 27.0 us a round, link records 21.1):
+   capping them never helped -- finding and removing them should win part of it back.
+3. **Brunel**: 3x real time at 50k on the 4090 (captured windows) -- to optimize later, as PD14. Strong scaling
+   on the 4090 (2026-11-23, captured windows, 100 ms): wall per simulated ms 2.8-3.0 from 10k to 60k, 3.5-3.7 from
+   70k to 110k (2.18 G links); a round ~2.1-2.8 ms at every size (latency-bound, not by the links). Memory: GPU
+   ~8.3 B a link (15.1 GiB at 100k), the host's peak in construction ~24 B a link (44 GiB at 100k, 53 at 110k:
+   the instance's 62 GB the first limit, ~110k); construction 129 s at 100k (~N^2) -- both to cut (phase 4).
+   **Latency-bound** (as naer1 was): a round's time is its kernels' chain of dependent steps -- the pull's
+   loads, the merge's and the batch walk's barriers, one after another -- not the links moved. To optimize with
+   aggressive prefetching and latency hiding: the next block's / batch's records and links loaded while the
+   current one is walked, fewer barriers per batch, more independent work in flight per program.
+
 ## Open in the working tree (segment records and the batch walk, uncommitted experiment, 2026-11-22)
 
 - **The batch walk writes no delivery log** (`_walk_batch`): the log-based tests (test_fused_gpu's end-to-end,
