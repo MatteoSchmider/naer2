@@ -215,3 +215,20 @@ what limits a round is the slowest of its ~309 programs running side by side, no
   the window's mean above it is its slower rounds (p90 27.4) and the graph's start. The fused kernel: ~8 s
   to compile, 168 registers (each population's own: <= 123) -- 3 programs an SM, still one wave; capped at
   128 (4 an SM): no different.
+
+## Streams around a resize, reproducibility (2026-11-22)
+
+- **A resize synchronizes after its work too.** It runs while a round is being launched (a run's judging asks
+  for it), and the round's populations' streams wait only for what the current stream held when the round began
+  (`Network._concurrently`'s one event): without the second sync their kernels read the new rings before the
+  resize's copies filled them -- free stacks of zeros, two slots in one block, staging reading a mixed record, an
+  illegal address in PD14's volley (3/6-6/8 runs on the 4090). Everything that synchronized near a resize hid it
+  (the caching allocator off, a host-side invariant check, the device-side arena check's rebuild). The arena
+  check stays as a development aid (`PopulationRuntime.arena_check`, fused.py ARENA_CHECK: every block popped
+  and freed counted on the device, the first violation raised when its run is judged).
+- **Reproducibility**: delivery order within a slot follows the pull's LDS atomic claims, so two runs can sum a
+  neuron's inputs in a different order (last bits). In practice the runs are reproducible (planned windows:
+  bitwise, 3 of 3; PD14 stayed spike-for-spike identical across two paths for 8000 rounds). A guaranteed order
+  isn't cheap: a tile's 128 lanes claim ~20-50 different slots (a segment per delay bucket, ~3-6 lanes a slot),
+  so aggregating the claims per slot needs a pass per distinct slot, and claiming warp by warp ~4 barriers a
+  tile -- more than the claim costs now (~0.3 us a tile).

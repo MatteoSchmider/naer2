@@ -1,184 +1,112 @@
 # naer2 — status and plan
 
+Every population runs one fused Gluon kernel per run (pull intake, delivery, update, send, emission),
+generated from its hooks (`naer2/transpiler/templates/fused.py` the fixed template -- what limits optimizing it
+further: `limitations.md` next to it -- and `fused_template.py` its generator), on its runtime
+(`naer2/runtime.py`: state, emission history `naer2/history.py`, ring `naer2/ring.py`, plan of incoming
+`SimulationTopology`s). `Network.step` schedules round by round (horizons, rounds, one stream per population);
+`Network.run_graph` replays planned windows of rounds from captured device graphs (`naer2/schedule.py`,
+`naer2/graph.py`), optionally with every round's populations fused into one kernel (`naer2/fusion.py`,
+`Network.fuse_rounds`) and, for clock-only networks, windows extrapolated instead of planned
+(`naer2/periodic.py`, `Network.periodic_windows`). PD14 (`test/networks/PD14/net.py`, its expert settings in
+`tune`): rates within a few percent of the published model; on the RTX 4090 ~25 us wall clock per 0.1 ms round
+in quiet activity, GPU-bound (2026-11-21).
 
-test
+Run everything with `python -m pytest`. Open gaps are failing `test_gap_*` tests (`python -m pytest -k gap`) and
+`# GAP (...)` comments in the code (`grep -rn "GAP (" naer2`); known limitations are `# LIMITATION (...)`
+comments and `naer2/transpiler/templates/limitations.md`; D-n are the decisions below.
 
-Every population runs one fused Gluon kernel per run (pull intake, delivery,
-update, send, emission), generated from its hooks
-(`naer2/transpiler/templates/fused.py` the fixed template -- what limits
-optimizing it further: `limitations.md` next to it -- and
-`fused_template.py` its generator), on its runtime (`naer2/runtime.py`:
-state, emission history `naer2/history.py`, ring `naer2/ring.py`, plan of
-incoming `SimulationTopology`s), scheduled by `Network.step` (horizons,
-rounds, one stream per population). PD14 through `Network.step` matches
-the hand-built harness spike for spike over 800 ms at equal ring
-capacities (`tools/pd14_network.py`, 2026-11-16).
+## Small changes
 
-Run everything with `python -m pytest`. Open gaps are failing `test_gap_*`
-tests (`python -m pytest -k gap`) and `# GAP (...)` comments in the code
-(`grep -rn "GAP (" naer2`); known limitations are `# LIMITATION (...)`
-comments; D-n are the decisions below.
+- **Generated modules in /tmp**: every generated kernel module (`fused_template._load`, `fusion.FusedRound._load`)
+  leaves a directory behind (`tempfile.mkdtemp`, never removed) -- 1600+ after a few days of development; with
+  Triton's own cache (several GB) it nearly filled a disk. One directory per process, removed at exit (the JIT
+  only reads a kernel's source from its file while compiling).
+- **PD14's harness ring capacities** (`tools/pd14_setup.py`, `PD14_MAIN_CAP`) were sized for the old, weaker
+  volley (before the L4e -> L2/3e fix): re-measure them (the network's E_6 arena now peaks at ~1500 blocks, ~700
+  before).
+- **The per-link attr load is unconditional** (`_stage_records`): a connection whose receive reads no attr gets a
+  placeholder attr block (`fabric.PLACEHOLDER`); a constexpr skipping the load would save it.
+- **`random.*` in an edge hook** would draw by the neuron lane index, not the link's (RandomLoweringTransformer):
+  raise NotImplementedError there until edge hooks run on link lanes.
+- **Multapses** (duplicate targets in one row): delivered as separate links; forward runs per link (D-8 if in one
+  stream block). Not enforced or documented anywhere.
+- **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean post-target mapping because `@` binds
+  tighter than `>>`; TODOs in `Population.__matmul__` / `Connection.__matmul__` -- document it, or raise on it.
 
-## Model correctness
+## Medium changes
 
-- **PD14's rates** (2026-11-21): E_23 was silent (0.0 Hz) because the network doubled the wrong projection
-  -- E_23 -> E_4 instead of the published L4e -> L2/3e (test/networks/PD14/net.py). Fixed, 5 s through
-  Network.step on the 4090, the last second: E_23 0.81, I_23 2.74, E_4 4.21, I_4 5.60, E_5 7.18, I_5 8.30,
-  E_6 1.07, I_6 7.50 Hz -- every population a few percent below the published ones (from memory, to check
-  against the paper: ~0.9, 2.9, 4.4, 5.8, 7.6, 8.6, 1.1, 7.8), plausibly the DC background (V_rest shifted)
-  lacking the Poisson drive's fluctuations: a Poisson background in PD14_neuron.update would close it.
-  Left: the harness's fixed ring capacities (tools/pd14_setup.py, PD14_MAIN_CAP) were sized for the old,
-  weaker volley -- re-measure them (the network's E_6 arena now peaks at ~1500 blocks, ~700 before).
+- **README.md** is out of date in general (e.g. "What's deliberately not here yet" says nothing runs a kernel).
+- **The showcases** (`showcases/`) predate the fused path in places (e.g. `hybrid_scheduling.py` mentions
+  `carry_cap`) -- look at them again, and check they still run.
+- **The test suite**: fine for now, but testing matters more as the library matures -- work through it (structure,
+  speed, coverage). Known so far: no direct unit tests for `AttrPrefixTransformer`, `SelfAttrTransformer`,
+  `TargetMaskTransformer`, `GluonTransformer`, `UsedMemberFinder` / `AssignedMemberFinder` (only through the
+  generated kernels' tests); unused test fixtures (`ed_relay`, `lif_cd_weightless`, the two triplet STDP edges).
+- **Construction and compile time**: measure, then cut -- the fused round kernel takes ~8 s to compile, PD14's first
+  captured window ~8.7 s (compile and capture); needed to compare with NEST and GeNN (build times too).
+- **The step path's schedule entries** are read from pinned host memory (`PopulationRuntime.run`: the direct
+  schedule): 1-5 us of every program's start, growing with the population's programs (uncached PCIe reads, every
+  program its own; limitations.md). In device memory (one copy per run, or a planned window's) if stepping still
+  matters next to captured windows.
+- **A history that grows** when a consumer falls behind
+  (`test_network_step::test_gap_history_grows_with_a_slow_consumer`; today the overrun raises).
+- **Ring memory**: the per-cell overflow log -- at least one block (256 records) per cell, most of the quiet-activity
+  memory beyond the arenas; a per-group log would be smaller (a claim per record past the held blocks); the
+  reserve (`ring.POOL_RESERVE` = 2 blocks per main run; PD14's quiet slots end with ~220-360 records) could follow
+  the need; a run holds at most `ring.POOL_MAX_BLOCKS` = 2047 blocks (the packed claim counter's field): past it,
+  the runtime raises.
+- **Group-local link targets as `uint8` / `int16`** (group sizes up to 256 / 65536): 2-4x less target memory at
+  billions of synapses.
+- **D-1: receive's `time` is the link's arrival**, e + its bucket's mean delay (`test_gap_receive_time_is_the_arrival`):
+  the pull knows the mean when it appends, so the record's time word carries the arrival.
+- **An event-driven test model**: a network to optimize the general (event-driven) path against -- planning,
+  gated windows -- the way PD14 drove the clocked one.
 
-## Open work
+## Large changes
 
-- **Illegal address in PD14's volley** (closed 2026-11-22). A resize runs while a round is being launched
-  (a run's judging asks for it), and the round's populations' streams waited only for what the current
-  stream held when the round began: their kernels read the new rings before the resize's copies filled
-  them -- free stacks of zeros, two slots in one block, staging reading a mixed record. `_Launches.resize`
-  (and `_grow_cells`) now synchronize after the copies too. Every earlier check that synchronized hid it
-  (the caching allocator off, the host-side invariant check, the device-side arena check's rebuild); found
-  by the device-side arena check (`PopulationRuntime.arena_check`, fused.py ARENA_CHECK: silent, and still
-  no fault, with only its rebuild left -- which synchronizes) and confirmed 8/8 clean on the 4090 (before:
-  3/6 and 6/8 faulting). `tools/pd14_volley.py` (`--device-check`), `tools/pd14_volley_debug.patch` are the
-  tools from the hunt.
-- **Ring sizing** (2026-11-18). Every group's main and side runs live in
-  one arena of 256-record blocks (`naer2/ring.py`; `fused.py`:
-  `_append_links`, `_pool_fixup`, `_free_blocks`), sized at runtime
-  (`naer2/runtime.py`): every run's status (stats per group: blocks held,
-  most logged; the groups done) lands in pinned host slots, at most
-  `status_slots` (4) runs behind; arenas and logs grow at need x 1.5 > size
-  to need x 2 (both in one resize), shrink when need x 1.5 < size / 2 for
-  200 runs. A run too large for its ring stops before committing anything,
-  every run after it stops too (`_run_gate`), and the host reruns them once
-  the rings have grown (`_Launches.recover`) -- nothing is lost. Every
-  resize waits for the device to be idle (reallocating while other streams'
-  kernels ran made the 780M's MES fail REMOVE_QUEUE and reset the GPU --
-  the "PD14 faults after the overflow" seen before). PD14 from the minimum
-  arenas: spike-for-spike identical to per-cell rings, 0.42 GB of rings in
-  quiet activity (1.36 GB fixed before), ~1.7 GB at the volley's peak.
-  Left:
-  - **segmented arena growth** (next for sizing): a resize copies the
-    arena once (growing; a shrink compacts), batched across populations
-    behind one drain. PD14 on the RX 6600, G=256 / 8 warps (2026-11-19),
-    the volley's first 200 rounds: 26 resizes in 8 batches, 92 ms (57 ms of
-    copies, up to 477 MB), ~1.03 ms a round against ~0.50 without them.
-    Instead: an arena of segments, a growth adding one (new block ids past
-    the old ones, onto the free stacks) and copying nothing -- the kernel
-    addresses a block through its segment (a block id's segment from its
-    high bits, or a small per-group segment table: one more lookup per
-    record address, issued with the block id's load; limitations.md, the
-    dependent loads), the reserve and the tables staying where they are; a
-    shrink still compacts (rare, in quiet activity). Also fewer drains: 8
-    batches are 8 waits for an idle device.
-  - the per-cell overflow log: at least one block (256 records) per cell,
-    most of the quiet-activity memory beyond the arenas; a per-group log
-    would be smaller (a claim per record past the held blocks).
-  - the reserve: `ring.POOL_RESERVE` = 2 blocks per main run (PD14's quiet
-    slots end with ~220-360 records) -- could follow the same need.
-  - a run holds at most `ring.POOL_MAX_BLOCKS` = 2047 blocks (the packed
-    claim counter's field): past it, the runtime raises.
-  - LIMITATION: the general (non-uniform) pull takes room record by record
-    and can't stop a run: past its ring it still loses links (a warning)
-    and the ring doubles.
-  - LIMITATION: host readbacks of device state go through
-    `PopulationRuntime.settle()` (a stopped run rerun first) -- anything
-    reading a history or ring directly on the host must call it. A rerun
-    reads the state tensors its launch read (the journal keeps them):
-    replacing a state tensor between runs is safe (Population attrs do),
-    writing into one in place isn't without a settle() first.
-- **Host limits** (2026-11-18). PD14's quiet rounds at G=256 are host-bound
-  on the 780M (~550 us of host time per round, 9 runs: ~60 us each --
-  status staging ~1/3, the launch ~1/4, the scheduler's Python ~1/5,
-  stream fork / join; the GPU's own floor somewhere around 230-400 us,
-  hard to pin down: the APU's GPU shares its power budget with the CPU).
-  Platform agnostic: nothing below torch / Triton (no HIP calls). Next:
-  the status written by the kernel straight into pinned host memory (no
-  copy, no event); then a measurement that holds up (more rounds, repeats,
-  the RX 6600 to separate the GPU from the CPU); then the scheduler's
-  Python. Structural, later: ONE launch per round for all populations --
-  Network collecting its runtimes into a bundle (a new class) that
-  launches every population's groups in one grid (the launch floor is
-  ~11 us per launch, ~100 us per PD14 round).
-- **Ring arenas: left from the clean-up** (2026-11-18: the layout lives in
-  `Ring._allocate` alone, its header read by `_ring`; the pooled helpers
-  are one section of `fused.py`). The general (non-uniform) pull still
-  takes blocks one record at a time (`_take_block`, with barriers) -- the
-  baseline path, slow anyway; the `lost` path (missing blocks, compacted
-  freeing) only runs once its arena ran out (untested at PD14's scale).
-- **Gaps**, each a failing test until closed (the generator raises
-  NotImplementedError naming the decision, or the values are wrong), each
-  checking the closed behaviour end to end:
+- **Segmented arena growth**: a resize copies the arena (growing; a shrink compacts) and drains the device -- PD14's
+  volley now makes ~55-85 resizes, its first 200 rounds ~0.4-0.7 ms a round on the 4090 against ~25 us in quiet
+  activity (RX 6600, 2026-11-19: 26 resizes in 8 batches, 92 ms, 57 ms of it copies, up to 477 MB). Instead: an
+  arena of segments, a growth adding one (new block ids past the old ones, onto the free stacks) and copying
+  nothing -- the kernel addresses a block through its segment (a block id's segment from its high bits, or a small
+  per-group segment table: one more lookup per record address, issued with the block id's load; limitations.md,
+  the dependent loads), the reserve and the tables staying where they are; a shrink still compacts (rare, in
+  quiet activity). Also fewer drains (every batch of resizes waits for an idle device, before and after).
+- **Autotuning per device**: the group size (`SimulationTopology.locality`; default 32, PD14 measured at 256 only),
+  the warps per program (4 everywhere for now, `runtime._warp_cap` -- the RX 6600 was faster at 8 when stepped),
+  the walk split by target warp (slower on the 780M, limitations.md) -- measured at startup.
+- **Refactoring**: the host side has grown in layers -- `Network` holds step, plan, run_planned, run_graph and the
+  fusion / periodic hooks, `PopulationRuntime` launching, status, windows, judging, sizing and recovery;
+  `Population` has become a god class (shape/config, dynamic_attrs bookkeeping, spike lifecycle state,
+  compile(), kernel compile + cache, device placement, real kernel launch...) -- split responsibilities out. Also:
+  see if `Topology` can be plain tensors (and regions / positions made lighter -- doubtful there); edges, nodes,
+  patterns, updates, receives, kernel, fabric each take a file -- maybe packaged more tightly, reusing things.
+- **The general (non-uniform) pull**: a mixed (NON_)UNIFORM_SOURCES pull (D-5); it takes room record by record
+  (`_take_block`, with barriers) and can't stop a run -- past its ring it still loses links (a warning) and the
+  ring doubles; the `lost` path (missing blocks, compacted freeing) only runs once an arena ran out (untested at
+  PD14's scale). LIMITATION: host readbacks of device state go through `PopulationRuntime.settle()` (a stopped
+  run rerun first) -- anything reading a history or ring directly on the host must call it; a rerun reads the
+  state tensors its launch read (the journal keeps them): replacing a state tensor between runs is safe
+  (Population attrs do), writing into one in place isn't without a settle() first.
+- **Scheduling**: adaptive implicit scheduling -- no explicit `Network.resolution` / `Connection.resolution` / slot
+  width, derived from the populations' and connections' own timing instead of a 0.1 ms default; `n_slots`
+  (longest delay + one window + 3) revisited with a long-time-range event-driven network.
+- **Feature gaps**, each a failing test until closed (the generator raises NotImplementedError naming the decision,
+  or the values are wrong), each checking the closed behaviour end to end:
   - `test_fused_generated_gpu::test_gap_spikes_inside_delivery` -- D-3
   - `test_gap_receive_variants_per_connection` -- D-6
   - `test_gap_several_per_link_attrs` -- D-7
-  - `test_gap_edge_forward` -- edge forward on link lanes while staging,
-    with D-8 documented in the code
+  - `test_gap_edge_forward` -- edge forward on link lanes while staging, with D-8 documented in the code
   - `test_gap_edge_forward_destination` -- D-9
   - `test_gap_source_attrs` -- D-10
-  - `test_gap_receive_time_is_the_arrival` -- D-1
   - `test_gap_edge_backward` -- D-11
-  - `test_coverage::test_gap_coverage_network_generates[B/C/D]` -- the
-    coverage network through D-3, edge forward and D-10
-  - `test_network_step::test_gap_history_grows_with_a_slow_consumer` -- a
-    history that grows when a consumer falls behind (today the overrun
-    raises)
-  - (closed 2026-11-21: every population draws its own `random.*` stream, `Population.seed`. Still open:
-    an edge hook calling `random.*` would use the neuron lane index, not the link's.)
-- **The per-link attr load is unconditional** (`_stage_records`): a
-  connection whose receive reads no attr gets a placeholder attr block
-  (`fabric.PLACEHOLDER`); a constexpr skipping the load would save it.
-- **Multapses** (duplicate targets in one row): delivered as separate
-  links; forward runs per link (D-8 if in one stream block). Not enforced
-  anywhere.
-- **`Connection @ mapping` without parens** (`>> B @ {...}`) doesn't mean
-  post-target mapping because `@` binds tighter than `>>`; TODOs in
-  `Population.__matmul__` / `Connection.__matmul__`.
-- **Optimizations**: a mixed (NON_)UNIFORM_SOURCES pull (D-5); an
-  automatic, device-dependent group size (`SimulationTopology.locality`;
-  default 32, PD14 measured at 256 only) and warps per program (an
-  autotuning at startup: 4 everywhere for now, `runtime._warp_cap` -- the
-  RX 6600 was faster at 8 when stepped); adaptive implicit scheduling --
-  no explicit `Network.resolution` / `Connection.resolution` / slot width,
-  derived from the populations' and connections' own timing instead of a
-  0.1 ms default; `n_slots` (longest delay + one window + 3) revisited
-  with a long-time-range event-driven network; group-local target indices
-  as `uint8` / `int16` (group sizes up to 256 / 65536: 2-4x less target
-  memory at billions of synapses).
-- **Reproducibility**: delivery order within a slot follows the pull's LDS
-  atomic claims, so two runs can sum a neuron's inputs in a different
-  order (last bits). In practice PD14 stayed spike-for-spike identical
-  across the two paths for 8000 rounds; a deterministic append order would
-  make it guaranteed.
-
-## Refactoring
-
-- see if Topology can be plain tensors
-- see if something similar can be done with regions/positions to make them
-  lighter (doubt it though in that case)
-- edges, nodes, patterns, updates, receives, kernel, fabric all take up
-  single files, maybe they can be packaged more tightly file-wise and reuse
-  some things?
-- Population has become a god class (shape/config, dynamic_attrs
-  bookkeeping, spike lifecycle state, compile(), kernel compile+cache,
-  device placement, real kernel launch...) — split responsibilities out once
-  the dust settles
-
-## Docs, showcases, tests
-
-- **README.md** is out of date in general (e.g. "What's deliberately not
-  here yet" says nothing runs a kernel) -- go through it.
-- **The showcases** (`showcases/`) predate the fused path in places (e.g.
-  `hybrid_scheduling.py` mentions `carry_cap`) -- look at them again, and
-  check they still run.
-- **The test suite**, eventually: fine for now and the foreseeable future,
-  but testing matters more as the library matures -- work through it and
-  optimize it then (structure, speed, coverage). Known so far: no direct
-  unit tests for `AttrPrefixTransformer`, `SelfAttrTransformer`,
-  `TargetMaskTransformer`, `GluonTransformer`, `UsedMemberFinder` /
-  `AssignedMemberFinder` (only through the generated kernels' tests);
-  unused test fixtures (`ed_relay`, `lif_cd_weightless`, the two triplet
-  STDP edges).
+  - `test_coverage::test_gap_coverage_network_generates[B/C/D]` -- the coverage network through D-3, edge forward
+    and D-10
+- **PD14 with a Poisson background, against NEST and GeNN**: the published model exists with a DC drive (this one:
+  V_rest shifted) and with a Poisson one; both, compared directly with NEST (its most rigorous settings) and GeNN
+  (2023, Poisson drive on an RTX 4090: real-time factor 0.272, ~27 us wall clock per 0.1 ms round) -- accuracy,
+  speed, and the front end's definition and build time.
 
 ## Decisions (D-n, judged together 2026-11-14; referenced from the code)
 
