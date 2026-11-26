@@ -1,5 +1,5 @@
+import itertools
 import math
-from logging import debug
 
 import torch
 
@@ -8,10 +8,43 @@ from .nodes import Node, node_types
 from .types import Region
 
 
+def _same_time(a: float, b: float) -> bool:
+    """Equality of two run times up to float rounding: 0.2 * 3 and 0.3 + 0.3
+    must count as the same round. inf only equals inf."""
+    if math.isinf(a) or math.isinf(b):
+        return a == b
+    return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+
+
+_SEEDS = itertools.count(1)  # (Population.seed: the populations numbered as they are made)
+
+
 class Population:
-    def __init__(self, instance, shape):
+    def __init__(
+        self,
+        instance,
+        shape,
+        group_size: int = 32,
+        timestep: float | None = None,
+        delay_resolution: float | None = None,
+    ):
         # TODO: actually verify that shape is integer or one of our allowed Regions with the Region constructor call
         self.shape: Region = Region(shape)
+
+        # neurons per program of the fused kernel (one group: its ring, its share of every link)
+        self.group_size = group_size
+
+        # This population's own clock: a run every timestep (its window
+        # [t, t + timestep)). None (default): an update() population runs as
+        # far as its inputs' horizon allows, an event-driven one when an
+        # arrival is due (see _next_run_time); an update() population without
+        # incoming connections (a source) every smallest delay of its outgoing
+        # ones (_own_timestep).
+        self.timestep = timestep
+
+        # The ring's slot width; None (default): the finest resolution of the
+        # incoming connections (see _slot_width).
+        self.delay_resolution = delay_resolution
 
         # Check that instance's type was decorated and registered
         if instance.__class__ not in node_types.keys():
@@ -33,54 +66,83 @@ class Population:
         self.instance = instance
         self.incoming: list = []  # Connection objects whose target is this population
         self.last_update: float = -math.inf
+        # Scheduling (see _next_run_time, _relax_horizon):
+        # _horizon: no spike of this population before it is still unknown
+        #   (clocked/update populations: where their last run computed to;
+        #   event-driven ones: derived every round from their inputs).
+        # _bound: no input arrival before it is still unknown.
+        # _run_times: pending arrivals of an event-driven population --
+        #   intake appends arrival + the connection's minimum delay for a
+        #   connection whose source emitted new spikes; later per-link
+        #   arrivals are found in its ring after each run
+        #   (_note_pending_arrivals).
+        self._horizon: float = 0.0
+        self._bound: float = math.inf
+        self._run_times: list[float] = []
+        # a run time's earliest spike where it is earlier (a slot-end run: its slot's records arrive, and fire,
+        # anywhere in the slot -- D-1's exact times; the horizon must be no later: _relax_horizon); an exact
+        # run time (a source run's earliest emission + the minimum delay) is its own
+        self._floors: dict[float, float] = {}
+        self._min_delays: dict = {}
+        self._max_delays: dict = {}
+        # Intake bookkeeping: _run_id counts this population's runs (0 =
+        # never run); _read_run[conn] is the source run intake last read
+        # from conn, so a source is read once per run even when rounds
+        # repeat at the same time; _summary caches (run id, n spikes,
+        # earliest emission time) of this population's own last run.
+        self._run_id: int = 0
+        self._read_run: dict = {}
+        self._summary: tuple[int, int, float] | None = None
+        # The scheduler's hot path, fixed for one Network.step (_prepare_step): (connection, source, minimum
+        # delay) per incoming connection, event-driven, update() dynamics.
+        self._ins: list = []
+        self._clock: float | None = None  # its clock for the step (_own_timestep)
+        self._is_event_driven: bool = False
+        self._autonomous: bool = False
+
+        # The fused kernel's runtime (naer2/runtime.py), built on the first
+        # run: the kernel generated from this population's hooks
+        # (fused_kernel()), its dynamic attrs as the runtime's state (the
+        # same tensors), its history, ring and plan of incoming
+        # connections.
+        # The ring (naer2/ring.py): every group's runs in one arena of
+        # ring_block-record blocks, starting at ring_in_flight of the group's
+        # incoming links (the largest group's) + per slot its reserved blocks
+        # and a partly used one -- by default the reserves alone: the
+        # runtime sizes the arenas from what the runs need (naer2/runtime.py;
+        # PD14: quiet activity needs little more than the reserves, the
+        # thalamic volley ~4x that). main_cap / side_cap: with ring_block
+        # None only, per-cell runs of that many records (None: their
+        # defaults).
+        self._fused = None
+        self._runtime = None
+        self._connected = False
+        self.ring_block: int | None = 256
+        self.ring_in_flight: float = 0.0
+        self.main_cap: int | None = None
+        self.side_cap: int | None = None
+        # the emission history's depth; None: the network's derived one
+        # (Network._plan_histories), 3 without a network step
+        self.history_depth: int | None = None
+        self._derived_depth: int = 3
+        # the spikes one run can emit (its history's cap); None: one per neuron -- more where neurons fire inside
+        # delivery, any number of times a run (D-3); past it the run's spikes are lost and check() raises
+        self.history_cap: int | None = None
+        # the slotted ring's records per segment (a source's links into a group in one record, the walk expanding
+        # it) instead of per link -- queues always hold segments (SPIKES.md)
+        self.segment_records: bool = __import__("os").environ.get("NAER2_SEG") == "1"  # (EXPERIMENT)
+        # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
+        # development aid -- off by default, a little work per delivered link
+        self.count_received: bool = False
+        # receive's time where the incoming delays vary per link (D-1, BRUNEL.md): every link of a ring slot at
+        # one time, its "center" (statistically unbiased) or its "end" (causal: never before an actual arrival)
+        self.slot_time: str = "center"
+        # random.* draws from this population's own stream (RandomLoweringTransformer): distinct by default
+        # (populations numbered as they are made: the same network built the same way draws the same numbers),
+        # the same stream where set equal
+        self.seed: int = next(_SEEDS)
 
         self.network: Network = Network(self)
-
-        # Debug
-        # debug(self.dynamic_attrs)
-
-        # need to decide:
-        # attributes may be dynamic if they are changed in a connection as well!
-        # => only collect ALL attributes here
-        # => potentially let connection ADD attributes?
-        # => when is the decision made which ones are dynamic and which are static?
-
-        # why should a connection add attributes?
-        # => stdp may want to write to a buffer of pre-firing times in a target neuron
-        # => this is the basis of our whole speedup in simulation!
-        # => so to not make the target neuron code depend on this, we need to be able to add an array to it
-        # => the connection needs to add the array to the population from the edge code
-        # => edge code needs to be analyzed, together with the mappings to identify which unresolved attributes are left and need to be added
-
-        # STEP 1:
-        # this whole issue arose from trying to verify source and edge mappings in connection
-        # so for that problem, just provide all static and dynamic attributes
-        # in fact, as we see here now, we can only make a final decision on which is which, once we have all connections from and to a population
-        # ideally, the connection "adds" these to the appropriate population
-        # => we may add to source from edge and target code
-        # => we may add to target from edge code
-
-        # focus on verifying mappings for now.
-        # a mapping can only mean that the thing it is renaming already exists, otherwise it will simply be added
-        # when something is added we can worry about that later on.
-        # we need to provide a  way to access all known attributes from the population!
-        # we also need a way to check which attributes from source the edge code uses
-
-        # =====> we have the assignedmemberfinder!
-        # instead of looking for assignments on members of self, look for assignments on members of source, target, time, etc.!
-        # => we can even have a separate ast analyzer which looks for usages overall, not just assignments
-        # so we can find which source attributes the edge and target code actually USE and which ones they ASSIGN and also which ones in total are present in either population and the edge
-        # overall we do need something like the Population class for Edges too, wherein this analysis can be found, their multiplicity is generated from the Connection class, because it depends upon the pattern
-        # so the edge class may have its edge type known and the ast analysis accessed before knowing how many edges there actually are, since the connection may still be incomplete but already trying to verify things
-        # overall, since the edge class would be for verification and compilation, just like the Population class is for now,
-        # it would make sense to remove any start/stop control from the population class and delegate this exclusively to a network class!
-        # since the network class is singly responsible for that, it should consist only of that and not at all of compilation, that is handled by the individual populations
-        # the edge code also needs to be integrated in the population code of course, but this may happen at a later stage and it needs information from both the edge and population classes
-        # so merging only makes sense by letting the population own the edge at some point.....
-        # networks owns populations and connections, but populations own edges but edges are part of connections????
-
-        # STEP 2:
-        # JIT-compile only just before running
 
     @property
     def ports(self):
@@ -91,102 +153,510 @@ class Population:
         """True when the update hook modifies state, so the network clock must drive it."""
         return bool(self.node.update.assigned_members)
 
-    def _min_incoming_delay(self) -> float:
-        """Smallest per-link delay across all incoming connections."""
-        min_d = math.inf
-        for conn in self.incoming:
+    def _ensure_on_device(self, device) -> None:
+        """Move this population's own per-neuron dynamic-attr tensors onto
+        `device` in place (idempotent), so they're the right device both to
+        read and to tl.store into from this point on. Called on `self`
+        before this population's own kernel launches, and on a connection's
+        `_source` before reading its state as a source_{attr} pointer --
+        since the "lazy move on first kernel launch" policy must hold
+        regardless of which population's kernel happens to run first on a
+        given round.
+
+        A dynamic attr build()-time code never explicitly broadcast into a
+        per-neuron tensor (e.g. `pop.potential = tensor` is common, but a
+        node can have several dynamic attrs and nothing requires every one
+        of them to be set that way) is broadcast here instead, lazily, from
+        the node instance's own scalar default (the value its __init__ set)
+        -- same timing as the device move, since both are "whatever this
+        attr needs before the first real kernel read/write touches it"."""
+        n = len(self.shape)
+        for attr, py_type in self.dynamic_attrs.items():
+            if attr not in self.__dict__:
+                default = getattr(self.instance, attr)
+                dtype = (
+                    torch.bool
+                    if py_type is bool
+                    else torch.int32 if py_type is int else torch.float32
+                )
+                setattr(self, attr, torch.full((n,), default, dtype=dtype))
+            tensor = getattr(self, attr)
+            if tensor.device != device:
+                setattr(self, attr, tensor.to(device))
+
+    @property
+    def _event_driven(self) -> bool:
+        return self.timestep is None and not self.has_autonomous_dynamics
+
+    def _own_timestep(self) -> float | None:
+        """The population's clock: its explicit timestep; else, for update() dynamics without incoming
+        connections (a source: e.g. a Poisson generator), the smallest delay of its outgoing connections
+        (BRUNEL.md, step 4) -- a run [t, t + D) emits nothing a consumer receives before t + D, so no consumer
+        ever waits on a run of it it couldn't have had (and the longest window that holds for). None: no clock
+        of its own (event-driven, an update() population its inputs bound, a source without outgoing
+        connections or with a zero delay)."""
+        if self.timestep is not None:
+            return self.timestep
+        if not (self.has_autonomous_dynamics and not self.incoming):
+            return None
+        d = min((pop._min_delay(c) for pop in self.network.populations for c in pop.incoming if c._source is self),
+                default=0.0)
+        return d if d > 0 else None
+
+    def _max_window(self) -> float:
+        """The longest window a run of this population can have: its clock (_own_timestep); else at most, over
+        its incoming connections, a source's longest window + the connection's minimum delay (its window ends at
+        its input bound, min over the sources' horizons + their delays: a horizon no further than a run of the
+        source past its start) -- a fixed point over the network (cycles bounded by any clocked path); inf
+        without one."""
+        pops = list(self.network.populations)
+        clocks = {p: p._own_timestep() for p in pops}
+        W = {p: clocks[p] if clocks[p] is not None else math.inf for p in pops}
+        for _ in range(len(pops) + 1):
+            changed = False
+            for p in pops:
+                if clocks[p] is not None or not p.incoming:
+                    continue
+                v = min(W.get(c._source, math.inf) + p._min_delay(c) for c in p.incoming)
+                if v < W[p]:
+                    W[p], changed = v, True
+            if not changed:
+                break
+        return W[self]
+
+    def _ring_window(self) -> float:
+        """The window the ring covers ahead of a run's start: its own clock (else the slot width), and every
+        source's run's (an intake can take in a whole run, its spikes spanning its window): a clocked source's
+        clock (exact), an event-driven one's longest window (_max_window). LIMITATION: an update() source
+        without a clock (bounded by its inputs, e.g. PD14's neurons) counts as one slot width -- in lockstep
+        with a clock its runs are (the fixed point's bound would be loose there: 2-3x PD14's 0.1)."""
+        w = self._slot_width()
+        own = self._own_timestep()
+        windows = [own if own is not None else w]
+        for c in self.incoming:
+            src = c._source
+            if src._own_timestep() is not None:
+                windows.append(src._own_timestep())
+            elif src._event_driven and math.isfinite(src._max_window()):
+                windows.append(src._max_window())
+        return max(windows)
+
+    def _prepare_step(self) -> None:
+        """Start of a Network.step: what its rounds look up constantly, cached for the step (incoming
+        connections, their sources and minimum delays; event-driven; update() dynamics; its clock) -- the
+        scheduler's Python is a good part of a round's host time."""
+        self._clock = self._own_timestep()
+        self._ins = [(c, c._source, self._min_delay(c)) for c in self.incoming]
+        self._is_event_driven = self._event_driven
+        self._autonomous = self.has_autonomous_dynamics
+
+    def _emission_summary(self) -> tuple[int, float]:
+        """(number of spikes, earliest emission time) of this population's
+        last run: its history's header, read back once per run and shared by
+        all consumers (a host sync -- TODO.md, D-13)."""
+        if self._summary is None or self._summary[0] != self._run_id:
+            if self._runtime is None or self._runtime.run_id == 0:
+                return 0, math.inf  # no kernel ran: nothing emitted
+            self._runtime.settle()  # (a stopped run rerun first)
+            n, earliest = self._runtime.history.summary(self._runtime.run_id)
+            self._summary = (self._run_id, n, earliest)
+        return self._summary[1], self._summary[2]
+
+    def _intake(self, t: float, planning: bool = False) -> None:
+        """End of every round (Network.step): take in what every source that
+        ran since this population last read it emitted. Host side: read
+        each source once per run, and for an event-driven population
+        schedule a run at the source's earliest emission + the connection's
+        minimum delay (later per-link arrivals are found by the update
+        kernel)."""
+        read = self._read_run
+        for conn, source, min_delay in self._ins:
+            if source._run_id == 0 or read.get(conn) == source._run_id:
+                continue
+            read[conn] = source._run_id
+            if not self._is_event_driven:
+                continue  # its own clock or its inputs' horizon runs it: no summary needed
+            if planning:  # (Network.plan: every time an arrival of this source run could make a run due)
+                for r, floor in self._possible_run_times(conn, source, min_delay):
+                    q = next((q for q in self._run_times if _same_time(r, q)), None)
+                    if q is None:
+                        self._run_times.append(q := r)
+                    if floor < self._floors.get(q, q):
+                        self._floors[q] = floor
+                continue
+            n, earliest = source._emission_summary()  # a host sync (TODO.md, D-13)
+            if n:
+                self._run_times.append(earliest + min_delay)
+        # (The spikes themselves: the fused kernel's pull takes them in at
+        # this population's next run, straight from the sources' histories.)
+
+    def _possible_run_times(self, conn, source, min_delay: float) -> list[tuple[float, float]]:
+        """(Network.plan) Every time a spike of the source's last run [ts, te) through conn could make this
+        event-driven population's run due, without knowing its spikes: ts + the minimum delay (intake's,
+        exact for a source emitting at its window's start), and the end of every slot an arrival in
+        [ts + min delay, te + max delay] can land in (_note_pending_arrivals') -- each with its earliest
+        spike (a slot's: its start, or ts + the minimum delay)."""
+        ts, te = source._window
+        w = self._slot_width()
+        k0 = math.floor((ts + min_delay) / w + 1e-9)
+        k1 = math.floor((te + self._max_delay(conn)) / w + 1e-9)
+        return [(ts + min_delay, ts + min_delay)] + [(round((k + 1) * w, 12), max(round(k * w, 12), ts + min_delay))
+                                                     for k in range(k0, k1 + 1)]
+
+    def _max_delay(self, conn) -> float:
+        """Largest delay on `conn` (0.0 if it has none), cached (as _min_delay)."""
+        if conn not in self._max_delays:
             d = getattr(conn.fabric, "delay", None)
             if d is None:
-                continue
-            min_d = min(
-                min_d,
-                float(d.min().item()) if isinstance(d, torch.Tensor) else float(d),
+                self._max_delays[conn] = 0.0
+            elif isinstance(d, torch.Tensor):
+                m = float(d.max())
+                self._max_delays[conn] = float(f"{m:.7g}") if d.dtype in (torch.float32, torch.float16,
+                                                                          torch.bfloat16) else m
+            else:
+                self._max_delays[conn] = float(d)
+        return self._max_delays[conn]
+
+    def _schedule_state(self) -> tuple:
+        """Everything Network.step's scheduling changes (Network.plan restores it)."""
+        return (self.last_update, self._run_id, getattr(self, "_window", None), self._horizon, self._bound,
+                list(self._run_times), dict(self._read_run), self._summary, dict(self._floors))
+
+    def _restore_schedule(self, state: tuple) -> None:
+        (self.last_update, self._run_id, self._window, self._horizon, self._bound, run_times, read_run,
+         self._summary, self._floors) = state
+        self._run_times, self._read_run = run_times, read_run
+
+    def _check_schedulable(self) -> None:
+        """An update() population needs a clock: its own timestep, its
+        outgoing connections' smallest delay (a source), or inputs bounding
+        how far it may integrate."""
+        if self.has_autonomous_dynamics and not self.incoming and self._own_timestep() is None:
+            raise ValueError(
+                f"{type(self.instance).__name__} population has update() dynamics but "
+                f"neither an explicit timestep, nor incoming connections, nor outgoing ones with a nonzero "
+                f"delay, so nothing determines how far each update may integrate: set population.timestep."
             )
-        return min_d
 
-    def advance(self, t: float):
-        """Called by Network.step — run both kernels if an update is due at time t."""
-        if self.has_autonomous_dynamics:
-            self._execute_gather_kernel(t)
-            self._execute_update_kernel(t)
-            self.last_update = t
+    def _min_delay(self, conn) -> float:
+        """Smallest delay on `conn` (0.0 if it has none), cached: delays
+        are static and a per-link tensor can be very large. A float32 tensor
+        holds ~7 significant digits: its minimum is read back to those (0.1
+        stays 0.1, not 0.10000000149 -- which would put this population's
+        runs a hair after its sources' and split every round in two)."""
+        if conn not in self._min_delays:
+            d = getattr(conn.fabric, "delay", None)
+            if d is None:
+                self._min_delays[conn] = 0.0
+            elif isinstance(d, torch.Tensor):
+                m = float(d.min())
+                self._min_delays[conn] = float(f"{m:.7g}") if d.dtype in (torch.float32, torch.float16,
+                                                                          torch.bfloat16) else m
+            else:
+                self._min_delays[conn] = float(d)
+        return self._min_delays[conn]
+
+    def _reset_horizon(self) -> None:
+        """Start of a round's horizon fixed point: derived values restart at
+        inf and only shrink while relaxing (see Network.step)."""
+        if self._ins:
+            self._bound = math.inf
+        if self._is_event_driven and self.last_update != -math.inf:
+            self._horizon = math.inf
+
+    def _relax_horizon(self) -> bool:
+        """One relaxation step: input bound = min over incoming connections
+        of (source horizon + minimum delay); an event-driven population
+        emits nothing before its earliest unprocessed arrival, so its own
+        horizon is min(bound, earliest pending arrival). True if anything
+        changed."""
+        bound = math.inf
+        for _conn, source, min_delay in self._ins:
+            b = source._horizon + min_delay
+            if b < bound:
+                bound = b
+        horizon = self._horizon
+        if self._is_event_driven and self.last_update != -math.inf:
+            # (its spikes no earlier than its runs' earliest: a slot-end run's, its slot's start -- _floors)
+            horizon = min(bound, min((self._floors.get(r, r) for r in self._run_times), default=math.inf))
+        changed = bound != self._bound or horizon != self._horizon
+        self._bound, self._horizon = bound, horizon
+        return changed
+
+    def _next_run_time(self) -> float:
+        """When this population next wants its update kernel to run, given
+        this round's relaxed horizons; math.inf for "not until something
+        changes". Never earlier than the network's current time.
+
+          - never run yet: 0.0, for every population
+          - a clock (explicit timestep, or a source's derived one): its horizon
+            (last run + timestep)
+          - update() dynamics, no timestep: as soon as its input bound is
+            past its horizon, i.e. it can integrate further
+          - event-driven: its earliest pending arrival, once the input
+            bound has reached it"""
+        if self.last_update == -math.inf:
+            return 0.0
+        if self._clock is not None:
+            return self._horizon
+        if self._autonomous:
+            if self._bound > self._horizon and not _same_time(self._bound, self._horizon):
+                return max(self._horizon, self.network.t)
+            return math.inf
+        arrival = min(self._run_times, default=math.inf)
+        if arrival <= self._bound or _same_time(arrival, self._bound):
+            return arrival
+        return math.inf
+
+    def _execute_update_kernel(self, t: float, stream=None, launch: bool = True) -> tuple[float, float] | None:
+        """Offered every round's time t by Network.step(); runs only if t is
+        this population's own next run time. The run's window ends at
+        t + timestep for a clocked population, else at its input bound.
+        Returns the run's window (None: not this round); launch False: the
+        bookkeeping only, no kernel (Network.plan)."""
+        if not _same_time(self._next_run_time(), t):
+            return None
+        self.last_update = t
+        self._run_id += 1
+        window_end = t + self._clock if self._clock is not None else self._bound
+        self._window = (t, window_end)
+        if not self._is_event_driven:
+            self._horizon = window_end
+        self._run_times = [
+            r for r in self._run_times if r > window_end and not _same_time(r, window_end)
+        ]
+        if self._floors:
+            self._floors = {r: f for r, f in self._floors.items() if r in self._run_times}
+
+        if launch:
+            self.run(t, window_end, round_id=self.network.round_id, stream=stream)
+        return t, window_end
+
+    def _note_pending_arrivals(self) -> None:
+        """An event-driven population runs when an arrival is due: its ring
+        knows the next one after a run -- the first slot still holding
+        records (later per-link arrivals of spikes already taken in). A run
+        at that slot's end is the first that can deliver it. One readback of
+        the ring's counts (the host sync event-driven scheduling has anyway,
+        TODO.md, D-13) -- after the round's join (Network.step): the run
+        is on this population's stream."""
+        if self._runtime is None:
+            return  # no kernel ran: nothing pending
+        self._runtime.settle()  # (a stopped run rerun first)
+        ring = self._runtime.ring
+        if self._runtime.queues:  # (its queues' next arrival, exact: the run's event state, fused.py _ev_close)
+            nxt = self._runtime.next_arrival()
+            if math.isfinite(nxt) and not any(_same_time(nxt, q) for q in self._run_times):
+                self._run_times.append(nxt)
+            return
+        pending = (ring.main_count + ring.side_count).view(ring.n_groups * ring.n_classes, ring.ring_slots)
+        pending = pending.amax(0).tolist()  # (per slot, over the groups and delay classes)
+        ring.first_pending = math.inf  # (none: the ring is empty -- its next run starts from its own start)
+        for k in range(ring.ring_pos, ring.ring_pos + ring.ring_slots):
+            if pending[k % ring.ring_slots]:
+                ring.first_pending = k
+                arrival = (k + 1) * ring.slot_width  # (a run at the slot's end; its spikes from its start on)
+                if arrival not in self._run_times:
+                    self._run_times.append(arrival)
+                self._floors[arrival] = min(self._floors.get(arrival, arrival), k * ring.slot_width)
+                return
+
+    # ------------------------------------------------------------------ the fused kernel's runtime
+
+    def fused_kernel(self):
+        """This population's FusedKernel, generated from its hooks (naer2/
+        transpiler/templates/fused_template.py), once."""
+        if self._fused is None:
+            from .transpiler.templates.fused_template import FusedKernelTemplate
+
+            self._fused = FusedKernelTemplate(self).build()
+        return self._fused
+
+    @property
+    def runtime(self):
+        """The runtime (naer2/runtime.py), connected to its sources' (built on first use)."""
+        self._ensure_runtime()
+        return self._runtime
+
+    def _create_runtime(self, device) -> None:
+        """The runtime itself, its state this population's dynamic attrs
+        (the same tensors: what the kernel writes, the attrs show) -- not
+        yet connected."""
+        if self._runtime is not None:
+            return
+        from .runtime import PopulationRuntime
+
+        self._ensure_on_device(device)
+        kernel = self.fused_kernel()
+        self._runtime = PopulationRuntime(kernel, len(self.shape), group_size=self.group_size,
+                                          depth=self.history_depth or self._derived_depth, device=device,
+                                          state={a: getattr(self, a) for a in kernel.attrs},
+                                          history_cap=self.history_cap)
+        self._runtime.seed = self.seed
+        self._runtime.segment_records = self.segment_records
+
+    def _resolution(self, conn) -> float:
+        """A connection's delay quantization: its own, else the network's."""
+        return conn.resolution if conn.resolution is not None else self.network.resolution
+
+    def _homogeneous_delay(self, conn) -> float | None:
+        """A connection's delay where it has one value for every link (a number, or a tensor of one value), read
+        back as _min_delay does; None where it varies per link."""
+        d = getattr(conn.fabric, "delay", None)
+        if d is None or not isinstance(d, torch.Tensor):
+            return float(d) if d is not None else 0.0
+        if d.numel() and bool((d == d.reshape(-1)[0]).all()):
+            return self._min_delay(conn)
+        return None
+
+    def _delivery_time(self) -> tuple[float, float, float]:
+        """receive's time (T_A, T_C, T_B: T_A e + T_C k + T_B for a record emitted at e, delivered from slot k;
+        D-1, BRUNEL.md, fused.py _deliver_link) by the incoming delays: one homogeneous delay D over every
+        incoming link -- exact, e + D (emission order is arrival order); otherwise the slot's center or end
+        (slot_time), every link of a slot at one time. Several homogeneous delays: (1, 0, 0) -- exact too, each
+        delay class's delay added by delivery (a ring per class, merged by arrival: _delay_classes)."""
+        delays = [self._homogeneous_delay(c) for c in self.incoming]
+        if None not in delays and len(set(delays)) <= 1:
+            return 1.0, 0.0, delays[0] if delays else 0.0
+        if self._delay_classes() is not None:  # (each class's delay added by delivery itself: _deliver, NC > 1)
+            return 1.0, 0.0, 0.0
+        if self.slot_time not in ("center", "end"):
+            raise ValueError(f"slot_time is 'center' or 'end', not {self.slot_time!r}")
+        w = self._slot_width()
+        return 0.0, w, (0.5 if self.slot_time == "center" else 1.0) * w
+
+    def _queues(self) -> bool:
+        """Every incoming connection one delay value (any values): a queue per connection, exact -- else the slotted
+        ring (any per-link delays: a slot's time). SPIKES.md. (Queues live in pooled arenas: per-cell runs,
+        ring_block None, keep the slotted ring. A queue's arrival, e + D_c, its delivery computes itself:
+        _delivery_time's constants stay a slotted ring's.)"""
+        return (bool(self.incoming) and bool(self.ring_block)
+                and all(self._homogeneous_delay(c) is not None for c in self.incoming))
+
+    def _delay_classes(self) -> tuple[list[int], list[float]] | None:
+        """Several homogeneous delays (every incoming connection one delay value, not all the same; D-1,
+        BRUNEL.md): per connection its delay class, per class its delay (in increasing order) -- a ring per
+        class, merged by arrival at delivery. None otherwise (one value, or any per-link delays)."""
+        delays = [self._homogeneous_delay(c) for c in self.incoming]
+        if None in delays or len(set(delays)) <= 1:
+            return None
+        values = sorted(set(delays))
+        return [values.index(d) for d in delays], values
+
+    def _slot_width(self) -> float:
+        """The ring's slot width: the finest resolution its incoming
+        connections require (TODO.md, D-12; population.delay_resolution
+        overrides); without incoming connections the network's."""
+        if self.delay_resolution is not None:
+            return float(self.delay_resolution)
+        return min((self._resolution(c) for c in self.incoming), default=self.network.resolution)
+
+    def _ring_pool(self, topologies, n_slots: int) -> tuple[int, int] | None:
+        """(block, blocks per group) of the ring's arenas (see __init__), None without ring_block."""
+        if not self.ring_block:
+            return None
+        n_groups = -(-len(self.shape) // self.group_size)
+        links = sum((t.links_per_group() for t in topologies), torch.zeros(n_groups, dtype=torch.int64))
+        from .ring import POOL_RESERVE
+
+        records = math.ceil(self.ring_in_flight * int(links.max())) if len(links) else 0
+        # + per slot its reserved blocks and one partly used one (see naer2/ring.py)
+        return self.ring_block, -(-records // self.ring_block) + n_slots * (POOL_RESERVE + 1) + 1
+
+    def _ensure_runtime(self) -> None:
+        """Every runtime of the population and its sources created, then
+        this one connected: each incoming connection's SimulationTopology
+        (Fabric.simulation, at this population's group size and slot width,
+        carrying the per-link attr its kernel stages) and its source's
+        runtime."""
+        device = self.network.device
+        self._create_runtime(device)
+        if self._connected:
+            return
+        kernel, w = self._runtime.kernel, self._slot_width()
+        sources, topologies = [], []
+        for conn in self.incoming:
+            conn._source._create_runtime(device)
+            sources.append(conn._source._runtime)
+            topologies.append(conn.fabric.simulation(
+                len(self.shape), self.group_size, device, resolution=self._resolution(conn),
+                attrs=[kernel.edge_attr] if kernel.edge_attr is not None else []))
+        # the ring covers the longest incoming delay (its bucket mean) and one run's window ahead -- its own, or a
+        # source's, the longer: one intake can take in a source's run whose spikes span its window, so arrivals
+        # reach up to a source window + the longest delay past this run's start (_max_window)
+        longest = max((float(t.bucket_mean.max()) for t in topologies), default=0.0)
+        n_slots = math.ceil(longest / w) + math.ceil(self._ring_window() / w - 1e-9) + 3
+        caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
+        min_delays = [self._min_delay(c) for c in self.incoming]
+        if self._queues():  # (a queue per connection: one cell each, no slots -- SPIKES.md)
+            self._runtime.connect(sources, topologies, len(self.incoming), slot_width=w,
+                                  pool=self._ring_pool(topologies, len(self.incoming)), min_delays=min_delays,
+                                  queues=True, **caps)
         else:
-            min_d = self._min_incoming_delay()
-            if min_d < math.inf and t - self.last_update >= min_d:
-                self._execute_gather_kernel(t)
-                self._execute_update_kernel(t)
-                self.last_update = t
+            classes, class_delays = self._delay_classes() or (None, None)
+            cells = n_slots * (len(class_delays) if class_delays else 1)  # (a group's cells: a ring per class)
+            self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, cells),
+                                  min_delays=min_delays, classes=classes, class_delays=class_delays, **caps)
+        self._connected = True
 
-    def _execute_gather_kernel(self, t: float):
-        """Kernel 1 stub: collect incoming spikes from all incoming connections,
-        interleave and sort them by arrival time, producing a merged spike buffer
-        (spike_tgt, spike_link per connection) for the update kernel.
-        """
-        pass
+    def run(self, t_start: float, t_end: float, deliver_until: float | None = None, round_id: int | None = None,
+            stream=None) -> None:
+        """One run of the fused kernel over [t_start, t_end) in round
+        `round_id`: what the sources emitted in earlier rounds taken in,
+        every slot due by deliver_until (default t_end) delivered, update,
+        send, emission into the history. The scheduler's entry
+        (_execute_update_kernel) and the direct one."""
+        self._ensure_runtime()
+        self._runtime.count_received = self.count_received
+        self._runtime.run(t_start, t_end, deliver_until=deliver_until, round_id=round_id, stream=stream)
 
-    def _execute_update_kernel(self, t: float):
-        """Kernel 2 stub: merged update-receive-send.
-        Consumes the spike buffer produced by the gather kernel, applies receive
-        hooks per connection, then runs the update and send hooks across all neurons.
-        """
-        pass
+    def check(self) -> None:
+        """Raise on what the last runs flagged (ring overflow, far-future arrivals, history overrun)."""
+        if self._runtime is not None:
+            self._runtime.check()
+
+    def emitted(self) -> list[tuple[float, int]]:
+        """The last run's spikes, [(e, node)] in flat-list order."""
+        return self._runtime.emitted()
+
+    def __setattr__(self, name, value):
+        if name[0] == "_":  # the internal bookkeeping (the scheduler sets these every round): never a dynamic attr
+            object.__setattr__(self, name, value)
+            return
+        # a dynamic attr assigned once the runtime exists: the runtime's state follows (same tensor)
+        runtime = self.__dict__.get("_runtime")
+        if runtime is not None and name == "seed":
+            runtime.seed = int(value)
+        if runtime is not None and name in runtime.state:
+            value = torch.as_tensor(value).to(runtime.device)
+            runtime.state[name] = value
+        object.__setattr__(self, name, value)
 
     def __rshift__(self, right):
         from .connection import ConnectionBuilder
 
         return ConnectionBuilder(self).connect(right)
 
-    def compile(self) -> "ast.Module":
-        """Compile the merged update-receive-send kernel for this population.
+    def __matmul__(self, mapping):
+        """A @ {real_name: hook_name} — source_map, before any edge is known.
 
-        Pairs each incoming connection with its transpiled receive-hook stmts,
-        then feeds them — along with the update and send sections — into
-        UpdateKernelTemplate to produce the final ast.Module.
+        Returns an incomplete ConnectionBuilder (no fabric/target yet) meant to
+        be finished with >>, e.g. A @ {"potential": "src_pot"} >> edge @ pattern >> B.
+
+        This claims @ on every Population unconditionally, which is why
+        `>> B @ {mapping}` (bare, no parens) can't mean "post-target fabric_map
+        on B" — @ binds tighter than >>, so `B @ {mapping}` evaluates first and
+        hits this method, treating B as a brand-new source (the chain then
+        raises, ConnectionBuilder.connect, naming the fix). Post-target mapping
+        requires explicit parens: `(A >> edge @ pattern >> B) @ {...}`.
+        A prior design used deliberately different operator binding strengths
+        (mirroring how | already binds looser than >> for delay()) to make bare
+        post-target chaining just work; we dropped that in favor of the current
+        type-dispatch design since it's more robust to a user not remembering
+        precedence rules. If we want bare post-target @ back, revisit that.
         """
-        import ast
+        from .connection import ConnectionBuilder
 
-        from .transpiler.context import TranspilerContext
-        from .transpiler.hook_transpiler import HookTranspiler
-        from .transpiler.templates.update_kernel import UpdateKernelTemplate
-
-        ctx = TranspilerContext(
-            static_attrs={
-                k: v
-                for k, v in self.instance.__dict__.items()
-                if k not in self.dynamic_attrs
-            },
-            dynamic_attrs=self.dynamic_attrs,
-        )
-
-        # one transpiled receive + edge-forward section per incoming connection
-        incoming_with_hooks = []
-        for conn in self.incoming:
-            port = conn._target_port or "receive"
-            hook = self.node.receive.get(port)
-            recv_stmts = (
-                HookTranspiler(hook, ctx).emit_for_spike_loop(set(self.dynamic_attrs))
-                if hook
-                else []
-            )
-
-            # edge forward hook (updates per-link edge state inside the spike loop)
-            edge_fwd_hook = conn.fabric.edge.get("forward")
-            if edge_fwd_hook is not None and edge_fwd_hook.assigned_members:
-                edge_ctx = TranspilerContext(
-                    static_attrs=conn.fabric.static_attrs,
-                    dynamic_attrs=conn.fabric.dynamic_attrs,
-                )
-                edge_fwd_stmts = HookTranspiler(edge_fwd_hook, edge_ctx).emit_for_spike_loop(
-                    set(conn.fabric.dynamic_attrs)
-                )
-            else:
-                edge_fwd_stmts = []
-
-            incoming_with_hooks.append((conn, recv_stmts, edge_fwd_stmts))
-
-        update_section = HookTranspiler(self.node.update, ctx).emit()
-        send_section = HookTranspiler(self.node.send, ctx).emit()
-
-        return UpdateKernelTemplate(ctx, incoming_with_hooks).build(
-            update_section, send_section
-        )
+        if not isinstance(mapping, dict):
+            raise ValueError("Population @ mapping expects a dict (source_map)")
+        return ConnectionBuilder(self).source_map(mapping)

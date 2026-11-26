@@ -1,0 +1,8 @@
+# naer2's Python dependencies, for cloud/setup.sh (the venv on a cloud GPU instance).
+# torch from the PyTorch wheel index setup.sh uses (TORCH_INDEX, default CUDA 12.8).
+torch==2.11.0
+numpy
+pytest
+# naer2's kernels are Gluon (triton.experimental.gluon) and need this Triton, newer than the one torch pins:
+# setup.sh installs this line as an override of torch's own triton requirement.
+triton==3.9.0

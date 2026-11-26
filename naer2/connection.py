@@ -49,7 +49,7 @@ class ConnectionBuilder:
         self._target_port: str = None
         self._source_map: dict[str, str | Set[str]] = None
         self._fabric_map: dict[str, str] = None
-        self._delay: int | float | torch.Tensor = None
+        self._resolution: float | None = None
 
     # ------------------------------------------------------------------ properties
 
@@ -60,6 +60,15 @@ class ConnectionBuilder:
     @property
     def _topology(self):
         return self._fabric.topology if self._fabric is not None else None
+
+    def _ensure_fabric(self) -> Fabric:
+        """A pattern with no edge at all (`A >> pattern >> B`) is valid --
+        it just means no forward/backward hooks and no per-link tensor
+        other than whatever gets set directly on the connection afterwards
+        (see Connection.__setattr__, Fabric(instance=None))."""
+        if self._fabric is None:
+            self._fabric = Fabric()
+        return self._fabric
 
     # ------------------------------------------------------------------ builder API
 
@@ -72,7 +81,7 @@ class ConnectionBuilder:
                     topology, inferred_region = Topology.build(
                         self._pattern, self._source.shape
                     )
-                    self._fabric.topology = topology
+                    self._ensure_fabric().topology = topology
                     self._target = Population(target, inferred_region)
             else:
                 raise ValueError(
@@ -81,9 +90,17 @@ class ConnectionBuilder:
         else:
             self._target = target
             if self._pattern is not None:
-                self._fabric.topology = Topology.build(
+                self._ensure_fabric().topology = Topology.build(
                     self._pattern, self._source.shape, target.shape
                 )
+        if (
+            self._target_port is not None
+            and self._target_port not in self._target.ports
+        ):
+            raise ValueError(
+                f"target_port '{self._target_port}' not in {self._target!r}"
+            )
+
         self._source.network += self._target.network
         conn = Connection(self)
         self._source.network.connections.add(conn)
@@ -108,9 +125,9 @@ class ConnectionBuilder:
     def target_port(self, target_port: str) -> "ConnectionBuilder":
         if not isinstance(target_port, str):
             raise ValueError("target port must be a string")
-        if self._target is None:
-            raise ValueError(f"Cannot set target_port before target is set")
-        if target_port not in self._target.ports:
+        # Port name may be set before the target is known (e.g. in the pre->>
+        # edge chain); validated against the target's ports once it is set.
+        if self._target is not None and target_port not in self._target.ports:
             raise ValueError(f"target_port '{target_port}' not in {self._target!r}")
         self._target_port = target_port
         return self
@@ -118,13 +135,13 @@ class ConnectionBuilder:
     def source_map(self, source_map: dict[str, str | Set[str]]) -> "ConnectionBuilder":
         if not isinstance(source_map, dict):
             raise ValueError("source_map must be a dict")
-        self._source_map = source_map
+        self._source_map = {**(self._source_map or {}), **source_map}
         return self
 
     def fabric_map(self, fabric_map: dict[str, str]) -> "ConnectionBuilder":
         if not isinstance(fabric_map, dict):
             raise ValueError("fabric_map must be a dict")
-        self._fabric_map = fabric_map
+        self._fabric_map = {**(self._fabric_map or {}), **fabric_map}
         return self
 
     # ------------------------------------------------------------------ connect dispatch
@@ -135,6 +152,10 @@ class ConnectionBuilder:
                 Fabric(to.edge) if not isinstance(to.edge, Fabric) else to.edge
             )
             self._pattern = to.pattern
+            if to.port is not None:
+                self.target_port(to.port)
+            if to.fabric_map:
+                self.fabric_map(to.fabric_map)
             return self
         if isinstance(to, Population):
             return self.target(to)
@@ -144,6 +165,11 @@ class ConnectionBuilder:
             return self._set_fabric(Fabric(to))
         if to in pattern_types or type(to) in pattern_types or callable(to):
             return self.pattern(to)
+        if isinstance(to, ConnectionBuilder) and to._target is None and to._source_map is not None:
+            # `A >> edge >> B @ {...}`: @ binds tighter than >>, so `B @ {...}` became a new chain from B
+            raise ValueError(
+                "a mapping after the target needs parentheses: write (A >> edge >> B) @ {...} -- "
+                "`>> B @ {...}` reads as `>> (B @ {...})`, a new connection from B with a source mapping")
         raise ValueError(f"Cannot connect to {to!r}")
 
     def __rshift__(self, to) -> "ConnectionBuilder | Connection":
@@ -155,10 +181,13 @@ class ConnectionBuilder:
             return self
         if not isinstance(place, dict):
             raise ValueError("at() expects a port name (str) or mapping (dict)")
-        if self._target is None or self._fabric is None:
+        # Disambiguation is purely by whether the edge (fabric) is known yet:
+        # before an edge is set, a mapping renames source attributes; once the
+        # edge is set, a mapping renames edge attributes for the target's receive.
+        if self._fabric is None:
             self.source_map(place)
-            return self
-        self.fabric_map(place)
+        else:
+            self.fabric_map(place)
         return self
 
     def __matmul__(self, mapping_or_port) -> "ConnectionBuilder":
@@ -170,11 +199,17 @@ class ConnectionBuilder:
                 raise ValueError("delay must be an int, float or tensor")
             elif value.shape != self.shape:
                 raise ValueError(f"delay tensor must be shape {self.shape}")
-        self._delay = value
+        setattr(self._ensure_fabric(), "delay", value)  # where conn.delay = ... puts it
         return self
 
     def __or__(self, value) -> "ConnectionBuilder":
         return self.delay(value)
+
+    @property
+    def resolution(self) -> float | None:
+        """The width its per-link delays are quantized at (delay buckets;
+        TODO.md); None: the network's resolution."""
+        return self._resolution
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -189,12 +224,85 @@ class Connection:
     def __init__(self, builder: ConnectionBuilder):
         self.builder = builder
 
+    def __setattr__(self, name, value):
+        if name == "builder":
+            object.__setattr__(self, name, value)
+            return
+        if name == "resolution":
+            # the delay quantization: the framework's own setting, never an edge attr
+            if value is not None and not (isinstance(value, (int, float)) and value > 0):
+                raise ValueError("resolution must be a positive number (or None: the network's)")
+            self.builder._resolution = float(value) if value is not None else None
+            return
+        if name == "delay":
+            # delay is read directly off fabric by the framework itself
+            # (Population._min_delay, Fabric.simulation's delay buckets),
+            # never via edge.delay inside a hook -- so it's exempt from the
+            # "some receive hook must reference this name" check below.
+            setattr(self.builder._ensure_fabric(), name, value)
+            return
+        self._set_edge_attr(name, value)
+
+    def _set_edge_attr(self, name, value) -> None:
+        """conn.<name> = tensor -- the validated, ergonomic alternative to
+        conn.fabric.<name> = tensor (still available, unchecked), and what
+        makes an edge class optional for the common "just a per-link
+        tensor, no learning rule" case (see Fabric(instance=None)).
+
+        Only stores it if the target's receive hook at this connection's
+        port actually reads edge.<name> (after reversing fabric_map) -- storing a tensor
+        nothing will ever load is almost certainly a mistake, and with no
+        edge class there's no other check (a real edge class's dynamic_attrs
+        validation) to catch it.
+        """
+        from .transpiler.analyzers.used_members import UsedMemberFinder
+
+        builder = self.builder
+        target = builder._target
+        port = builder._target_port or "receive"
+        hook = target.node.receive.get(port) if target is not None else None
+        if hook is None:
+            raise ValueError(
+                f"cannot set '{name}': target has no receive hook at port '{port}'"
+            )
+        used_edge_names = UsedMemberFinder(hook.ast, "edge").run()
+        edge_rename = {hook_name: real for real, hook_name in (builder._fabric_map or {}).items()}
+        real_used_edge_attrs = {edge_rename.get(n, n) for n in used_edge_names}
+        if name not in real_used_edge_attrs:
+            raise ValueError(
+                f"'{name}' is not used as edge.{name} by {target!r}'s receive hook "
+                f"(port '{port}') -- nothing would read this tensor"
+            )
+        setattr(builder._ensure_fabric(), name, value)
+
     def delay(self, value):
         self.builder.delay(value)
         return self
 
     def __or__(self, value):
         self.builder.delay(value)
+        return self
+
+    def __matmul__(self, other) -> "Connection":
+        # Post-target mapping/port, once the whole chain is already a Connection:
+        #   (A >> edge @ pattern >> B) @ {"weight": "w"}
+        # The edge is always already set by this point, so a dict here is
+        # unambiguously a fabric_map (at()'s own disambiguation confirms this).
+        #
+        # This only fires with the explicit parens shown above. Written
+        # bare — `A >> edge @ pattern >> B @ {"weight": "w"}` — @ binds tighter
+        # than >>, so `B @ {"weight": "w"}` evaluates first, hits
+        # Population.__matmul__, and produces a source_map builder for B as a
+        # brand-new source instead of a fabric_map on this Connection
+        # (ConnectionBuilder.connect then raises, naming the parens). A prior
+        # design used deliberately different operator binding strengths
+        # (mirroring how | already binds looser than >> for delay(), enabling
+        # `... >> B | 1.5` to work bare) so post-target @ would just work
+        # without parens; we dropped that for the current type-dispatch design,
+        # which is more robust to a user not remembering precedence rules
+        # (see Population.__matmul__'s TODO). Revisit if bare post-target
+        # chaining turns out to matter enough.
+        self.builder.at(other)
         return self
 
     def __getattr__(self, name):

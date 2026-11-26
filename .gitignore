@@ -1,5 +1,8 @@
+/__pycache__
+/.claude
+/.pytest_cache
+/.rocprofv3
 /.venv
 /.vscode
-/__pycache__
-/naer
 *.pyc
+/cloud/instance.env

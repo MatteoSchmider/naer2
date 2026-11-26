@@ -44,7 +44,8 @@ def edge_decorator(cls: type, forward_name: str, backward_name: str) -> type:
         "backward": Hook("backward", getattr(cls, str(backward_name))).verify(_EDGE_RECEIVE_TYPES),
     }
 
-    # edge_instance @ pattern → _PartialConnection, consumed by >> on a population
-    cls.__matmul__ = lambda self, other: _PartialConnection(self, other)
+    # edge_instance @ (port | mapping | pattern), in any order, any count →
+    # _PartialConnection accumulates the pieces; consumed by >> on a population.
+    cls.__matmul__ = lambda self, other: _PartialConnection(self) @ other
 
     return cls

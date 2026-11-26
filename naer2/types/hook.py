@@ -1,7 +1,6 @@
 import ast
 import inspect
 from inspect import Parameter, signature
-from logging import debug
 from textwrap import dedent
 from typing import Callable, Self, Set, Type
 
@@ -30,25 +29,9 @@ class Hook:
         sig = signature(self.function)
         params = list(sig.parameters.values())
 
-        # debug(self.name)
-        # debug(str(allowed_types))
-
         # Ensure 'self' is the first parameter if it is a parameter
         self_adjust = 0
         for index, param in enumerate(params):
-            annotation_name = getattr(
-                param.annotation, "__name__", str(param.annotation)
-            )
-            # debug(
-            #    "Found parameter: "
-            #    + str(param.name)
-            #    + " , type: "
-            #    + annotation_name
-            #    + " , kind: "
-            #    + str(param.kind)
-            #    + " , default: "
-            #    + str(param.default)
-            # )
             if param.name == "self":
                 if index != 0:
                     raise TypeError(

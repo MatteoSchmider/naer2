@@ -4,6 +4,7 @@ from .transpiler import *
 from .types import *
 from . import receives, updates, sends
 from .receives import time
+from .sends import spike
 
 __all__ = types.__all__ + [
     "edge",
@@ -14,4 +15,5 @@ __all__ = types.__all__ + [
     "updates",
     "sends",
     "time",
+    "spike",
 ]

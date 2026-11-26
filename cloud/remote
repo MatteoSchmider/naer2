@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Work on a cloud GPU instance from this checkout. Give the instance's ssh command once:
+#
+#   cloud/remote set "ssh -o StrictHostKeyChecking=no -p 10202 root@frp.gpu.ai"   # stored in cloud/instance.env
+#
+# then:
+#   cloud/remote sync               this working tree onto the instance (rsync: changed files only, untracked
+#                                   ones included; never .git, .venv, caches) -- the commits needn't match
+#   cloud/remote setup [--test]     the repo there (cloned if missing -- REPO_URL, default this checkout's
+#                                   origin -- and checked out at this checkout's HEAD), sync, then
+#                                   cloud/setup.sh there (gcc, Python 3.12 venv, requirements; --test: suite)
+#   cloud/remote test [ARGS]        sync, then the test suite there (gap tests excluded; ARGS go to pytest)
+#   cloud/remote run CMD...         a command in the remote repo, its venv on PATH
+#   cloud/remote py SCRIPT [ARGS]   a local Python script run there (streamed, nothing copied; cwd: the repo)
+#   cloud/remote shell              an interactive shell in the remote repo
+#   cloud/remote info               the stored instance and whether it answers
+#
+# One ssh connection is shared for 10 minutes (ControlMaster), so calls in a row don't redo the handshake.
+# REMOTE_DIR (default /root/naer2) is the repository on the instance.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+ENV_FILE="$HERE/instance.env"
+
+die() { echo "cloud/remote: $*" >&2; exit 1; }
+
+load() {
+    [ -f "$ENV_FILE" ] || die "no instance yet: cloud/remote set \"<the instance's ssh command>\""
+    # shellcheck source=/dev/null
+    . "$ENV_FILE"
+    REMOTE_DIR="${REMOTE_DIR:-/root/naer2}"
+    SSH_OPTS=(-p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+              -o ConnectTimeout=20 -o ServerAliveInterval=30
+              -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-naer2-%r@%h:%p" -o ControlPersist=10m)
+    TARGET="$USER_AT_HOST"
+}
+
+remote() {  # remote COMMAND-STRING [ssh flags...]: in the repo, the venv's bin on PATH when it exists
+    local cmd="$1"; shift
+    ssh "${SSH_OPTS[@]}" "$@" "$TARGET" \
+        "cd '$REMOTE_DIR' && { [ -d .venv/bin ] && export PATH=\"\$PWD/.venv/bin:\$PATH\"; true; } && $cmd"
+}
+
+sync() {
+    remote "command -v rsync >/dev/null || { DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync >/dev/null; }" >/dev/null
+    # (--no-owner --no-group: the files belong to the remote user, else git there refuses the repo as
+    # "dubious ownership")
+    rsync -az --no-owner --no-group --delete -e "ssh ${SSH_OPTS[*]}" \
+        --exclude .git --exclude .venv --exclude __pycache__ --exclude .pytest_cache --exclude .rocprofv3 \
+        --exclude .claude --exclude .vscode --exclude cloud/instance.env \
+        --out-format='  %n' "$REPO/" "$TARGET:$REMOTE_DIR/" | grep -v '/$' || true
+    echo "synced $REPO -> $TARGET:$REMOTE_DIR"
+}
+
+quote() { printf '%q ' "$@"; }
+
+checkout() {  # the repo on the instance: cloned if missing, at this checkout's HEAD commit (when it's pushed)
+    local url commit
+    url="${REPO_URL:-$(git -C "$REPO" remote get-url origin)}"
+    commit="$(git -C "$REPO" rev-parse HEAD)"
+    ssh "${SSH_OPTS[@]}" "$TARGET" bash -s -- "$url" "$REMOTE_DIR" "$commit" <<'REMOTE'
+set -e
+url="$1"; dir="$2"; commit="$3"
+command -v git >/dev/null || { DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null; }
+if [ ! -d "$dir/.git" ]; then
+    echo "cloning $url into $dir"
+    git clone -q "$url" "$dir"
+fi
+cd "$dir"
+# (files synced by an older cloud/remote may belong to another uid: git refuses those repos without this)
+git config --global --get-all safe.directory | grep -qx "$dir" || git config --global --add safe.directory "$dir"
+git fetch -q origin || echo "(fetch failed: staying on what is there)"
+if git cat-file -e "$commit^{commit}" 2>/dev/null; then
+    git checkout -q -f --detach "$commit"
+    echo "at $(git log --oneline -1)"
+else
+    echo "commit ${commit:0:7} isn't on the remote (not pushed?): at $(git log --oneline -1); the sync brings the rest"
+fi
+REMOTE
+}
+
+case "${1:-}" in
+    set)
+        [ $# -ge 2 ] || die "usage: cloud/remote set \"ssh [-p PORT] [options] USER@HOST\""
+        read -r -a words <<< "$2"
+        port=22; who=""
+        for ((i = 0; i < ${#words[@]}; i++)); do
+            case "${words[$i]}" in
+                ssh) ;;
+                -p) port="${words[$((i + 1))]}"; i=$((i + 1)) ;;
+                -o|-i|-l|-J|-F) i=$((i + 1)) ;;  # (options with a value: not needed here)
+                -*) ;;
+                *@*) who="${words[$i]}" ;;
+            esac
+        done
+        [ -n "$who" ] || die "no USER@HOST in: $2"
+        printf 'USER_AT_HOST=%q\nPORT=%q\n' "$who" "$port" > "$ENV_FILE"
+        [ -n "${REMOTE_DIR:-}" ] && printf 'REMOTE_DIR=%q\n' "$REMOTE_DIR" >> "$ENV_FILE"
+        echo "instance: $who, port $port (cloud/instance.env)"
+        ;;
+    info)
+        load
+        echo "instance: $TARGET, port $PORT, repo $REMOTE_DIR"
+        remote 'echo "answers: $(hostname), $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"'
+        ;;
+    sync)
+        load; sync ;;
+    setup)
+        load; checkout; sync; remote "bash cloud/setup.sh ${2:-}" ;;
+    test)
+        load; sync; shift; remote "python -m pytest -q -p no:cacheprovider -k 'not gap' $(quote "$@")" ;;
+    run)
+        load; shift; [ $# -ge 1 ] || die "usage: cloud/remote run CMD..."; remote "$*" ;;
+    py)
+        load; shift; [ $# -ge 1 ] || die "usage: cloud/remote py SCRIPT [ARGS]"
+        script="$1"; shift
+        remote "python - $(quote "$@")" < "$script" ;;
+    shell)
+        load; remote 'exec bash -l' -t ;;
+    *)
+        sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        [ -n "${1:-}" ] && exit 1 || exit 0 ;;
+esac

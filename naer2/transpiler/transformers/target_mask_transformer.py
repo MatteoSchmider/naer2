@@ -13,11 +13,15 @@ class TargetMaskTransformer(StmtTransformer):
         x  = expr       →  x = tl.where(is_target, expr, x)
         x op= expr      →  x = tl.where(is_target, x op expr, x)
 
-    Only names listed in `dynamic_attrs` are wrapped; temporaries are left alone.
+    Only names listed in `dynamic_attrs` are wrapped; temporaries are left alone,
+    and so are assignments IfTransformer already masked (x = where(m, v, x)).
+    mask: the mask's name -- the fused template's final pass roots top-level
+    writes at the group's own `mask` (keeping every attr a [GROUP_SIZE] tensor).
     """
 
-    def __init__(self, dynamic_attrs: set):
+    def __init__(self, dynamic_attrs: set, mask: str = "is_target"):
         self.attrs = set(dynamic_attrs)
+        self.mask = mask
 
     @staticmethod
     def _where(cond, true, false):
@@ -27,9 +31,8 @@ class TargetMaskTransformer(StmtTransformer):
             keywords=[],
         )
 
-    @staticmethod
-    def _is_target():
-        return ast.Name(id="is_target", ctx=ast.Load())
+    def _is_target(self):
+        return ast.Name(id=self.mask, ctx=ast.Load())
 
     def visit_AugAssign(self, node):
         self.generic_visit(node)
@@ -42,12 +45,21 @@ class TargetMaskTransformer(StmtTransformer):
             ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=new_val), node
         )
 
+    @staticmethod
+    def _masked_already(node) -> bool:
+        """x = <ns>.where(m, v, x): IfTransformer's lowering of an assignment
+        under a branch -- already masked (by a mask within this one)."""
+        v = node.value
+        return (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr == "where"
+                and len(v.args) == 3 and isinstance(v.args[2], ast.Name) and v.args[2].id == node.targets[0].id)
+
     def visit_Assign(self, node):
         self.generic_visit(node)
         if (
             len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id in self.attrs
+            and not self._masked_already(node)
         ):
             name = node.targets[0].id
             new_val = self._where(self._is_target(), node.value, ast.Name(id=name, ctx=ast.Load()))

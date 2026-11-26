@@ -3,7 +3,6 @@ import torch
 from .connection import PD14_connection
 from .neuron import PD14_neuron
 from .poisson import PD14_poisson
-from .synapse import PD14_synapse
 
 """
 Implementation notes (Potjans & Diesmann 2014):
@@ -12,7 +11,8 @@ Units: ms / mV / nA / MOhm  (1 nA × 1 MOhm = 1 mV).
 
 Weights: PSC amplitudes in nA from spec PSP J=0.15 mV via
   J_unit(tau_m=10, tau_s=0.5, R_m=40) ≈ 0.08781 nA (excitatory),
-  -4 × J_unit ≈ -0.35124 nA (inhibitory), 2 × J_unit ≈ 0.17562 nA (E23→E4).
+  -4 × J_unit ≈ -0.35124 nA (inhibitory), 2 × J_unit ≈ 0.17562 nA (E4→E23: from L4e to L2/3e,
+  the published model's one doubled projection -- NEST's microcircuit: PSP_mean_matrix[L23E, L4E] = 2 PSP_e).
 
 Neuron: exact propagator integration (Rotter & Diesmann 1999) with dynamic dt,
   so the same code works for fixed-step and event-driven simulation.
@@ -73,6 +73,14 @@ def build(desc: dict = description):
         PD14_poisson(desc["T"]["rate"], desc["T"]["start"], desc["T"]["stop"])
         * desc["T"]["size"]
     )
+    # T has no incoming connections and update() is a no-op -- send()'s own
+    # clock (next_spike) is the only thing driving it, so it needs its own
+    # timestep. 0.1ms matches the literature's accurate clock-driven
+    # comparison timestep for PD14 -- and since no other population here
+    # declares one, it also sets the whole network's cadence: every
+    # PD14_neuron population integrates as far as its inputs' horizon
+    # allows (T's runs + the minimum delay).
+    populations["T"].timestep = 0.1
 
     for source, weight_mean, weight_std, delay_mean, delay_std, probs in zip(
         desc["connections"]["populations"],
@@ -87,15 +95,35 @@ def build(desc: dict = description):
                 continue
             w_mean, w_std = (
                 (2 * _J_E, abs(2 * _J_E) * 0.1)
-                if source == "E_23" and target == "E_4"
+                if source == "E_4" and target == "E_23"
                 else (weight_mean, weight_std)
             )
-            pattern = PD14_connection(prob)
-            conn = (
-                populations[source] >> PD14_synapse() @ pattern >> populations[target]
-            )
-            conn.fabric.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
+            conn = populations[source] >> PD14_connection(prob) >> populations[target]
+            conn.delay = torch.normal(delay_mean, delay_std, conn.shape).clamp(min=0.1)
             weights = torch.normal(w_mean, w_std, conn.shape)
-            conn.fabric.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
+            conn.weight = weights.clamp(min=0) if w_mean >= 0 else weights.clamp(max=0)
 
-    return populations["T"].network
+    network = populations["T"].network
+    tune(populations, network)
+    return network
+
+
+# ── expert settings: PD14's own optimizations, not the library's defaults ─────────────────────────────
+# (comment a line out to compare without it; measured on the RTX 4090, captured windows,
+# naer2/transpiler/templates/limitations.md)
+GROUP_SIZE = 256  # neurons per program (4 warps: 2 a lane)
+# the populations receiving the most links per neuron (I_4 ~520 a group of 256, E_5 ~440, the rest ~300-350)
+# end most rounds: half-size groups even the round's programs out (~0.7 us a round, fused)
+SMALL_GROUPS = ("I_4", "E_5")
+
+
+def tune(populations: dict, network, group_size: int = GROUP_SIZE) -> None:
+    """PD14's expert settings on its populations (by name) and network: group sizes, fused rounds, periodic
+    windows."""
+    small = min(group_size, max(group_size // 2, 128))  # (128 at least: every population at the same warps)
+    for name, pop in populations.items():
+        pop.group_size = small if name in SMALL_GROUPS else group_size
+    # one kernel a round in planned and captured windows (naer2/fusion.py: ~0.8 us a round)
+    network.fuse_rounds = True
+    # captured windows extrapolated once learned, not planned (naer2/periodic.py: every population clocked)
+    network.periodic_windows = True

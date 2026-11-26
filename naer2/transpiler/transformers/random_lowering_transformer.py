@@ -1,0 +1,123 @@
+import ast
+
+from .base import StmtTransformer
+
+# Python random.* call name -> which distribution it lowers to. Only the two
+# broadly useful ones for now, same "whitelist or raise" policy as
+# MathLoweringTransformer, rather than leaving an undefined `random` name in
+# the kernel.
+_UNIFORM = {"random"}
+_GAUSSIAN = {"gauss", "normalvariate"}
+
+
+class RandomLoweringTransformer(StmtTransformer):
+    """Lowers Python random.* calls in hook bodies to per-lane Triton RNG.
+
+    Structurally the same idea as MathLoweringTransformer (same pipeline
+    position — before IfTransformer, for the same reason: it unparses branch
+    tests and spike-time expressions into new statements, so calls appearing
+    there must already be lowered — and the same "whitelist or raise"
+    policy), for a different problem: math.exp(x) fails because it's not
+    vectorized; random.random() fails because Python's random module is one
+    host-side stream with no notion of "one value per GPU lane" at all.
+
+        random.random()                  -> tl.rand(seed, offs)
+        random.gauss(mu, sigma)
+        random.normalvariate(mu, sigma)  -> mu + sigma * tl.randn(seed, offs)
+
+    Triton's RNG (Philox, a counter-based PRNG: same (seed, offset) always
+    reproduces the same output, different inputs look statistically
+    independent) has no per-lane state to carry across calls, so every draw
+    is reseeded from scratch:
+      - offs (the lane's global neuron index — every kernel already computes
+        this once, see the fused template's entry) makes different lanes in
+        the same call draw different numbers.
+      - t (the kernel's own per-call time-boundary argument — also already
+        in scope everywhere, node hook or spike loop alike — bit-
+        reinterpreted as an int) makes the same lane draw a different number
+        on a later call. Verified against torch/triton directly: same (t,
+        offs) reproduces bit-for-bit, a different t does not.
+      - a per-call-site salt (this transformer numbers each random.* call
+        site in one hook body starting at 0, XORed into the seed) keeps two
+        DIFFERENT random.random() calls in the same hook from returning the
+        same value.
+
+      - the population's own seed (Population.seed, the kernel's `seed`
+        argument) in the key's high 32 bits: two populations draw their own
+        streams (different by default, the same when their seeds are set
+        equal) -- test_populations_draw_their_own_random_numbers.
+      - inside a while loop, its iteration (the loop's counter, which this
+        transformer names on the While node, n2_loop_var, for IfTransformer
+        to keep): the same call site draws anew every iteration.
+
+    ALSO NOT HANDLED: `offs` is GROUP_SIZE-shaped (one lane per neuron);
+    nothing here checks which lane space the surrounding code actually runs
+    in. Fine for node hooks (update/send/receive, which is all that's
+    exercised so far — see test/networks/PD14/poisson.py), wrong if ever
+    reached from an edge forward/backward hook, which runs on link lanes
+    instead. No edge hook calls random.* yet.
+    """
+
+    def __init__(self):
+        self._call_site = 0
+        self._loops: list[str] = []  # the enclosing while loops' counters, outermost first
+        self._n_loops = 0
+
+    def visit_While(self, node: ast.While) -> ast.AST:
+        node.n2_loop_var = f"_it{self._n_loops}"  # (IfTransformer's counter for this loop: its name)
+        self._n_loops += 1
+        self._loops.append(node.n2_loop_var)
+        self.generic_visit(node)
+        self._loops.pop()
+        return node
+
+    def _seed_expr(self) -> str:
+        salt = self._call_site
+        self._call_site += 1
+        # a 64-bit Philox key: the population's seed (the kernel's `seed` argument, Population.seed) in the
+        # high 32 bits, the time's bits (XOR the call site's salt) in the low ones -- no two populations'
+        # streams meet, whatever their times
+        # (the salt XORed in 64 bits: a 32-bit salt doesn't fit an int32 constant -- the second call site's,
+        # 0x9E3779B1, already doesn't)
+        low = ("t.to(tl.int32, bitcast=True)" if salt == 0
+               else f"(t.to(tl.int32, bitcast=True).to(tl.int64) ^ {(salt * 0x9E3779B1) & 0xFFFFFFFF})")
+        for depth, it in enumerate(self._loops):  # (inside loops: each one's iteration, mixed in)
+            low = f"({low}.to(tl.int64) ^ ({it}.to(tl.int64) * {(0x85EBCA6B + depth * 0xC2B2AE35) & 0xFFFFFFFF}))"
+        return f"((seed.to(tl.int64) << 32) | ({low}.to(tl.int64) & 0xFFFFFFFF))"
+
+    @staticmethod
+    def _is_random(func: ast.expr) -> bool:
+        return (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "random"
+        )
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if node.keywords or not self._is_random(node.func):
+            return node
+
+        name = node.func.attr
+        seed = self._seed_expr()
+
+        if name in _UNIFORM:
+            if node.args:
+                raise ValueError("random.random() takes no arguments")
+            return ast.copy_location(
+                ast.parse(f"tl.rand({seed}, offs)", mode="eval").body, node
+            )
+
+        if name in _GAUSSIAN:
+            if len(node.args) != 2:
+                raise ValueError(f"random.{name}(mu, sigma) expects exactly 2 arguments")
+            mu, sigma = (ast.unparse(a) for a in node.args)
+            return ast.copy_location(
+                ast.parse(f"({mu}) + ({sigma}) * tl.randn({seed}, offs)", mode="eval").body,
+                node,
+            )
+
+        raise ValueError(
+            f"random.{name}() has no per-lane Triton lowering; supported: "
+            f"{sorted(_UNIFORM | _GAUSSIAN)}"
+        )
