@@ -90,9 +90,10 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
 - **Autotuning per device**: the group size (`SimulationTopology.locality`; default 32, PD14 measured at 256 only),
   the warps per program (4 everywhere for now, `runtime._warp_cap` -- the RX 6600 was faster at 8 when stepped),
   the walk split by target warp (slower on the 780M, limitations.md) -- measured at startup.
-- **Refactoring**: the host side has grown in layers -- `Network` holds step, plan, run_planned, run_graph and the
-  fusion / periodic hooks, `PopulationRuntime` launching, status, windows, judging, sizing and recovery;
-  `Population` has become a god class (shape/config, dynamic_attrs bookkeeping, spike lifecycle state,
+- **Refactoring**: the host side is split (refactor A, 2026-11-28: `naer2/sim/` -- scheduler, executor, runtime,
+  ledger, sizing, recovery; `Network` a facade). Left: planning and execution still walk the same rounds twice
+  (a plan, then its launch -- one pass could do both); the runtime's buffers and its running in one class (a
+  buffer structure apart would move ~90 outside reads). `Population` has become a god class (shape/config, dynamic_attrs bookkeeping, spike lifecycle state,
   compile(), kernel compile + cache, device placement, real kernel launch...) -- split responsibilities out. Also:
   see if `Topology` can be plain tensors (and regions / positions made lighter -- doubtful there); edges, nodes,
   patterns, updates, receives, kernel, fabric each take a file -- maybe packaged more tightly, reusing things.

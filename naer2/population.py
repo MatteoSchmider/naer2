@@ -81,7 +81,7 @@ class Population:
         self.ring_block: int = 256
         self.ring_in_flight: float = 0.0
         # the emission history's depth; None: the network's derived one
-        # (Network._plan_histories), 3 without a network step
+        # (Scheduler.history_depth), 3 without a network step
         self.history_depth: int | None = None
         self._derived_depth: int = 3
         # the spikes one run can emit (its history's cap); None: one per neuron -- more where neurons fire inside

@@ -40,7 +40,10 @@ and slots, replacing the general pull: SPIKES.md.)
 
 ## 2. Refactor A, then what builds on it
 
-- **Refactor A** (host side).
+- **Refactor A** (host side). Done 2026-11-28: `naer2/sim/` -- `Scheduler` (per population a `PopSchedule`; one
+  round function for step() and plan(), plan() on a copy), `Executor` (one round dispatch for stepped rounds,
+  planned and captured windows), `PopulationRuntime` (buffers, launching), `Ledger` (`RunParams`, status slots,
+  judging), `RingSizer`, `Recovery`; `Network` a facade. PD14 and Brunel at the baseline's speed throughout.
 - **The ring project**: segmented arena growth, ring memory (a per-group overflow log, the reserve, the 2047-block
   limit), a history that grows for a slow consumer, the untested `lost` path (blocks missing: only a shrink
   below what's in use could, since the general pull's removal, 2026-11-28).

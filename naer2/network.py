@@ -1,6 +1,11 @@
+"""
+A network: its populations and connections, its time and round, and the four ways to advance it -- step(),
+plan() (a dry run), run_planned() and run_graph() (planned and captured windows). What runs when is the
+scheduler's (naer2/sim/scheduler.py), running it the executor's (naer2/sim/executor.py).
+"""
+
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING, Set
 
 import torch
@@ -12,8 +17,6 @@ if TYPE_CHECKING:
     from .connection import Connection
     from .population import Population
 
-_EPS = 1e-10  # (also naer2/sim/scheduler.py's)
-EVENT_DRIVEN_DEPTH = 8  # the history depth of a network with an event-driven consumer (see _plan_histories)
 
 
 class Network:
@@ -96,26 +99,22 @@ class Network:
         Emission delay, transmission delay and waiting for a slower
         consumer all live in the consumer's ring; a source's history keeps
         its runs until every consumer has pulled them (its depth:
-        _plan_histories).
+        Scheduler.history_depth).
         """
-        sched = self.scheduler
         states = self._prepare()
-        t_end = self.t + t_step
-        while self.t < t_end - _EPS:
-            self.t = sched.next_time(states, self.t, cap=t_end)
+        for self.t, runs in self.scheduler.rounds(states, self.t, until=self.t + t_step):
             self.round_id += 1  # every run of this round reads its sources' earlier rounds only
-            self.executor.step(sched.take(states, self.t), self.round_id)
-            # host bookkeeping only, after the round's join (reads on the current stream see every run)
-            sched.arrived(states, self.t)
-            sched.intake(states)
+            self.executor.step(runs, self.round_id)
 
     def _prepare(self) -> list:
-        """Before a step or plan: the scheduler's states for the populations (Scheduler.prepare), the histories'
-        depth once."""
+        """Before a step or plan: the scheduler's states for the populations (Scheduler.prepare); the histories'
+        depth, once (Scheduler.history_depth)."""
         pops = list(self.populations)
         states = self.scheduler.prepare(pops)
         if not self._planned:
-            self._plan_histories(pops)
+            depth = self.scheduler.history_depth(pops, self.resolution)
+            for pop in pops:
+                pop._derived_depth = depth
             self._planned = True
         return states
 
@@ -133,20 +132,13 @@ class Network:
         of a population whose sources are event-driven too are conservative (their pending arrivals unknown,
         every possible one assumed). commit: the plan on the scheduling state itself, left where the plan
         ends (run_planned then makes the planned runs), else on a copy."""
-        sched = self.scheduler
         self._prepare()
-        states = sched.states(copy=not commit)
-        t, round_id = self.t, self.round_id
-        launches = []
-        while len(launches) < max_launches:
-            t_next = sched.next_time(states, t, cap=until)
-            if t_next == math.inf or (until is not None and t_next >= until - _EPS):
-                break
-            t, round_id = t_next, round_id + 1
-            launches.append(sched.take(states, t))
-            sched.intake(states, planning=True)
+        states = self.scheduler.states(copy=not commit)
+        t, launches = self.t, []
+        for t, runs in self.scheduler.rounds(states, t, until, planning=True, max_rounds=max_launches):
+            launches.append(runs)
         if commit:
-            self.t, self.round_id = t, round_id
+            self.t, self.round_id = t, self.round_id + len(launches)
         return launches
 
     def run_planned(self, max_launches: int = 1000, until: float | None = None) -> int:
@@ -177,28 +169,3 @@ class Network:
     def _need_runtimes(self, what: str) -> None:
         if any(pop._runtime is None for pop in self.populations):
             raise RuntimeError(f"{what}: every population needs its runtime -- step() a round first")
-
-    def _plan_histories(self, pops) -> None:
-        """The emission histories' depth K, once, before the first round: a
-        source's history must keep every run its slowest consumer hasn't
-        read yet -- the most runs it makes between two of that consumer's
-        reads, + 2 (naer2/history.py). From the timesteps: 2 + ceil(consumer
-        timestep / source timestep), an unset one taken as the network's
-        resolution (the finest a population runs at); at least 3 (every
-        population running every round) -- at least EVENT_DRIVEN_DEPTH with
-        an event-driven consumer anywhere (it reads whenever an arrival is
-        due: no cadence to derive from). One K for the whole network (a
-        consumer's sources must share theirs); a population's own
-        history_depth overrides, an overrun still raises (check()). TODO:
-        grow a history when a consumer falls behind (test_network_step's
-        gap test)."""
-        depth = 3
-        if any(pop._event_driven and pop.incoming for pop in pops):
-            depth = EVENT_DRIVEN_DEPTH
-        for pop in pops:
-            for conn in pop.incoming:
-                src = conn._source
-                reads, runs = pop._own_timestep() or self.resolution, src._own_timestep() or self.resolution
-                depth = max(depth, 2 + math.ceil(reads / runs - 1e-9))
-        for pop in pops:
-            pop._derived_depth = depth

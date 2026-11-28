@@ -7,10 +7,11 @@ every possible arrival of an event-driven population assumed instead of read fro
 
   PopSchedule      one population's scheduling: what is fixed for a step (its incoming connections, clock,
                    kind) and what the rounds change (its last run, horizon, input bound, pending run times, ...)
-  Scheduler        the network's: prepare() at a step's start, then per round next_time(), take(), and, after
-                   the round, arrived() and intake() -- the device's feedback passed in (a population's
-                   emission summary, its ring's next pending arrival: Population._emission_summary,
-                   _pending_arrival -- host syncs, TODO.md D-13); states() a copy for a dry run
+  Scheduler        the network's: prepare() at a step's start, then rounds() -- per round next_time(), take(),
+                   and, after the round, arrived() and intake() -- the device's feedback passed in (a
+                   population's emission summary, its ring's next pending arrival: Population._emission_summary,
+                   _pending_arrival -- host syncs, TODO.md D-13); states() a copy for a dry run; history_depth()
+                   the emission histories' depth from the populations' cadences
 
 The model's delays and clocks it schedules from are the populations' (Population._own_timestep, _min_delay,
 _max_delay, _slot_width).
@@ -22,6 +23,7 @@ import dataclasses
 import math
 
 _EPS = 1e-10
+EVENT_DRIVEN_DEPTH = 8  # the history depth of a network with an event-driven consumer (Scheduler.history_depth)
 
 
 def same_time(a: float, b: float) -> bool:
@@ -149,6 +151,46 @@ class Scheduler:
     def states(self, copy: bool = False) -> list[PopSchedule]:
         """The live states (prepare's order), or a copy of them to plan on."""
         return [s.copy() for s in self._states] if copy else self._states
+
+    def rounds(self, states: list[PopSchedule], t: float, until: float | None, planning: bool = False,
+               max_rounds: int | None = None):
+        """The rounds from network time t on, one at a time: (t, its runs [(population, t_start, t_end,
+        gated)]) -- the caller launches them (or not: planning), and the round's bookkeeping follows when the
+        next is asked for (arrived, unless planning; intake). Stepping (planning False): up to until, a round
+        at until itself included (the times capped there). Planning: the rounds before until (or with no end,
+        while a population wants one), at most max_rounds."""
+        n = 0
+        while max_rounds is None or n < max_rounds:
+            if not planning and t >= until - _EPS:
+                return
+            t_next = self.next_time(states, t, cap=until)
+            if t_next == math.inf or (planning and until is not None and t_next >= until - _EPS):
+                return
+            t, n = t_next, n + 1
+            yield t, self.take(states, t)
+            # (after the round's join: reads on the current stream see every run)
+            if not planning:
+                self.arrived(states, t)
+            self.intake(states, planning=planning)
+
+    @staticmethod
+    def history_depth(pops: list, resolution: float) -> int:
+        """The emission histories' depth K: a source's history must keep every run its slowest consumer
+        hasn't read yet -- the most runs it makes between two of that consumer's reads, + 2 (naer2/history.py).
+        From the timesteps: 2 + ceil(consumer timestep / source timestep), an unset one taken as the network's
+        resolution (the finest a population runs at); at least 3 (every population running every round) -- at
+        least EVENT_DRIVEN_DEPTH with an event-driven consumer anywhere (it reads whenever an arrival is due:
+        no cadence to derive from). One K for the whole network (a consumer's sources must share theirs); a
+        population's own history_depth overrides, an overrun still raises (check()). TODO: grow a history when
+        a consumer falls behind (test_network_step's gap test)."""
+        depth = 3
+        if any(pop._event_driven and pop.incoming for pop in pops):
+            depth = EVENT_DRIVEN_DEPTH
+        for pop in pops:
+            for conn in pop.incoming:
+                reads, runs = pop._own_timestep() or resolution, conn._source._own_timestep() or resolution
+                depth = max(depth, 2 + math.ceil(reads / runs - 1e-9))
+        return depth
 
     # ---- a round
 
