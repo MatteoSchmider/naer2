@@ -39,7 +39,7 @@ R._direct_launch = recording
 
 obj = P._network(G)
 net = obj[0]
-net.graph_barrier = True
+net.executor.barrier = True
 # fused rounds (naer2/fusion.py): as PD14's definition sets them (net.py: on), --fuse / --unfused to override
 FUSE = True if "--fuse" in sys.argv else False if "--unfused" in sys.argv else net.fuse_rounds
 pops = P._runtimes("network", obj)
@@ -110,20 +110,20 @@ for _ in range(3):
     net.run_graph(max_launches=WINDOW)
 torch.cuda.synchronize()
 if FUSE:
-    k = net._fused.compiled
-    print(f"  fused: {net._fused.n_programs} programs; first windows (its compile included) "
+    k = net.executor.fused.compiled
+    print(f"  fused: {net.executor.fused.n_programs} programs; first windows (its compile included) "
           f"{time.perf_counter() - t_fuse:.1f} s; registers {getattr(k, 'n_regs', '?')}, spills "
           f"{getattr(k, 'n_spills', '?')}, shared memory {k.metadata.shared} B", flush=True)
 if "--status-device" in sys.argv:  # (after the windows' status slots are allocated; the graphs captured anew)
     status_on_device()
-    net._graphs = {}
+    net.executor.graphs = {}
     net.run_graph(max_launches=WINDOW)
     torch.cuda.synchronize()
 if "--steady" in sys.argv:  # no shrinking from here on (each resize drains, copies and recaptures: its cost not a round's)
     for p in pops.values():
         p._runtime.sizer.shrink_window = 1 << 40
 events.clear()
-cap0, rs0 = getattr(net, "_captures", 0), sum(len(p._runtime.sizer.resizes) for p in pops.values())
+cap0, rs0 = net.executor.captures, sum(len(p._runtime.sizer.resizes) for p in pops.values())
 rs_at = {k: len(p._runtime.sizer.resizes) for k, p in pops.items()}
 t = time.perf_counter()
 n = 0
@@ -150,7 +150,7 @@ spills = max(getattr(k, "n_spills", 0) for k in fused)
 nw = sorted({k.metadata.num_warps for k in fused})
 print(f"{torch.cuda.get_device_name(0)} G={G} warps={nw} maxnreg={MAXNREG}: graph on the GPU "
       f"{gpu[len(gpu) // 2]:.1f} us/round (min {gpu[0]:.1f}), wall {wall:.0f} us/round; registers {regs}, "
-      f"spills {spills}; captures {net._captures}{timed_extra}")
+      f"spills {spills}; captures {net.executor.captures}{timed_extra}")
 
 if "--trace" in sys.argv:  # one stepped round against one replayed round, traced inside the kernels
     import statistics
@@ -163,7 +163,7 @@ if "--trace" in sys.argv:  # one stepped round against one replayed round, trace
         MHZ = None
     for p in pops.values():
         P._runtime("network", p).set_trace(cap=4096, level=1)
-    net._graphs = {}  # (the traced kernels: captured anew)
+    net.executor.graphs = {}  # (the traced kernels: captured anew)
 
     def sample():
         torch.cuda.synchronize()
@@ -246,13 +246,13 @@ if "--slowest" in sys.argv:  # each round's slowest programs, level-2 traced: wh
         MHZ = 1000.0
     for p in pops.values():
         P._runtime("network", p).set_trace(cap=8192, level=2)
-    net._graphs = {}
+    net.executor.graphs = {}
     if "--serial" in sys.argv:  # every round's kernels one after another on one stream: none alongside another
         def _serial(work):
             s = torch.cuda.current_stream()
             for _, fn in work:
                 fn(s)
-        net._concurrently = _serial
+        net.executor.concurrently = _serial
     for _ in range(3):  # (the traced variants compiled: not inside a capture)
         P._advance("network", obj, 0)
     for _ in range(3):

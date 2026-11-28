@@ -395,11 +395,15 @@ class Population:
         """One run of the fused kernel over [t_start, t_end) in round
         `round_id`: what the sources emitted in earlier rounds taken in,
         every slot due by deliver_until (default t_end) delivered, update,
-        send, emission into the history. Network.step's launch of a
-        scheduled run, and the direct one."""
+        send, emission into the history -- the direct one (a stepped round's:
+        naer2/sim/executor.py)."""
+        self._prepared_runtime().run(t_start, t_end, deliver_until=deliver_until, round_id=round_id, stream=stream)
+
+    def _prepared_runtime(self):
+        """The runtime, built and connected, its settings this population's (before a run)."""
         self._ensure_runtime()
         self._runtime.count_received = self.count_received
-        self._runtime.run(t_start, t_end, deliver_until=deliver_until, round_id=round_id, stream=stream)
+        return self._runtime
 
     def check(self) -> None:
         """Raise on what the last runs flagged (ring overflow, far-future arrivals, history overrun)."""

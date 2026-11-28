@@ -30,7 +30,7 @@ WINDOW, WINDOWS, WARMUP = opts.get("window", 100), opts.get("windows", 20), opts
 
 obj = P._network(256)
 net = obj[0]
-net.graph_barrier = True
+net.executor.barrier = True
 for r in range(WARMUP):
     P._advance("network", obj, r)
     if r % 500 == 0:

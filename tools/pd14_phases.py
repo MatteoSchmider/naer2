@@ -46,7 +46,7 @@ for k in range(1005, 1010):  # the traced variants compiled
 torch.cuda.synchronize()
 GRAPH = "--graph" in sys.argv  # one-round graphs (naer2/graph.py, the barrier): a round's kernels all at once
 if GRAPH:
-    net.graph_barrier = True
+    net.executor.barrier = True
     for _ in range(3):
         net.run_graph(max_launches=1)
     torch.cuda.synchronize()

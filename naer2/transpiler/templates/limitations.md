@@ -220,7 +220,7 @@ what limits a round is the slowest of its ~309 programs running side by side, no
 
 - **A resize synchronizes after its work too.** It runs while a round is being launched (a run's judging asks
   for it), and the round's populations' streams wait only for what the current stream held when the round began
-  (`Network._concurrently`'s one event): without the second sync their kernels read the new rings before the
+  (`Executor.concurrently`'s one event): without the second sync their kernels read the new rings before the
   resize's copies filled them -- free stacks of zeros, two slots in one block, staging reading a mixed record, an
   illegal address in PD14's volley (3/6-6/8 runs on the 4090). Everything that synchronized near a resize hid it
   (the caching allocator off, a host-side invariant check, the device-side arena check's rebuild). The arena

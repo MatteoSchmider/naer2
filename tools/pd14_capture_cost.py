@@ -43,7 +43,7 @@ for r in range(WARMUP):
 for _ in range(3):  # graph A captured, replayed twice
     net.run_graph(max_launches=WINDOW)
 torch.cuda.synchronize()
-graph_a = next(iter(net._graphs.values()))
+graph_a = next(iter(net.executor.graphs.values()))
 n_kernels = sum(len(runs) for runs in net.plan(WINDOW, commit=False))
 
 
@@ -74,9 +74,9 @@ def capture(stream):
             g = torch.cuda.CUDAGraph()
         g.capture_begin(capture_error_mode="thread_local")
         for runs in sched.launches:
-            (_serial if SERIAL else net._concurrently)(
-                (pop, lambda s, pop=pop, i=i, run_id=run_id: pop._runtime.launch_entry(
-                    bufs[id(pop._runtime)], i, run_id, s, bookkeeping=False))
+            (_serial if SERIAL else net.executor.concurrently)(
+                (pop, lambda s, pop=pop, i=i, run_id=run_id: pop._runtime.launch(
+                    pop._runtime.entry_params(bufs[id(pop._runtime)], i, run_id), s))
                 for pop, i, run_id in runs)
             if BARRIER:
                 bar.add_(1)
@@ -137,4 +137,4 @@ print(f"  a window, then B captured while it runs: capture {(t_cap - t_enq) * 1e
       f"(serial: {(alone + (rec + end + inst) / 1e3) * 1e3:.1f}); plan + schedule {t_plan * 1e3:.1f} ms"
       + (f"; {t_done}" if t_done else ""))
 print("  before the capture (ms): " + ", ".join(f"{k} {v * 1e3:.1f}" for k, v in t_more.items()))
-print(f"  graphs captured by run_graph meanwhile: {net._captures}")
+print(f"  graphs captured by run_graph meanwhile: {net.executor.captures}")

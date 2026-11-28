@@ -66,7 +66,7 @@ def test_periodic_windows_are_the_planned_ones(between, monkeypatch):
     rows_p, state_p, received_p = _windows(planned_net, planned_pops, 9, between, monkeypatch)
     net, pops = _mini(periodic=True)
     rows, state, received = _windows(net, pops, 9, between, monkeypatch)
-    assert net._periodic._k > 0, "some windows were extrapolated"
+    assert net.executor.periodic._k > 0, "some windows were extrapolated"
     for a, b in zip(rows_p, rows):
         _same_rows(a, b)
     for n in received:
@@ -81,4 +81,4 @@ def test_an_event_driven_network_plans_every_window():
     network.periodic_windows = True
     for _ in range(4):
         network.run_graph(max_launches=2)
-    assert network._periodic._shift is None and network._periodic._k == 0
+    assert network.executor.periodic._shift is None and network.executor.periodic._k == 0

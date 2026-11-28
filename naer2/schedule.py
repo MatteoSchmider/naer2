@@ -8,7 +8,7 @@ One entry is RUN_WORDS int32 words:
   [run id, round id, first slot delivered (k_lo), last slot delivered (k_hi), t_start (float32 bits),
    t_end (float32 bits), gated, status slot (-1: the run id mod the runtime's status slots)]
 
-  - a direct run (PopulationRuntime.run): one entry in the runtime's own pinned host schedule, its slot the
+  - a direct run (PopulationRuntime.direct_params): one entry in the runtime's own pinned host schedule, its slot the
     run id mod the runtime's status slots (the kernel reads it from host memory; a slot is reused only
     once its run's status has been judged)
   - a planned window (Schedule, from Network.plan): every population's runs of the window, numbered and
@@ -39,15 +39,17 @@ def write_entry(row, run_id: int, round_id: int, k_lo: int, k_hi: int, t_start: 
 class Schedule:
     """A planned window (Network.plan's launches) as run schedules, one per population: its runs numbered on
     from its runtime's run id, each run's ring slots from its ring's position advanced run by run (as
-    PopulationRuntime.run does it), its round from the network's round id -- in device memory (one upload).
+    PopulationRuntime.direct_params does it), its rounds from round0 on (default: the network's round id, the
+    launches its next rounds) -- in device memory (one upload).
     launches[i]: launch i's runs as (population, entry index), in the plan's order. commit() moves the
     runtimes on past the window (run ids, ring positions), as if its runs had been made one by one."""
 
-    def __init__(self, network, launches: list, device, upload: bool = True):
+    def __init__(self, network, launches: list, device, upload: bool = True, round0: int | None = None):
+        round0 = network.round_id if round0 is None else round0
         self.launches = []
         rows, run_ids, ring_pos = {}, {}, {}
         for i, launch in enumerate(launches):
-            round_id = network.round_id + i + 1
+            round_id = round0 + i + 1
             runs = []
             for pop, t_start, t_end, gated in launch:
                 rt = pop._runtime

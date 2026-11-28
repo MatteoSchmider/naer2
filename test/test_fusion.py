@@ -30,7 +30,7 @@ def _run(mode: str, fuse: bool):
         run(max_launches=10)
     for pop in pops.values():
         pop.check()
-    launches = network._fused.launches if network._fused is not None else 0
+    launches = network.executor.fused.launches if network.executor.fused is not None else 0
     state = {(n, a): t.detach().cpu().clone() for n, p in pops.items() for a, t in p.runtime.state.items()}
     received = {n: p.runtime.n_received.detach().cpu().clone() for n, p in pops.items()}
     return state, received, launches
@@ -76,7 +76,7 @@ def test_rounds_not_every_population_runs_launch_per_population():
         network.run_planned(max_launches=10)
         for pop in pops.values():
             pop.check()
-        launches = network._fused.launches if network._fused is not None else 0
+        launches = network.executor.fused.launches if network.executor.fused is not None else 0
         return ({(n, a): t.detach().cpu().clone() for n, p in pops.items() for a, t in p.runtime.state.items()},
                 launches, mixed, len(rounds))
     state, _, _, _ = run(False)

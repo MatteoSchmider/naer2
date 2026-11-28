@@ -27,7 +27,7 @@ G, ROUNDS, WARMUP = opts.get("G", 256), opts.get("rounds", 40), opts.get("warmup
 
 obj = P._network(G)
 net = obj[0]
-net.graph_barrier = True
+net.executor.barrier = True
 pops = P._runtimes("network", obj)
 P.group_sizes(pops, next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--Gpop=")), None))
 for p in pops.values():

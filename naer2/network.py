@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Set
 
 import torch
 
+from .sim.executor import Executor
 from .sim.scheduler import Scheduler
 
 if TYPE_CHECKING:
@@ -33,41 +34,25 @@ class Network:
         # Device every population's state lazily moves onto on its first
         # real kernel launch (Population._ensure_on_device).
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._streams: dict[Population, torch.cuda.Stream] = {}
-        # Fused rounds (naer2/fusion.py): a round in which every population runs as ONE kernel launch, in
-        # planned and captured windows -- on by default (PD14, Brunel: not slower; its cost: the most registers
-        # any population needs, longer compiles); off (net.fuse_rounds = False): a kernel per population, e.g. to
-        # look at one population's own kernel
-        self._fuse_rounds = True
-        self._fused = None
+        # Running what the scheduler decides: stepped rounds, planned and captured windows (naer2/sim/executor.py)
+        self.executor = Executor(self)
         # Periodic windows (naer2/periodic.py): a clock-only network's captured windows extrapolated once
         # learned, not planned -- off by default; PD14 turns it on (its tune)
         self.periodic_windows = False
 
     @property
     def fuse_rounds(self) -> bool:
-        return self._fuse_rounds
+        """Fused rounds (naer2/fusion.py): a round in which every population runs as ONE kernel launch, in
+        planned and captured windows -- on by default (PD14, Brunel: not slower; its cost: the most registers
+        any population needs, longer compiles); off: a kernel per population, e.g. to look at one population's
+        own kernel."""
+        return self.executor.fuse
 
     @fuse_rounds.setter
     def fuse_rounds(self, on: bool) -> None:
-        if bool(on) != self._fuse_rounds:
-            self._fuse_rounds = bool(on)
-            self._graphs = {}  # (captured either way: captured anew)
-
-    def _fused_round(self):
-        """The fused kernel of every population (fuse_rounds; None if off, or a population without its
-        runtime): built once, again when a runtime or its kernel is replaced."""
-        if not self._fuse_rounds or self.device.type != "cuda":
-            return None
-        if any(pop._runtime is None for pop in self.populations):
-            return None
-        # a fixed order (the same fused kernel every process -- its compile, its cache): the largest first
-        runtimes = sorted((pop._runtime for pop in self.populations), key=lambda rt: (-rt.n_groups, -rt.n, id(rt)))
-        key = tuple((id(rt), id(rt.kernel)) for rt in runtimes)
-        if self._fused is None or self._fused.key != key:
-            from .fusion import FusedRound
-            self._fused = FusedRound(runtimes)
-        return self._fused
+        if bool(on) != self.executor.fuse:
+            self.executor.fuse = bool(on)
+            self.executor.graphs = {}  # (captured either way: captured anew)
 
     def merge(self, other: Network):
         for population in other.populations:
@@ -95,8 +80,8 @@ class Network:
              wants to run (inf for not yet); the round's time is the
              earliest of these, capped at t_end (Scheduler.next_time).
           2. Run: every population whose time it is takes its run
-             (Scheduler.take) -- one fused kernel, with the round's id, on its
-             own stream: it pulls what its sources emitted in earlier rounds
+             (Scheduler.take; Executor.step) -- its kernel, with the round's
+             id, on its own stream: it pulls what its sources emitted in earlier rounds
              (their emission histories) into its ring, delivers the due
              slots, updates, sends, and emits into its own history. The runs
              of a round are independent and run concurrently; the round
@@ -119,10 +104,7 @@ class Network:
         while self.t < t_end - _EPS:
             self.t = sched.next_time(states, self.t, cap=t_end)
             self.round_id += 1  # every run of this round reads its sources' earlier rounds only
-            runs = sched.take(states, self.t)
-            self._concurrently(
-                (pop, lambda stream, pop=pop, a=a, b=b: pop.run(a, b, round_id=self.round_id, stream=stream))
-                for pop, a, b, _ in runs)
+            self.executor.step(sched.take(states, self.t), self.round_id)
             # host bookkeeping only, after the round's join (reads on the current stream see every run)
             sched.arrived(states, self.t)
             sched.intake(states)
@@ -178,107 +160,23 @@ class Network:
         scheduling then holds the plan's view (every possible arrival assumed): further windows plan from
         it, step() would schedule it more often than needed. Every population needs its runtime: step() a
         round first. Returns the rounds made."""
-        from .schedule import Schedule
-
-        pops = list(self.populations)
-        if any(pop._runtime is None for pop in pops):
-            raise RuntimeError("run_planned: every population needs its runtime -- step() a round first")
+        self._need_runtimes("run_planned")
         round0 = self.round_id
-        launches = self.plan(max_launches, until, commit=True)
-        saved_round = self.round_id
-        self.round_id = round0
-        schedule = Schedule(self, launches, self.device)
-        self.round_id = saved_round
-        for pop in pops:  # two windows' runs of status slots: one window in flight while the next launches
-            rt = pop._runtime
-            rt.ledger.ensure(2 * schedule.n_runs.get(id(rt), 0))
-        fused = self._fused_round()
-        for runs in schedule.launches:
-            if fused is not None and fused.covers([pop._runtime for pop, _, _ in runs]):
-                self._launch_fused(fused, schedule, runs)
-                continue
-            self._concurrently(
-                (pop, lambda stream, pop=pop, i=i, run_id=run_id: pop._runtime.launch_entry(
-                    schedule.entries(pop._runtime), i, run_id, stream))
-                for pop, i, run_id in runs)
-        schedule.commit()
-        for pop in pops:
-            if pop._event_driven and pop.incoming:
-                pop._runtime.sync_ring_pos()
-        self._schedule = schedule  # (its entries stay alive until the next window's)
-        return len(launches)
-
-    @staticmethod
-    def _launch_fused(fused, schedule, runs) -> None:
-        """A planned round's runs as one fused launch (naer2/fusion.py), each run's bookkeeping its runtime's
-        (launch_entry's): its status slot free first, then pending, journaled for a rerun."""
-        by_rt = {id(pop._runtime): (pop._runtime, i, run_id) for pop, i, run_id in runs}
-        params = []
-        for rt in fused.runtimes:
-            _, i, run_id = by_rt[id(rt)]
-            rt.ledger.free_slot()
-            params.append(rt.entry_params(schedule.entries(rt), i, run_id))
-        fused.launch(params, torch.cuda.current_stream())
-        for rt, p in zip(fused.runtimes, params):
-            rt.ledger.launched(p)
+        return self.executor.planned(self.plan(max_launches, until, commit=True), round0)
 
     def run_graph(self, max_launches: int = 1000, until: float | None = None) -> int:
         """As run_planned, but the window replayed from a captured device graph (naer2/graph.py): captured
         once per window shape (which populations run in which round, gated or not), every window of that
         shape then a replay -- its entries written first, no launch from the host. One window may be in
         flight while the next is planned and filled: status slots for two windows' runs, the older one
-        judged (waited for) when its slots are needed. Returns the rounds made."""
-        from .graph import WindowGraph
-        from .periodic import Periodic
-        from .schedule import Schedule
+        judged (waited for) when its slots are needed. A clock-only network's windows, with periodic_windows,
+        extrapolated once learned (naer2/periodic.py). Returns the rounds made."""
+        self._need_runtimes("run_graph")
+        return self.executor.captured(max_launches, until, periodic=self.periodic_windows)
 
-        pops = list(self.populations)
-        if any(pop._runtime is None for pop in pops):
-            raise RuntimeError("run_graph: every population needs its runtime -- step() a round first")
-        if not hasattr(self, "_periodic"):
-            self._periodic = Periodic()
-        # a clock-only network's windows repeat: once learned, the next one extrapolated (naer2/periodic.py)
-        schedule = self._periodic.next(self, max_launches) if until is None and self.periodic_windows else None
-        if schedule is None:
-            start = (self.t, self.round_id)
-            launches = self.plan(max_launches, until, commit=True)
-            if not launches:
-                return 0
-            saved_round, self.round_id = self.round_id, start[1]
-            schedule = Schedule(self, launches, self.device, upload=False)
-            self.round_id = saved_round
-            n_rounds = len(launches)
-        else:
-            start, launches, n_rounds = None, None, schedule.base.n
-        for pop in pops:
-            rt = pop._runtime
-            n = schedule.n_runs.get(id(rt), 0)
-            rt.ledger.ensure(2 * n)
-            rt.ledger.make_room(n)
-            # the window two turns back judged: its capture turn's buffers are this window's next
-            # (status slots rounded up could otherwise leave it pending, its entries overwritten)
-            rt.ledger.judge_windows(keep=1)
-        if not hasattr(self, "_graphs"):
-            self._graphs = {}
-        sig = schedule.signature()
-        graph = self._graphs.get(sig)
-        if graph is None or not graph.valid(schedule):
-            graph = self._graphs[sig] = WindowGraph(self, schedule, barrier=getattr(self, "graph_barrier", False),
-                                                    fused=self._fused_round())
-            self._captures = getattr(self, "_captures", 0) + 1
-        graph.replay(schedule)
-        schedule.commit()
-        if launches is not None:  # (planned: a sample for the periodic windows, where they apply)
-            if until is None and self.periodic_windows and Periodic.applies(self, launches):
-                self._periodic.learn(self, schedule, start)
-            else:
-                self._periodic.forget()
-        if any(pop._event_driven and pop.incoming for pop in pops):
-            torch.cuda.synchronize()  # (the gated runs' delivery positions: only their kernels know)
-            for pop in pops:
-                if pop._event_driven and pop.incoming:
-                    pop._runtime.sync_ring_pos()
-        return n_rounds
+    def _need_runtimes(self, what: str) -> None:
+        if any(pop._runtime is None for pop in self.populations):
+            raise RuntimeError(f"{what}: every population needs its runtime -- step() a round first")
 
     def _plan_histories(self, pops) -> None:
         """The emission histories' depth K, once, before the first round: a
@@ -304,31 +202,3 @@ class Network:
                 depth = max(depth, 2 + math.ceil(reads / runs - 1e-9))
         for pop in pops:
             pop._derived_depth = depth
-
-    def _concurrently(self, work) -> None:
-        """Launch each population's work on its own CUDA stream: every
-        stream after what came before (one pre-made event recorded on the
-        current stream), the current stream after all of them (one pre-made
-        event per stream) -- a device-side join, no host sync. work: (pop,
-        fn(stream)); fn(None) runs on the current stream (CPU: in order)."""
-        if self.device.type != "cuda":
-            for _, fn in work:
-                fn(None)
-            return
-        main = torch.cuda.current_stream()
-        if not hasattr(self, "_ready"):
-            self._ready = torch.cuda.Event()
-            self._done: dict = {}
-        self._ready.record(main)
-        launched = []
-        for pop, fn in work:
-            stream = self._streams.get(pop)
-            if stream is None:
-                stream = self._streams[pop] = torch.cuda.Stream()
-                self._done[pop] = torch.cuda.Event()
-            stream.wait_event(self._ready)
-            fn(stream)
-            self._done[pop].record(stream)
-            launched.append(pop)
-        for pop in launched:
-            main.wait_event(self._done[pop])

@@ -23,7 +23,7 @@ ROUNDS, WARMUP = opts.get("rounds", 200), opts.get("warmup", 1000)
 
 obj = P._network(256)
 net = obj[0]
-net.graph_barrier = True
+net.executor.barrier = True
 pops = P._runtimes("network", obj)
 for r in range(WARMUP):
     P._advance("network", obj, r)

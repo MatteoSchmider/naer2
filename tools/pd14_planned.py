@@ -39,7 +39,7 @@ if sys.argv[1] == "compare":
 mode, out = sys.argv[1], sys.argv[2]
 obj = P._network(G)
 net = obj[0]
-net.graph_barrier = "--barrier" in sys.argv  # (graph mode: a barrier kernel between rounds, naer2/graph.py)
+net.executor.barrier = "--barrier" in sys.argv  # (graph mode: a barrier kernel between rounds, naer2/graph.py)
 pops = P._runtimes("network", obj)
 for p in pops.values():
     p.count_received = True  # (the links each population received: compared as activity)
@@ -65,7 +65,7 @@ else:
     torch.cuda.synchronize()
     if ROUNDS > WINDOW:
         print(f"  the other windows: {(time.perf_counter() - t_rest) / (ROUNDS - WINDOW) * 1e6:.0f} us/round"
-              + (f", {len(net._graphs)} window shapes, captures: {net._captures}" if mode == "graph" else ""),
+              + (f", {len(net.executor.graphs)} window shapes, captures: {net.executor.captures}" if mode == "graph" else ""),
               flush=True)
 torch.cuda.synchronize()
 us = (time.perf_counter() - t0) / ROUNDS * 1e6

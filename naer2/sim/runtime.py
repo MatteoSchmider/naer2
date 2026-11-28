@@ -172,6 +172,12 @@ class PopulationRuntime:
         send, emit. stream: a torch.cuda.Stream to launch on (default: the
         current one). num_warps: default one lane per neuron, up to 8 warps;
         never more lanes than the group has neurons (see _warps)."""
+        self.start(self.direct_params(t_start, t_end, deliver_until, round_id, num_warps), stream)
+
+    def direct_params(self, t_start, t_end, deliver_until=None, round_id=None, num_warps=None) -> RunParams:
+        """The next run's launch from the direct schedule (run()'s; a stepped round's, naer2/sim/executor.py):
+        its entry written into its status slot's row of the ledger's pinned host schedule (the slot judged
+        free first), the run id and the ring's delivery position moved on."""
         num_warps = self._warps(num_warps)
         self.ledger.judge_pending(wait=False)
         self.ledger.free_slot()  # (the slot this run's kernel writes)
@@ -184,24 +190,8 @@ class PopulationRuntime:
         slot = self.ledger.slot(self.run_id)
         write_entry(self.ledger.sched_np[slot], self.run_id, round_id if round_id is not None else self.run_id,
                     k_lo, k_hi, t_start, t_end)
-        params = RunParams(self.ledger.sched_host, slot, self.run_id, num_warps, self._state())
-        self.launch(params, stream)
         self.ring.ring_pos = max(k_lo, k_hi + 1)
-        self.ledger.launched(params)
-
-    def launch_entry(self, sched: torch.Tensor, i: int, run_id: int, stream=None, num_warps=None,
-                     bookkeeping: bool = True, status: torch.Tensor | None = None) -> None:
-        """A planned run: entry i of a schedule (naer2/schedule.py) -- everything the run needs besides
-        this runtime's own buffers is in it; run_id is the entry's (for the status bookkeeping).
-        bookkeeping False: the launch alone (a graph capture: the bookkeeping follows each replay,
-        Ledger.launched_window). status: where the kernel writes its status (None: the ledger's host slots)."""
-        if not bookkeeping:
-            self.launch(self.entry_params(sched, i, run_id, num_warps, status), stream)
-            return
-        self.ledger.free_slot()
-        params = self.entry_params(sched, i, run_id, num_warps)
-        self.launch(params, stream)
-        self.ledger.launched(params)
+        return RunParams(self.ledger.sched_host, slot, self.run_id, num_warps, self._state())
 
     def entry_params(self, sched: torch.Tensor, i: int, run_id: int, num_warps=None, status=None) -> RunParams:
         """A planned run's launch (RunParams): entry i of schedule sched; status: where the kernel writes its
@@ -210,6 +200,13 @@ class PopulationRuntime:
 
     def _state(self) -> tuple:
         return tuple(self.state[a] for a in self.kernel.attrs)
+
+    def start(self, params: RunParams, stream=None) -> None:
+        """A run launched and kept until known complete: its status slot judged free, the launch, the run
+        pending and journaled for a rerun (Ledger.launched)."""
+        self.ledger.free_slot()
+        self.launch(params, stream)
+        self.ledger.launched(params)
 
     def launch(self, params: RunParams, stream) -> None:
         """One run's kernel launch (run(): the direct schedule; a planned window: naer2/schedule.py; a rerun:

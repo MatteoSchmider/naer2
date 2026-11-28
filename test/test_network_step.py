@@ -246,17 +246,18 @@ def test_the_history_depth_follows_the_timesteps():
     B.check()
 
 
-def test_every_run_of_a_round_carries_its_id():
+def test_every_run_of_a_round_carries_its_id(monkeypatch):
+    from naer2.sim.runtime import PopulationRuntime
+
     network, A, B, _, _ = _net(0.5)
     rounds = []
-    for pop in (A, B):
-        run = pop.run
+    direct = PopulationRuntime.direct_params
 
-        def spy(*args, run=run, pop=pop, **kw):
-            rounds.append((pop is A, kw["round_id"], network.round_id))
-            return run(*args, **kw)
+    def spy(self, *args, **kw):  # (a stepped run's entry: its round id as written)
+        rounds.append((self, kw["round_id"], network.round_id))
+        return direct(self, *args, **kw)
 
-        pop.run = spy
+    monkeypatch.setattr(PopulationRuntime, "direct_params", spy)
     network.step(2.0)
     ids = [r for _, r, _ in rounds]
     assert ids and all(r == current for _, r, current in rounds)  # the round's id, at launch

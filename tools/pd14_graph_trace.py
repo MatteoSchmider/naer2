@@ -28,7 +28,7 @@ if sys.argv[1] == "run":
 
     obj = P._network(256)
     net = obj[0]
-    net.graph_barrier = "--barrier" in sys.argv
+    net.executor.barrier = "--barrier" in sys.argv
     for r in range(WARMUP):
         P._advance("network", obj, r)
         if r % 500 == 0:
@@ -43,7 +43,7 @@ if sys.argv[1] == "run":
         net.run_graph(max_launches=WINDOW)
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
-    print("traced one window; captures:", net._captures)
+    print("traced one window; captures:", net.executor.captures)
     sys.exit(0)
 
 rows = list(csv.DictReader(open(sys.argv[2])))

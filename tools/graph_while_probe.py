@@ -81,7 +81,7 @@ def triton_kernel(x, side, s):
 
 
 def fork_join(x, side, s):
-    """As Network._concurrently: each side stream after the body's stream, the body's stream after them."""
+    """As Executor.concurrently (naer2/sim/executor.py): each side stream after the body's stream, the body's stream after them."""
     ready = torch.cuda.Event()
     ready.record(s)
     done = []

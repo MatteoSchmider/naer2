@@ -19,8 +19,8 @@ covering every kind of population:
 
 Every population runs once at t = 0. Intake is the real host side
 (Scheduler.intake: read each source once per run, schedule event-driven
-consumers from the source's emission summary). The kernel and the device's
-feedback are stand-ins: a run records its window, its emission summary is
+consumers from the source's emission summary). The kernels (Executor.step) and the
+device's feedback are stand-ins: a run records its window, its emission summary is
 one spike stamped at the window's start, and its ring's next pending
 arrival (Population._pending_arrival) the earliest later per-link arrival
 of what it took in.
@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from naer2.population import Population
+from naer2.sim.executor import Executor
 from naer2.sim.scheduler import Scheduler
 from test.nodes import counter, delay_probe
 from test.patterns import all_to_all
@@ -65,9 +66,10 @@ def stand_ins(monkeypatch):
     last: dict = {}  # population -> its last run's window
     taken: dict = {}  # conn -> emission times still to deliver
 
-    def run(self, t_start, t_end, round_id=None, stream=None, **kw):  # the kernel
-        runs.append((t_start, self, t_end))
-        last[self] = (t_start, t_end)
+    def step(self, round_runs, round_id):  # the kernels (Executor.step)
+        for pop, t_start, t_end, _ in round_runs:
+            runs.append((t_start, pop, t_end))
+            last[pop] = (t_start, t_end)
 
     def summary(self):  # the run's emission summary: one spike at its start
         return (1, last[self][0]) if self in last else (0, math.inf)
@@ -95,7 +97,7 @@ def stand_ins(monkeypatch):
                 if s.read_run.get(conn) != b.get(conn):
                     taken.setdefault(conn, []).append(last[conn._source][0])
 
-    monkeypatch.setattr(Population, "run", run)
+    monkeypatch.setattr(Executor, "step", step)
     monkeypatch.setattr(Population, "_emission_summary", summary)
     monkeypatch.setattr(Population, "_pending_arrival", pending)
     monkeypatch.setattr(Scheduler, "intake", intake)
@@ -180,7 +182,7 @@ def test_a_source_run_without_spikes_schedules_nothing(monkeypatch):
     """Intake reads the source's emission summary: B runs every 0.3 but
     never emits, so event-driven C only ever runs at t = 0."""
     runs = []
-    monkeypatch.setattr(Population, "run", lambda self, t_start, t_end, **kw: runs.append((round(t_start, 6), self)))
+    monkeypatch.setattr(Executor, "step", lambda self, rr, round_id: runs.extend((round(a, 6), p) for p, a, _, _ in rr))
     monkeypatch.setattr(Population, "_emission_summary", lambda self: (0, math.inf))  # the run emitted nothing
 
     B = counter() * 2
