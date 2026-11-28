@@ -1,29 +1,5 @@
 # naer2 — status and plan
 
-## Next (decided 2026-11-22)
-
-1. **A short kernel refactor** -- before refactors A and B (PLAN.md), which stay open after it, then the rest.
-   The fused round the default everywhere (Brunel: not slower, ~3% faster), the unfused path removed in a later
-   refactor. Done 2026-11-28, from a trace of which paths PD14, Brunel and the tests compile: the delay classes
-   (`NC`), the run-by-run pull (`BATCH`), segment records on slots (`NAER2_SEG`: dropped -- PD14 keeps link
-   records, slower with segments; to rediscover where an optimization wants them), and the sequential general
-   pull with the side runs: the slotted ring takes uniform sources only (`UNIFORM_SOURCES` gone; non-uniform
-   sources need queues -- every incoming connection one delay value -- else NotImplementedError, a pull for them
-   to come with the model that needs it). The tests that ran the general pull now run queues (as a Population
-   would), plus a burst through the queue pull's merge path. Open: the per-cell rings (unpooled, only tests and
-   `ring_block = None`: keep or drop), the unfused path.
-2. **PD14's registers**: after the refactor 84-118 a thread (the fused round's 128 -> 118), no spills; capping
-   them never helped -- finding and removing them should.
-3. **Brunel**: 3x real time at 50k on the 4090 (captured windows) -- to optimize later, as PD14. Strong scaling
-   on the 4090 (2026-11-23, captured windows, 100 ms): wall per simulated ms 2.8-3.0 from 10k to 60k, 3.5-3.7 from
-   70k to 110k (2.18 G links); a round ~2.1-2.8 ms at every size (latency-bound, not by the links). Memory: GPU
-   ~8.3 B a link (15.1 GiB at 100k), the host's peak in construction ~24 B a link (44 GiB at 100k, 53 at 110k:
-   the instance's 62 GB the first limit, ~110k); construction 129 s at 100k (~N^2) -- both to cut (phase 4).
-   **Latency-bound** (as naer1 was): a round's time is its kernels' chain of dependent steps -- the pull's
-   loads, the merge's and the batch walk's barriers, one after another -- not the links moved. To optimize with
-   aggressive prefetching and latency hiding: the next block's / batch's records and links loaded while the
-   current one is walked, fewer barriers per batch, more independent work in flight per program.
-
 ## Open after the kernel refactor (2026-11-28)
 
 - **A flat list's order in the queue pull's merge path**: a uniform source's history is one flat list in its atomic
@@ -65,6 +41,18 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
 
 ## Medium changes
 
+- **The per-cell rings** (unpooled: `Population.ring_block = None`, and most runtime-level tests): production
+  always pools, and queues need the pool; dropping them removes every `POOL_B == 0` branch of the kernel and the
+  ring (`Ring.grow`, `_rec`), the tests then re-parametrized onto arenas -- or keep them as the simple reference
+  layout.
+- **Brunel's speed**: latency-bound (as naer1 was) -- a round ~1-3 ms at every size from 10k to 110k on the 4090
+  (captured windows; 50k: 1.5 ms wall per simulated ms on the 2026-11-28 instance, 2.9 on the 2026-11-23 one), its
+  kernels' chain of dependent steps (the pull's loads, the merge's and the batch walk's barriers), not the links
+  moved. To cut with aggressive prefetching and latency hiding: the next block's / batch's records and links loaded
+  while the current one is walked, fewer barriers per batch, more independent work in flight per program. Memory
+  ~8.3 B a link on the GPU, ~24 B in construction on the host (129 s at 100k, ~N^2) -- to cut too.
+- **The unfused path** (a population's own kernel per run, `Network.fuse_rounds` off): the fused round is the
+  default everywhere and not slower (PD14, Brunel) -- to remove, with its launch and capture code.
 - **README.md** is out of date in general (e.g. "What's deliberately not here yet" says nothing runs a kernel).
 - **The showcases** (`showcases/`) predate the fused path in places (e.g. `hybrid_scheduling.py` mentions
   `carry_cap`) -- look at them again, and check they still run.
