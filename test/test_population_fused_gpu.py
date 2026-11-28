@@ -118,11 +118,11 @@ def test_a_run_too_large_for_its_ring_stops_and_reruns():
             if r == 0:
                 start = dst.runtime.ring.n_blocks
                 for rt in (src.runtime, dst.runtime):  # a stop noticed late: only once the status slots run out
-                    judge = rt._judge_pending
-                    rt._judge_pending = lambda stream, wait, judge=judge: judge(stream, wait) if wait else None
+                    judge = rt.ledger.judge_pending
+                    rt.ledger.judge_pending = lambda wait, judge=judge: judge(wait) if wait else None
         dst.check()
     rt = dst.runtime
-    assert rt.stops and rt.growths
+    assert rt.sizer.stops and rt.sizer.growths
     assert rt.ring.n_blocks > start
     count = sum(_expected(conn, p, 500)[0] for p in pattern.values())
     assert int(count.sum()) > 0
@@ -145,13 +145,13 @@ def test_a_ring_arena_shrinks_back_and_keeps_what_it_holds():
         src.run(t, t + 0.1, round_id=r)
         dst.run(t, t + 0.1, round_id=r)
         if r == 0:
-            dst.runtime.shrink_window = 5
+            dst.runtime.sizer.shrink_window = 5
             start = dst.runtime.ring.n_blocks
     dst.check()
     rt = dst.runtime
-    shrinks = [r for r in rt.resizes if r[1] < start]
+    shrinks = [r for r in rt.sizer.resizes if r[1] < start]
     assert shrinks and 3 <= shrinks[0][0] < 21  # between the burst's intake and its delivery
-    assert not [g for g in rt.growths if g[1] == "arena"]  # (the burst may outgrow the log: a stop, a rerun)
+    assert not [g for g in rt.sizer.growths if g[1] == "arena"]  # (the burst may outgrow the log: a stop, a rerun)
     count, _ = _expected(conn, burst, 500)
     assert int(count.sum()) > 0
     assert torch.equal(rt.n_received.cpu().long(), count)

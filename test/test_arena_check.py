@@ -35,7 +35,7 @@ def test_the_arena_check_is_silent_through_stops_and_resizes():
     for pop in pops.values():
         pop.check()
     rt = pops["E"].runtime
-    assert rt.stops and rt.growths, "E stopped a run and its ring grew"
+    assert rt.sizer.stops and rt.sizer.growths, "E stopped a run and its ring grew"
     for name, pop in pops.items():
         assert pop.runtime.arena_errors() is None, f"{name}: {pop.runtime.arena_errors()}"
 

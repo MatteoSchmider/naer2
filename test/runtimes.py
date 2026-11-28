@@ -8,7 +8,7 @@ import math
 
 import torch
 
-from naer2.runtime import PopulationRuntime
+from naer2.sim.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.nodes import commanded, commanded_timed
 

@@ -1,6 +1,6 @@
 """
 Tests of the fused kernel (naer2/transpiler/templates/fused.py) through its
-runtime (naer2/runtime.py), on generated kernels of the commanded test nodes
+runtime (naer2/sim/runtime.py), on generated kernels of the commanded test nodes
 (test/runtimes.py: sources firing on command, consumers counting): emission
 into the K-deep history, pull intake + delivery end to end (every link in
 the run that covers its slot, per group in slot then emission order,
@@ -16,7 +16,7 @@ import sys
 import pytest
 import torch
 
-import naer2.runtime as runtime
+import naer2.sim.runtime as runtime
 from naer2.topology import SimulationTopology
 from test.runtimes import command, commanded_runtime, no_fire
 from test.topologies import random_topology as _topology

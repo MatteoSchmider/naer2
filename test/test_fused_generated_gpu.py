@@ -1,7 +1,7 @@
 """
 Generated fused kernels (naer2/transpiler/templates/fused_template.py)
 against the hand-written reference (test/fused_reference.py), both run by
-naer2/runtime.py:
+naer2/sim/runtime.py:
 PD14_neuron and PD14_poisson built through the DSL, their kernels generated
 from their hooks, run side by side with the reference from the same state
 on the same inputs, run by run: every state tensor and every spike
@@ -20,7 +20,7 @@ import torch
 
 import naer2 as n2
 from naer2.ring import RESERVE
-from naer2.runtime import PopulationRuntime
+from naer2.sim.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.edges import plastic_synapse, static_synapse
 from test.fused_reference import pd14_neuron_reference, pd14_poisson_reference

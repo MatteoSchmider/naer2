@@ -20,7 +20,7 @@ round's GPU time 65 -> 33 us; tools/pd14_graph_gpu.py --slowest, --status-device
 
 A run too large for its ring stops (and every run after it), and is rerun once its window is judged -- through
 its population's own kernel, from the window's entries, the ring grown; a resized ring's new buffer means a
-new capture. A window is judged before the window after next replays (PopulationRuntime.judge_windows): the
+new capture. A window is judged before the window after next replays (Ledger.judge_windows): the
 two captures' buffers alternate, a window's are its own until then.
 """
 
@@ -29,7 +29,8 @@ import gc
 import numpy as np
 import torch
 
-from .runtime import _Window, _WindowPart
+from .sim.ledger import WindowPart
+from .sim.recovery import Window
 
 
 class WindowGraph:
@@ -128,9 +129,9 @@ class WindowGraph:
         self.graphs[turn].replay()
         # the window's runs pending as one per runtime (judged together), one journal entry for a rerun
         status, status_host = self.status[turn], self.status_host[turn]
-        window = _Window(lambda: [(pop._runtime, i, run_id) for runs in schedule.launches for pop, i, run_id in runs])
+        window = Window(lambda: [(pop._runtime, i, run_id) for runs in schedule.launches for pop, i, run_id in runs])
         for key, rows in schedule.rows.items():
             rt = self._rts[key]
-            rt.note_window(_WindowPart(window, rows[:, 0].astype(np.int64), self._slots[key], buffers[key],
+            rt.ledger.launched_window(WindowPart(window, rows[:, 0].astype(np.int64), self._slots[key], buffers[key],
                                        status[key], status_host[key]))
-        next(iter(self._rts.values()))._launches.journal[("window", id(window))] = window
+        next(iter(self._rts.values())).recovery.launched_window(window)

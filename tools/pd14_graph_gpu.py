@@ -17,7 +17,8 @@ if "--rdna2" in sys.argv:
 import torch
 
 import naer2.graph as GR
-import naer2.runtime as R
+import naer2.sim.ledger as LG
+import naer2.sim.runtime as R
 import pd14_network as P
 
 opts = {a.split("=")[0][2:]: int(a.split("=")[1]) for a in sys.argv
@@ -63,21 +64,21 @@ for r in range(1, WARMUP):
 def status_on_device():
     """(probe) The runs' status into device memory, not pinned host memory (fused.py: _run_status): the host
     copies it back before it reads it (waiting for the device)."""
-    orig_landed = R.PopulationRuntime._landed
+    orig_landed = LG.Ledger._landed
 
     def landed(self, run_id):
         if hasattr(self, "_status_copy"):
-            self._status_copy.copy_(self._status_host)  # (device -> host, waiting for the device)
+            self._status_copy.copy_(self.status_host)  # (device -> host, waiting for the device)
         return orig_landed(self, run_id)
 
-    R.PopulationRuntime._landed = landed
+    LG.Ledger._landed = landed
     torch.cuda.synchronize()
     for p in pops.values():
-        rt = P._runtime("network", p)
-        rt._judge_pending(None, wait=True)
-        rt._status_copy = rt._status_host.clone().pin_memory()
-        rt._status_host = rt._status_host.to(net.device)
-        rt._status_np = rt._status_copy.numpy()
+        ledger = P._runtime("network", p).ledger
+        ledger.judge_pending(wait=True)
+        ledger._status_copy = ledger.status_host.clone().pin_memory()
+        ledger.status_host = ledger.status_host.to(net.device)
+        ledger._status_np = ledger._status_copy.numpy()
 
 
 events = []
@@ -120,10 +121,10 @@ if "--status-device" in sys.argv:  # (after the windows' status slots are alloca
     torch.cuda.synchronize()
 if "--steady" in sys.argv:  # no shrinking from here on (each resize drains, copies and recaptures: its cost not a round's)
     for p in pops.values():
-        p._runtime.shrink_window = 1 << 40
+        p._runtime.sizer.shrink_window = 1 << 40
 events.clear()
-cap0, rs0 = getattr(net, "_captures", 0), sum(len(p._runtime.resizes) for p in pops.values())
-rs_at = {k: len(p._runtime.resizes) for k, p in pops.items()}
+cap0, rs0 = getattr(net, "_captures", 0), sum(len(p._runtime.sizer.resizes) for p in pops.values())
+rs_at = {k: len(p._runtime.sizer.resizes) for k, p in pops.items()}
 t = time.perf_counter()
 n = 0
 per_window = []  # (wall per round of each window, host side: launch-to-launch, the queue bounded by the judging)
@@ -137,11 +138,11 @@ wall = (time.perf_counter() - t) / n * 1e6
 per_window.sort()
 timed_extra = (f"; per window: median {per_window[len(per_window) // 2]:.0f}, max {per_window[-1]:.0f} us/round"
                f"; timed: {n} rounds, {getattr(net, '_captures', 0) - cap0} captures, "
-               f"{sum(len(p._runtime.resizes) for p in pops.values()) - rs0} resizes")
+               f"{sum(len(p._runtime.sizer.resizes) for p in pops.values()) - rs0} resizes")
 for k, p in pops.items():  # (which populations resized while timed: run id, blocks per arena, log records per cell)
-    if len(p._runtime.resizes) > rs_at[k]:
-        print(f"  timed resize {k}: {p._runtime.resizes[rs_at[k]:]} (before: {p._runtime.resizes[max(rs_at[k] - 2, 0):rs_at[k]]}), "
-              f"growths {p._runtime.growths[-3:]}")
+    if len(p._runtime.sizer.resizes) > rs_at[k]:
+        print(f"  timed resize {k}: {p._runtime.sizer.resizes[rs_at[k]:]} (before: {p._runtime.sizer.resizes[max(rs_at[k] - 2, 0):rs_at[k]]}), "
+              f"growths {p._runtime.sizer.growths[-3:]}")
 gpu = sorted(s.elapsed_time(e) * 1e3 / WINDOW for s, e in events)
 fused = [k for k in compiled if k.metadata.name.startswith("fused")][-len(pops):]  # (approximate: last compiled)
 regs = sorted({getattr(k, "n_regs", 0) for k in fused})

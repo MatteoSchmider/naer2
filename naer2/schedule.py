@@ -16,7 +16,7 @@ One entry is RUN_WORDS int32 words:
   - a captured window (naer2/graph.py): the same entries copied into a graph's own buffers before replay
 
 A run too large for its ring inside a planned or captured window stops (and every run after it), and is rerun
-once the window's statuses are judged, the ring grown (runtime._Launches.recover).
+once the window's statuses are judged, the ring grown (naer2/sim/recovery.py: Recovery.recover).
 """
 
 import math

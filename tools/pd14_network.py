@@ -110,9 +110,9 @@ def record(path, out, ms, G, block=None, in_flight=None):
         _runtime(path, p).check()
     sizes = {name: _runtime(path, p).n for name, p in _runtimes(path, obj).items()}
     rounds = obj[0].round_id if path == "network" else n_rounds
-    growths = {name: _runtime(path, p).growths for name, p in _runtimes(path, obj).items()}
-    resizes = {name: getattr(_runtime(path, p), "resizes", []) for name, p in _runtimes(path, obj).items()}
-    stops = {name: getattr(_runtime(path, p), "stops", []) for name, p in _runtimes(path, obj).items()}
+    growths = {name: _runtime(path, p).sizer.growths for name, p in _runtimes(path, obj).items()}
+    resizes = {name: _runtime(path, p).sizer.resizes for name, p in _runtimes(path, obj).items()}
+    stops = {name: _runtime(path, p).sizer.stops for name, p in _runtimes(path, obj).items()}
     torch.save(dict(path=path, ms=ms, G=G, runs=runs, sizes=sizes, rounds=rounds, growths=growths,
                     resizes=resizes, stops=stops), out)
     print(f"{path}: {rounds} rounds for {ms} ms, {sum(len(v) for v in runs.values())} runs -> {out}")

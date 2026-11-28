@@ -1,7 +1,7 @@
 """
 Captured windows (Network.run_graph, naer2/graph.py) whose runs stop: a ring too small for a run inside a
-replayed window -- the window's runs are pending as one per runtime and judged together (runtime._WindowPart),
-its journal entry one for the whole window (runtime._Window): the stop found when the window is judged, every
+replayed window -- the window's runs are pending as one per runtime and judged together (naer2/sim/ledger.py: WindowPart),
+its journal entry one for the whole window (naer2/sim/recovery.py: Window): the stop found when the window is judged, every
 run not known complete rerun through its population's own kernel, in launch order, the ring grown -- and the
 result the one with rings large enough from the start (the links received exactly, the node state up to float
 rounding: test_fusion._same_state).
@@ -41,12 +41,12 @@ def _run(small: bool, fuse: bool):
 
 @pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fused"])
 def test_a_stop_inside_a_captured_window_is_rerun(fuse):
-    """(Before every replay the window two turns back is judged, PopulationRuntime.judge_windows: its capture
+    """(Before every replay the window two turns back is judged, Ledger.judge_windows: its capture
     turn's buffers are the next window's -- rerun from a later window's entries, a stopped run made a
     consumer fall behind its source's history.)"""
     state, received, _ = _run(small=False, fuse=fuse)
     state_s, received_s, rt = _run(small=True, fuse=fuse)
-    assert rt.stops and rt.growths, "E's ring stopped a run and grew"
+    assert rt.sizer.stops and rt.sizer.growths, "E's ring stopped a run and grew"
     assert sum(int(r.sum()) for r in received.values()) > 0
     for n in received:
         assert torch.equal(received[n], received_s[n]), f"{n}: received counts differ"

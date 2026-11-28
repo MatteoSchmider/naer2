@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import naer2 as n2
-from naer2.runtime import PopulationRuntime
+from naer2.sim.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a real GPU (CUDA/ROCm)")

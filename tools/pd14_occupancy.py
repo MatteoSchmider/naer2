@@ -16,7 +16,7 @@ if "--rdna2" in sys.argv:
     import rdna2  # noqa: F401
 import torch
 
-import naer2.runtime as R
+import naer2.sim.runtime as R
 import pd14_network as P
 
 opts = {a.split("=")[0][2:]: int(a.split("=")[1]) for a in sys.argv if a.startswith("--") and "=" in a}

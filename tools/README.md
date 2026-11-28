@@ -1,7 +1,7 @@
 # tools
 
 Benchmarks and diagnostics for the spike-management redesign's fused kernel
-(`naer2/transpiler/templates/fused.py`, run by `naer2/runtime.py`). All run on the default GPU; `--rdna2` (where offered)
+(`naer2/transpiler/templates/fused.py`, run by `naer2/sim/runtime.py`). All run on the default GPU; `--rdna2` (where offered)
 loads the shim for the RX 6600 eGPU, run with
 `HSA_OVERRIDE_GFX_VERSION_2=10.3.0 HIP_VISIBLE_DEVICES=1`. The split update
 and intake kernels before them, with `walk_sweep.py` and `intake_sweep.py`,
@@ -9,7 +9,7 @@ are in git history (commit `caea455`).
 
 | tool | what it does |
 |---|---|
-| `pd14_setup.py` | the shared PD14 benchmark: PD14's populations as `PopulationRuntime`s (`naer2/runtime.py`) running kernels generated from their hooks, with their `SimulationTopology` connections (0.1 ms buckets); `model="standin"`: the 8 cortical populations as `PD14_commanded` (PD14 firing on command at PD14-like rates), `"pd14"`: the real network with the thalamus; one round = one fused kernel per population, each on its own stream (pre-made events through a hub) |
+| `pd14_setup.py` | the shared PD14 benchmark: PD14's populations as `PopulationRuntime`s (`naer2/sim/runtime.py`) running kernels generated from their hooks, with their `SimulationTopology` connections (0.1 ms buckets); `model="standin"`: the 8 cortical populations as `PD14_commanded` (PD14 firing on command at PD14-like rates), `"pd14"`: the real network with the thalamus; one round = one fused kernel per population, each on its own stream (pre-made events through a hub) |
 | `pd14_roundtrip.py G` | wall clock per round, populations on their own streams (`--sequential`: on one); `--breakdown`: host issue time (queue filling, GPU idle) and the round alone |
 | `trace_round.py G` | every program of every population's kernel on one wall-clock axis, from the kernels' own stamps (`naer2/trace.py`): the round's span and GPU busy time (concurrent) and per population its span, programs alive and phases (isolated); `--level 2/3` split the pull intake further, `--heat N` keeps the clock up, `--no-counters` compiles the stand-in receive counters out (PD14's kernel) |
 | `kernel_isa.py G` | compiles the fused kernel and summarizes its ISA: VGPRs, spills, LDS, per loop the instruction mix and the highest VGPR touched |

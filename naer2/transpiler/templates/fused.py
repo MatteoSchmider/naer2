@@ -1446,7 +1446,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
         gl.store(wmark_ptr + pid, wmark)
     else:
         # a ring too small for this run: nothing committed; the run stops here, and with it every run that
-        # starts after (_run_gate) -- the host resizes and runs them again (PopulationRuntime, _Launches)
+        # starts after (_run_gate) -- the host resizes and runs them again (naer2/sim/recovery.py)
         gl.atomic_max(flags + FLAG_STOPPED, 1)
         gl.atomic_max(ctl, 1)
     gl.barrier()  # this program's ring entries are complete before it delivers
@@ -1463,7 +1463,7 @@ def _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot
 # merged into (e, node) order from its source programs' sorted regions (history.py) and appended in that order;
 # delivery merges the queues by arrival (_deliver_queues). A queue's blocks: all through its block table (no
 # fixed reserve); past the committed count, the pull writes scratch -- committed (counts, blocks, the free
-# stack's top) only if the whole pull fits, else the run stops and reruns (_Launches).
+# stack's top) only if the whole pull fits, else the run stops and reruns (naer2/sim/recovery.py).
 
 QNB = gl.constexpr(256)  # time bins a source run's spikes are counted in (their chunks: whole bins)
 QCH = gl.constexpr(512)  # the most spikes a chunk merges in LDS (bins grouped to QCH / 2 + one; past: merge path)

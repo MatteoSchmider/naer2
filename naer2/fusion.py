@@ -8,7 +8,7 @@ fused_run, exactly the code its own kernel runs), dispatched on the program id. 
                                 #  captured graphs)
 
 Only the launch is shared. Every run stays its population's: its schedule entry, its status, its journal
-entry -- a stopped run is rerun through its population's own kernel (runtime._Launches.recover), as without
+entry -- a stopped run is rerun through its population's own kernel (naer2/sim/recovery.py), as without
 fusion. Rounds in which only some populations run launch per population as before.
 
 What one kernel for all populations costs: its registers and shared memory are the most any population's body
@@ -18,14 +18,14 @@ block size). Worth it where the populations are alike and all run every round (P
 
     FusedRound(runtimes)            the fused kernel of these runtimes (in this order), generated and loaded
     .covers(runtimes)               whether a round's runs are exactly these runtimes'
-    .launch(params, stream)         one launch: params[i] runtime i's run (PopulationRuntime launch params)
+    .launch(params, stream)         one launch: params[i] runtime i's run (RunParams)
 """
 
 import importlib.util
 
 import torch
 
-from .runtime import _direct_launch
+from .sim.runtime import _direct_launch
 from .transpiler.templates.fused_template import CONSTEXPRS, DO_NOT_SPECIALIZE, FIXED_ARGS, module_path
 
 
@@ -107,12 +107,12 @@ def fused_round(
         (the compiled variant's key), and whether every state tensor is aligned (the specialization)."""
         args, consts, aligned = [], [], True
         for rt, p in zip(self.runtimes, params):
-            a, num_warps, al = rt._launch_args(p)
-            if num_warps != self.num_warps:
+            a, al = rt.launch_args(p)
+            if p.num_warps != self.num_warps:
                 raise ValueError("FusedRound.launch: a run's warps differ from the fused kernel's")
             args += a
             aligned &= al
-            c = rt._constexprs(num_warps)
+            c = rt.constexprs(p.num_warps)
             consts += [c[n] for n in CONSTEXPRS]
         return args, tuple(consts), aligned
 
@@ -136,7 +136,7 @@ def fused_round(
         return launch
 
     def launch(self, params: list, stream=None) -> None:
-        """One launch of the round: params[i] runtime i's run, as PopulationRuntime._launch takes it."""
+        """One launch of the round: params[i] runtime i's run (RunParams)."""
         self.launches += 1
         args, _, _ = self._args(params)
         self.ensure_compiled(params)(args, stream.cuda_stream if stream is not None else None)

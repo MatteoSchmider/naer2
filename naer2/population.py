@@ -100,7 +100,7 @@ class Population:
         self._is_event_driven: bool = False
         self._autonomous: bool = False
 
-        # The fused kernel's runtime (naer2/runtime.py), built on the first
+        # The fused kernel's runtime (naer2/sim/runtime.py), built on the first
         # run: the kernel generated from this population's hooks
         # (fused_kernel()), its dynamic attrs as the runtime's state (the
         # same tensors), its history, ring and plan of incoming
@@ -109,7 +109,7 @@ class Population:
         # ring_block-record blocks, starting at ring_in_flight of the group's
         # incoming links (the largest group's) + per slot its reserved blocks
         # and a partly used one -- by default the reserves alone: the
-        # runtime sizes the arenas from what the runs need (naer2/runtime.py;
+        # runtime sizes the arenas from what the runs need (naer2/sim/sizing.py;
         # PD14: quiet activity needs little more than the reserves, the
         # thalamic volley ~4x that).
         self._fused = None
@@ -466,7 +466,7 @@ class Population:
 
     @property
     def runtime(self):
-        """The runtime (naer2/runtime.py), connected to its sources' (built on first use)."""
+        """The runtime (naer2/sim/runtime.py), connected to its sources' (built on first use)."""
         self._ensure_runtime()
         return self._runtime
 
@@ -476,7 +476,7 @@ class Population:
         yet connected."""
         if self._runtime is not None:
             return
-        from .runtime import PopulationRuntime
+        from .sim.runtime import PopulationRuntime
 
         self._ensure_on_device(device)
         kernel = self.fused_kernel()

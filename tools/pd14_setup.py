@@ -1,5 +1,5 @@
 """The PD14 spike-management benchmark setup shared by the tools: PD14's
-populations as PopulationRuntimes (naer2/runtime.py) running kernels
+populations as PopulationRuntimes (naer2/sim/runtime.py) running kernels
 generated from their hooks (naer2/transpiler/templates/fused_template.py),
 with their SimulationTopology connections (0.1ms delay buckets); one round =
 one fused kernel per population, every population on its own stream.
@@ -20,7 +20,7 @@ import time
 import torch
 
 from naer2.ring import RESERVE
-from naer2.runtime import PopulationRuntime
+from naer2.sim.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.commanded import PD14_commanded
 from test.networks.PD14.net import build, description

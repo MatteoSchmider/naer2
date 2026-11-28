@@ -109,7 +109,7 @@ y = torch.zeros(1, device="cuda")
 torch_us = per_launch(lambda: y.add_(1))
 
 # the real thing: a small consumer with 8 incoming connections, no spikes
-from naer2.runtime import PopulationRuntime  # noqa: E402
+from naer2.sim.runtime import PopulationRuntime  # noqa: E402
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate  # noqa: E402
 from test.networks.PD14.commanded import PD14_commanded  # noqa: E402
 from test.topologies import random_topology  # noqa: E402

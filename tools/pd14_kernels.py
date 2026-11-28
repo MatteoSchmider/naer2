@@ -18,7 +18,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 import pd14_network as P
-from naer2 import runtime as R
+from naer2.sim import runtime as R
 
 G = int(sys.argv[1])
 ROUNDS = 300

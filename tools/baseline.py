@@ -25,7 +25,7 @@ sys.path[:0] = [os.getcwd(), os.path.join(os.getcwd(), "tools")]
 import torch
 
 import naer2.graph as GR
-import naer2.runtime as R
+import naer2.sim.recovery as RC
 
 NET = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "pd14"
 opts = {a.split("=")[0][2:]: a.split("=")[1] for a in sys.argv if a.startswith("--") and "=" in a}
@@ -84,8 +84,8 @@ def _timed(cls, name, kind):
     setattr(cls, name, f)
 
 
-_timed(R._Launches, "resize", "resize")
-_timed(R._Launches, "recover", "resize")
+_timed(RC.Recovery, "resize", "resize")
+_timed(RC.Recovery, "recover", "resize")
 _timed(GR.WindowGraph, "__init__", "capture")
 gpu = []  # the replays' GPU time, per window
 _replay = GR.WindowGraph.replay
@@ -214,5 +214,5 @@ print(f"  windows with them ({len(busy)}): {sum(w['wall'] for w in busy):.2f} s 
       f"max {max(rs, default=0) * 1e3:.0f} ms), {len(cap)} captures ({sum(cap):.2f} s, "
       f"median {st.median(cap) * 1e3 if cap else 0:.0f} ms)")
 growths = [(p.name if hasattr(p, "name") else type(p.instance).__name__, g) for p in net.populations
-           for g in p.runtime.growths]
+           for g in p.runtime.sizer.growths]
 print(f"  growths: {len(growths)}; rings at the end {rings / links:.2f} B a link")

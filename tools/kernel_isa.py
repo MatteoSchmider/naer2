@@ -14,7 +14,7 @@ import sys
 sys.path[:0] = [os.path.join(os.path.dirname(__file__), "..")]
 import torch
 
-from naer2.runtime import PopulationRuntime
+from naer2.sim.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.commanded import PD14_commanded
 from test.topologies import random_topology

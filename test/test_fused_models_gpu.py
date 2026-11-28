@@ -1,6 +1,6 @@
 """
 The fused kernels generated from PD14's hooks (naer2/transpiler/templates/
-fused_template.py, run by naer2/runtime.py) against the hooks themselves
+fused_template.py, run by naer2/sim/runtime.py) against the hooks themselves
 (test/networks/PD14/neuron.py, poisson.py) written out in torch, run by run: the state every hook assigns,
 which neurons spike and their emission times (bare n2.spike(): the window's
 start, D-4). The references follow the hooks' expressions in their order, in
@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from naer2.runtime import PopulationRuntime
+from naer2.sim.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.neuron import PD14_neuron
 from test.networks.PD14.poisson import PD14_poisson

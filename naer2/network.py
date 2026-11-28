@@ -228,9 +228,7 @@ class Network:
         self.round_id = saved_round
         for pop in pops:  # two windows' runs of status slots: one window in flight while the next launches
             rt = pop._runtime
-            need = 2 * schedule.n_runs.get(id(rt), 0)
-            if rt.status_slots < need:
-                rt._alloc_slots(1 << math.ceil(math.log2(need)))
+            rt.ledger.ensure(2 * schedule.n_runs.get(id(rt), 0))
         fused = self._fused_round()
         for runs in schedule.launches:
             if fused is not None and fused.covers([pop._runtime for pop, _, _ in runs]):
@@ -255,12 +253,11 @@ class Network:
         params = []
         for rt in fused.runtimes:
             _, i, run_id = by_rt[id(rt)]
-            rt.free_slot()
+            rt.ledger.free_slot()
             params.append(rt.entry_params(schedule.entries(rt), i, run_id))
         fused.launch(params, torch.cuda.current_stream())
         for rt, p in zip(fused.runtimes, params):
-            rt._launches.journal[(id(rt), p[2])] = (rt, p)
-            rt._pending.append(p[2])
+            rt.ledger.launched(p)
 
     def run_graph(self, max_launches: int = 1000, until: float | None = None) -> int:
         """As run_planned, but the window replayed from a captured device graph (naer2/graph.py): captured
@@ -293,12 +290,11 @@ class Network:
         for pop in pops:
             rt = pop._runtime
             n = schedule.n_runs.get(id(rt), 0)
-            if rt.status_slots < 2 * n:
-                rt._alloc_slots(1 << math.ceil(math.log2(2 * n)))
-            rt.make_room(n)
+            rt.ledger.ensure(2 * n)
+            rt.ledger.make_room(n)
             # the window two turns back judged: its capture turn's buffers are this window's next
             # (status slots rounded up could otherwise leave it pending, its entries overwritten)
-            rt.judge_windows(keep=1)
+            rt.ledger.judge_windows(keep=1)
         if not hasattr(self, "_graphs"):
             self._graphs = {}
         sig = schedule.signature()

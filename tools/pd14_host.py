@@ -1,7 +1,7 @@
 """The host's share of PD14's captured windows (run_graph): where a window's host time goes, part by part --
 planning (Network.plan), the schedule's entries (naer2/schedule.py), making room for the window's statuses
 (judging the older window's: waits for it), the replay (entries copied, graph launched), the runs'
-bookkeeping (note_window), the commit -- and cProfile's top functions over the same windows.
+bookkeeping (Ledger.launched_window), the commit -- and cProfile's top functions over the same windows.
 
     python tools/pd14_host.py [--window=100] [--windows=20] [--warmup=1000] [--profile] [--rdna2]
 
@@ -21,7 +21,7 @@ import torch
 
 import naer2.graph as GR
 import naer2.network as N
-import naer2.runtime as R
+import naer2.sim.ledger as LG
 import naer2.schedule as S
 import pd14_network as P
 
@@ -58,9 +58,9 @@ def timed(owner, name, label):
 timed(N.Network, "plan", "plan")
 timed(S.Schedule, "__init__", "schedule")
 timed(S.Schedule, "commit", "commit")
-timed(R.PopulationRuntime, "make_room", "make room (judging)")
-timed(R.PopulationRuntime, "note_window", "note_window (bookkeeping)")
-timed(GR.WindowGraph, "replay", "replay (incl. note_window)")
+timed(LG.Ledger, "make_room", "make room (judging)")
+timed(LG.Ledger, "launched_window", "launched_window (bookkeeping)")
+timed(GR.WindowGraph, "replay", "replay (incl. launched_window)")
 gpu = []
 real_replay = torch.cuda.CUDAGraph.replay
 

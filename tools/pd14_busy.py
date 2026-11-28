@@ -50,7 +50,7 @@ torch.cuda.synchronize()
 wall = (time.perf_counter() - t1) / ROUNDS
 r += ROUNDS
 
-from naer2 import runtime as R
+from naer2.sim import runtime as R
 for p in pops.values():
     P._runtime("network", p).set_trace(cap=8, level=1)  # (only the header's wall clock is used)
 for k in range(r, r + 5):
@@ -65,19 +65,19 @@ for p in pops.values():
     rt_ = P._runtime("network", p)
     big = torch.zeros(ROUNDS, rt_.trace.buf.numel(), device=rt_.trace.buf.device, dtype=torch.int32)
     SLICES[id(rt_)] = (big, [big[i] for i in range(ROUNDS)])
-_launch = R.PopulationRuntime._launch
+_launch = R.PopulationRuntime.launch
 def _launch_slice(self, params, stream):
     big, views = SLICES[id(self)]
-    self.trace.buf = views[(params[4] - r0) % ROUNDS]
+    self.trace.buf = views[(params.run_id - r0) % ROUNDS]
     _launch(self, params, stream)
-R.PopulationRuntime._launch = _launch_slice
+R.PopulationRuntime.launch = _launch_slice
 r0 = r
 t2 = time.perf_counter()
 for k in range(r, r + ROUNDS):
     P._advance("network", obj, k)
 torch.cuda.synchronize()
 wall_traced = (time.perf_counter() - t2) / ROUNDS
-R.PopulationRuntime._launch = _launch
+R.PopulationRuntime.launch = _launch
 SNAPS = []
 for p in pops.values():
     rt_ = P._runtime("network", p)

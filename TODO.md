@@ -20,7 +20,7 @@
 Every population runs one fused Gluon kernel per run (pull intake, delivery, update, send, emission),
 generated from its hooks (`naer2/transpiler/templates/fused.py` the fixed template -- what limits optimizing it
 further: `limitations.md` next to it -- and `fused_template.py` its generator), on its runtime
-(`naer2/runtime.py`: state, emission history `naer2/history.py`, ring `naer2/ring.py` -- per group an arena of
+(`naer2/sim/runtime.py`: state, emission history `naer2/history.py`, ring `naer2/ring.py` -- per group an arena of
 blocks --, plan of incoming
 `SimulationTopology`s). `Network.step` schedules round by round (horizons, rounds, one stream per population);
 `Network.run_graph` replays planned windows of rounds from captured device graphs (`naer2/schedule.py`,

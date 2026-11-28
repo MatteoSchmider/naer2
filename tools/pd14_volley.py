@@ -17,7 +17,9 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 import pd14_network as P
-from naer2 import runtime as R
+from naer2.sim import recovery as RC
+from naer2.sim import runtime as R
+from naer2.sim import sizing as SZ
 
 G = int(sys.argv[1])
 if "--keep-old" in sys.argv:  # never free a ring's old buffer (diagnostic)
@@ -33,18 +35,17 @@ for a in sys.argv:
     if a.startswith("--warps="):  # the warp cap (diagnostic): runtime._warp_cap overridden
         R._warp_cap = lambda device, _w=int(a.split("=")[1]): _w
 BLK = []  # TEMP: staging's block ids past the group's arena (ring header words 19..24), read before resizes
-_apply = R.PopulationRuntime._apply_wanted
-def _apply_blk(self):
-    if self._wanted is not None:
-        w = self.ring.buf[19:32].tolist()
+_apply = SZ.RingSizer.apply
+def _apply_blk(self, ring, run_id):
+    if self.wanted is not None:
+        w = ring.buf[19:32].tolist()
         if w[0] or w[6] or w[7]:
-            BLK.append((self.n, self.run_id, w))
-    return _apply(self)
+            BLK.append((ring.n_groups, run_id, w))
+    return _apply(self, ring, run_id)
 if "--staging" in sys.argv:  # (diagnostic, needs tools/pd14_volley_debug.patch: syncs at every resize)
-    R.PopulationRuntime._apply_wanted = _apply_blk
+    SZ.RingSizer.apply = _apply_blk
 INV = []  # TEMP: arena invariant (held blocks + free stack = every id once, per group), checked before resizes
-def _check_arena(rt, when):
-    ring = rt.ring
+def _check_arena(ring, when):
     if len(INV) >= 2:
         return
     g, S, nb, B = ring.n_groups, ring.n_slots, ring.n_blocks, ring.block
@@ -63,20 +64,20 @@ def _check_arena(rt, when):
             seen[i] = where
         missing = sorted(set(range(nb)) - set(seen))
         if dups or missing:
-            INV.append((rt.n, when, grp, dups[:4], missing[:8], len(ids), nb))
+            INV.append((ring.n_groups, when, grp, dups[:4], missing[:8], len(ids), nb))
             return
-_apply2 = R.PopulationRuntime._apply_wanted
-def _apply_inv(self):
-    if self._wanted is None:
-        return _apply2(self)
-    nb0 = self.ring.n_blocks
-    _check_arena(self, f"{self.run_id}, before resizing from {nb0}")
-    out = _apply2(self)
-    _check_arena(self, f"{self.run_id}, after resizing {nb0} -> {self.ring.n_blocks}")
+_apply2 = SZ.RingSizer.apply
+def _apply_inv(self, ring, run_id):
+    if self.wanted is None:
+        return _apply2(self, ring, run_id)
+    nb0 = ring.n_blocks
+    _check_arena(ring, f"{run_id}, before resizing from {nb0}")
+    out = _apply2(self, ring, run_id)
+    _check_arena(ring, f"{run_id}, after resizing {nb0} -> {ring.n_blocks}")
     return out
 CHECK_ARENA = "--check-arena" in sys.argv  # (diagnostic: copies the arenas' tables at every resize -- a sync
 if CHECK_ARENA:                           # that hides the race, TODO.md)
-    R.PopulationRuntime._apply_wanted = _apply_inv
+    SZ.RingSizer.apply = _apply_inv
 PROFILE = "--profile" in sys.argv
 t0 = time.time()
 obj = P._network(G)
@@ -85,8 +86,8 @@ pops = P._runtimes("network", obj)
 names = {id(p): n for n, p in pops.items()}
 order = [names[id(p)] for p in list(net.populations)]
 stops = [0]
-_rec = R._Launches.recover
-R._Launches.recover = lambda self: (stops.__setitem__(0, stops[0] + 1), _rec(self))[1]
+_rec = RC.Recovery.recover
+RC.Recovery.recover = lambda self: (stops.__setitem__(0, stops[0] + 1), _rec(self))[1]
 r, prof = 0, None
 DEVICE_CHECK = "--device-check" in sys.argv  # (the arena checked on the device: runtime.arena_check, no syncs)
 try:
@@ -135,7 +136,7 @@ for nm, p in pops.items():
               f"group {o[5]} round {o[6]} conn {o[7]} slot {o[8]} index {o[9]}: source {o[10]} of {o[11]}, "
               f"segments [{o[12]}, {o[13]}) of {o[14]}, e {e:.4f}, e-group spikes {o[16]}; links: lo {o[17]} "
               f"n {o[18]} segment {o[19]}")
-resizes = sum(len(P._runtime("network", p).resizes) for p in pops.values())
+resizes = sum(len(P._runtime("network", p).sizer.resizes) for p in pops.values())
 warps = P._runtime("network", list(net.populations)[0])._warps(None)
 print(f"no fault through round 7305 ({torch.cuda.get_device_name(0)}, G={G}, {warps} warps): volley's first 200 "
       f"rounds {per_round * 1e3:.2f} ms/round{' (profiled)' if PROFILE else ''}; {resizes} resizes, {stops[0]} "
