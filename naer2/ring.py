@@ -138,7 +138,7 @@ class Ring:
         self._allocate(device)
         self.ring_pos = 0  # first slot not yet delivered
         # the first slot still holding records, where the host knows it (an event-driven population's ring, read
-        # back after its runs: Population._note_pending_arrivals; inf: none) -- its next stepped run starts there
+        # back after its runs: Population._pending_arrival; inf: none) -- its next stepped run starts there
         # at the latest (PopulationRuntime.run; a gated run: fused.py _run_from); None: unknown
         self.first_pending: float | None = None
 

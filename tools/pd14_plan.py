@@ -7,7 +7,7 @@ import sys, time, os
 sys.path[:0] = [os.getcwd(), os.path.join(os.getcwd(), "tools")]
 import torch
 import pd14_network as P
-from naer2.population import Population
+from naer2.sim.scheduler import Scheduler
 obj = P._network(256)
 net = obj[0]
 names = {id(p): n for n, p in P._runtimes("network", obj).items()}
@@ -21,13 +21,12 @@ planned = [sorted((names[id(p)], round(a, 6), round(b, 6)) for p, a, b, g in L) 
 print(f"plan: {len(launches)} launches ({sum(len(L) for L in launches)} kernel runs, {launches[0][0][1]:.1f} "
       f"-> {launches[-1][0][2]:.1f} ms) in {dt * 1e3:.0f} ms host ({dt / len(launches) * 1e6:.0f} us a launch)")
 ran = []
-orig = Population._execute_update_kernel
-def rec(self, t, stream=None, launch=True):
-    w = orig(self, t, stream=stream, launch=launch)
-    if w is not None and launch:
-        ran.append((net.round_id, names[id(self)], round(w[0], 6), round(w[1], 6)))
-    return w
-Population._execute_update_kernel = rec
+orig = Scheduler.take
+def rec(states, t):  # (stepped from here on: every round's runs as step() takes them)
+    runs = orig(states, t)
+    ran.extend((net.round_id, names[id(p)], round(a, 6), round(b, 6)) for p, a, b, _ in runs)
+    return runs
+Scheduler.take = staticmethod(rec)
 for r in range(5, 5 + len(launches)):
     P._advance("network", obj, r)
 torch.cuda.synchronize()

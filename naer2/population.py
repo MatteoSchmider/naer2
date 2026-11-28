@@ -8,14 +8,6 @@ from .nodes import Node, node_types
 from .types import Region
 
 
-def _same_time(a: float, b: float) -> bool:
-    """Equality of two run times up to float rounding: 0.2 * 3 and 0.3 + 0.3
-    must count as the same round. inf only equals inf."""
-    if math.isinf(a) or math.isinf(b):
-        return a == b
-    return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
-
-
 _SEEDS = itertools.count(1)  # (Population.seed: the populations numbered as they are made)
 
 
@@ -37,7 +29,7 @@ class Population:
         # This population's own clock: a run every timestep (its window
         # [t, t + timestep)). None (default): an update() population runs as
         # far as its inputs' horizon allows, an event-driven one when an
-        # arrival is due (see _next_run_time); an update() population without
+        # arrival is due (naer2/sim/scheduler.py: PopSchedule.next_run_time); an update() population without
         # incoming connections (a source) every smallest delay of its outgoing
         # ones (_own_timestep).
         self.timestep = timestep
@@ -65,40 +57,11 @@ class Population:
                 self.dynamic_attrs[member] = instance.__dict__[member].__class__
         self.instance = instance
         self.incoming: list = []  # Connection objects whose target is this population
-        self.last_update: float = -math.inf
-        # Scheduling (see _next_run_time, _relax_horizon):
-        # _horizon: no spike of this population before it is still unknown
-        #   (clocked/update populations: where their last run computed to;
-        #   event-driven ones: derived every round from their inputs).
-        # _bound: no input arrival before it is still unknown.
-        # _run_times: pending arrivals of an event-driven population --
-        #   intake appends arrival + the connection's minimum delay for a
-        #   connection whose source emitted new spikes; later per-link
-        #   arrivals are found in its ring after each run
-        #   (_note_pending_arrivals).
-        self._horizon: float = 0.0
-        self._bound: float = math.inf
-        self._run_times: list[float] = []
-        # a run time's earliest spike where it is earlier (a slot-end run: its slot's records arrive, and fire,
-        # anywhere in the slot -- D-1's exact times; the horizon must be no later: _relax_horizon); an exact
-        # run time (a source run's earliest emission + the minimum delay) is its own
-        self._floors: dict[float, float] = {}
+        # (its scheduling -- last run, horizon, pending run times: the network's, naer2/sim/scheduler.py)
         self._min_delays: dict = {}
         self._max_delays: dict = {}
-        # Intake bookkeeping: _run_id counts this population's runs (0 =
-        # never run); _read_run[conn] is the source run intake last read
-        # from conn, so a source is read once per run even when rounds
-        # repeat at the same time; _summary caches (run id, n spikes,
-        # earliest emission time) of this population's own last run.
-        self._run_id: int = 0
-        self._read_run: dict = {}
+        # (its last run's emission summary, read back once per run: _emission_summary)
         self._summary: tuple[int, int, float] | None = None
-        # The scheduler's hot path, fixed for one Network.step (_prepare_step): (connection, source, minimum
-        # delay) per incoming connection, event-driven, update() dynamics.
-        self._ins: list = []
-        self._clock: float | None = None  # its clock for the step (_own_timestep)
-        self._is_event_driven: bool = False
-        self._autonomous: bool = False
 
         # The fused kernel's runtime (naer2/sim/runtime.py), built on the first
         # run: the kernel generated from this population's hooks
@@ -234,67 +197,48 @@ class Population:
                 windows.append(src._max_window())
         return max(windows)
 
-    def _prepare_step(self) -> None:
-        """Start of a Network.step: what its rounds look up constantly, cached for the step (incoming
-        connections, their sources and minimum delays; event-driven; update() dynamics; its clock) -- the
-        scheduler's Python is a good part of a round's host time."""
-        self._clock = self._own_timestep()
-        self._ins = [(c, c._source, self._min_delay(c)) for c in self.incoming]
-        self._is_event_driven = self._event_driven
-        self._autonomous = self.has_autonomous_dynamics
+    @property
+    def last_update(self) -> float:
+        """The start of this population's last run as the network scheduled it (-inf: none yet)."""
+        return self.network.scheduler.state(self).last_update
+
+    # ---- the device's feedback to the scheduler (naer2/sim/scheduler.py): readbacks, host syncs (TODO.md, D-13)
 
     def _emission_summary(self) -> tuple[int, float]:
         """(number of spikes, earliest emission time) of this population's
         last run: its history's header, read back once per run and shared by
-        all consumers (a host sync -- TODO.md, D-13)."""
-        if self._summary is None or self._summary[0] != self._run_id:
-            if self._runtime is None or self._runtime.run_id == 0:
-                return 0, math.inf  # no kernel ran: nothing emitted
-            self._runtime.settle()  # (a stopped run rerun first)
-            n, earliest = self._runtime.history.summary(self._runtime.run_id)
-            self._summary = (self._run_id, n, earliest)
+        all consumers."""
+        rt = self._runtime
+        if rt is None or rt.run_id == 0:
+            return 0, math.inf  # no kernel ran: nothing emitted
+        if self._summary is None or self._summary[0] != rt.run_id:
+            rt.settle()  # (a stopped run rerun first)
+            self._summary = (rt.run_id, *rt.history.summary(rt.run_id))
         return self._summary[1], self._summary[2]
 
-    def _intake(self, t: float, planning: bool = False) -> None:
-        """End of every round (Network.step): take in what every source that
-        ran since this population last read it emitted. Host side: read
-        each source once per run, and for an event-driven population
-        schedule a run at the source's earliest emission + the connection's
-        minimum delay (later per-link arrivals are found by the update
-        kernel)."""
-        read = self._read_run
-        for conn, source, min_delay in self._ins:
-            if source._run_id == 0 or read.get(conn) == source._run_id:
-                continue
-            read[conn] = source._run_id
-            if not self._is_event_driven:
-                continue  # its own clock or its inputs' horizon runs it: no summary needed
-            if planning:  # (Network.plan: every time an arrival of this source run could make a run due)
-                for r, floor in self._possible_run_times(conn, source, min_delay):
-                    q = next((q for q in self._run_times if _same_time(r, q)), None)
-                    if q is None:
-                        self._run_times.append(q := r)
-                    if floor < self._floors.get(q, q):
-                        self._floors[q] = floor
-                continue
-            n, earliest = source._emission_summary()  # a host sync (TODO.md, D-13)
-            if n:
-                self._run_times.append(earliest + min_delay)
-        # (The spikes themselves: the fused kernel's pull takes them in at
-        # this population's next run, straight from the sources' histories.)
-
-    def _possible_run_times(self, conn, source, min_delay: float) -> list[tuple[float, float]]:
-        """(Network.plan) Every time a spike of the source's last run [ts, te) through conn could make this
-        event-driven population's run due, without knowing its spikes: ts + the minimum delay (intake's,
-        exact for a source emitting at its window's start), and the end of every slot an arrival in
-        [ts + min delay, te + max delay] can land in (_note_pending_arrivals') -- each with its earliest
-        spike (a slot's: its start, or ts + the minimum delay)."""
-        ts, te = source._window
-        w = self._slot_width()
-        k0 = math.floor((ts + min_delay) / w + 1e-9)
-        k1 = math.floor((te + self._max_delay(conn)) / w + 1e-9)
-        return [(ts + min_delay, ts + min_delay)] + [(round((k + 1) * w, 12), max(round(k * w, 12), ts + min_delay))
-                                                     for k in range(k0, k1 + 1)]
+    def _pending_arrival(self) -> tuple[float, float] | None:
+        """An event-driven population runs when an arrival is due: its ring
+        knows the next one after a run -- the first slot still holding
+        records (later per-link arrivals of spikes already taken in). A run
+        at that slot's end is the first that can deliver it: (that run time,
+        its earliest spike -- the slot's start); a queue population's, exact
+        (its queues' next arrival, from the run's event state: fused.py
+        _ev_close). None: nothing pending. After the round's join
+        (Network.step): the run is on this population's stream."""
+        if self._runtime is None:
+            return None  # no kernel ran: nothing pending
+        self._runtime.settle()  # (a stopped run rerun first)
+        ring = self._runtime.ring
+        if self._runtime.queues:
+            nxt = self._runtime.next_arrival()
+            return (nxt, nxt) if math.isfinite(nxt) else None
+        pending = ring.run_count.view(ring.n_groups, ring.n_slots).amax(0).tolist()  # (per slot, over the groups)
+        ring.first_pending = math.inf  # (none: the ring is empty -- its next run starts from its own start)
+        for k in range(ring.ring_pos, ring.ring_pos + ring.n_slots):
+            if pending[k % ring.n_slots]:
+                ring.first_pending = k
+                return (k + 1) * ring.slot_width, k * ring.slot_width  # (a run at the slot's end)
+        return None
 
     def _max_delay(self, conn) -> float:
         """Largest delay on `conn` (0.0 if it has none), cached (as _min_delay)."""
@@ -309,27 +253,6 @@ class Population:
             else:
                 self._max_delays[conn] = float(d)
         return self._max_delays[conn]
-
-    def _schedule_state(self) -> tuple:
-        """Everything Network.step's scheduling changes (Network.plan restores it)."""
-        return (self.last_update, self._run_id, getattr(self, "_window", None), self._horizon, self._bound,
-                list(self._run_times), dict(self._read_run), self._summary, dict(self._floors))
-
-    def _restore_schedule(self, state: tuple) -> None:
-        (self.last_update, self._run_id, self._window, self._horizon, self._bound, run_times, read_run,
-         self._summary, self._floors) = state
-        self._run_times, self._read_run = run_times, read_run
-
-    def _check_schedulable(self) -> None:
-        """An update() population needs a clock: its own timestep, its
-        outgoing connections' smallest delay (a source), or inputs bounding
-        how far it may integrate."""
-        if self.has_autonomous_dynamics and not self.incoming and self._own_timestep() is None:
-            raise ValueError(
-                f"{type(self.instance).__name__} population has update() dynamics but "
-                f"neither an explicit timestep, nor incoming connections, nor outgoing ones with a nonzero "
-                f"delay, so nothing determines how far each update may integrate: set population.timestep."
-            )
 
     def _min_delay(self, conn) -> float:
         """Smallest delay on `conn` (0.0 if it has none), cached: delays
@@ -348,110 +271,6 @@ class Population:
             else:
                 self._min_delays[conn] = float(d)
         return self._min_delays[conn]
-
-    def _reset_horizon(self) -> None:
-        """Start of a round's horizon fixed point: derived values restart at
-        inf and only shrink while relaxing (see Network.step)."""
-        if self._ins:
-            self._bound = math.inf
-        if self._is_event_driven and self.last_update != -math.inf:
-            self._horizon = math.inf
-
-    def _relax_horizon(self) -> bool:
-        """One relaxation step: input bound = min over incoming connections
-        of (source horizon + minimum delay); an event-driven population
-        emits nothing before its earliest unprocessed arrival, so its own
-        horizon is min(bound, earliest pending arrival). True if anything
-        changed."""
-        bound = math.inf
-        for _conn, source, min_delay in self._ins:
-            b = source._horizon + min_delay
-            if b < bound:
-                bound = b
-        horizon = self._horizon
-        if self._is_event_driven and self.last_update != -math.inf:
-            # (its spikes no earlier than its runs' earliest: a slot-end run's, its slot's start -- _floors)
-            horizon = min(bound, min((self._floors.get(r, r) for r in self._run_times), default=math.inf))
-        changed = bound != self._bound or horizon != self._horizon
-        self._bound, self._horizon = bound, horizon
-        return changed
-
-    def _next_run_time(self) -> float:
-        """When this population next wants its update kernel to run, given
-        this round's relaxed horizons; math.inf for "not until something
-        changes". Never earlier than the network's current time.
-
-          - never run yet: 0.0, for every population
-          - a clock (explicit timestep, or a source's derived one): its horizon
-            (last run + timestep)
-          - update() dynamics, no timestep: as soon as its input bound is
-            past its horizon, i.e. it can integrate further
-          - event-driven: its earliest pending arrival, once the input
-            bound has reached it"""
-        if self.last_update == -math.inf:
-            return 0.0
-        if self._clock is not None:
-            return self._horizon
-        if self._autonomous:
-            if self._bound > self._horizon and not _same_time(self._bound, self._horizon):
-                return max(self._horizon, self.network.t)
-            return math.inf
-        arrival = min(self._run_times, default=math.inf)
-        if arrival <= self._bound or _same_time(arrival, self._bound):
-            return arrival
-        return math.inf
-
-    def _execute_update_kernel(self, t: float, stream=None, launch: bool = True) -> tuple[float, float] | None:
-        """Offered every round's time t by Network.step(); runs only if t is
-        this population's own next run time. The run's window ends at
-        t + timestep for a clocked population, else at its input bound.
-        Returns the run's window (None: not this round); launch False: the
-        bookkeeping only, no kernel (Network.plan)."""
-        if not _same_time(self._next_run_time(), t):
-            return None
-        self.last_update = t
-        self._run_id += 1
-        window_end = t + self._clock if self._clock is not None else self._bound
-        self._window = (t, window_end)
-        if not self._is_event_driven:
-            self._horizon = window_end
-        self._run_times = [
-            r for r in self._run_times if r > window_end and not _same_time(r, window_end)
-        ]
-        if self._floors:
-            self._floors = {r: f for r, f in self._floors.items() if r in self._run_times}
-
-        if launch:
-            self.run(t, window_end, round_id=self.network.round_id, stream=stream)
-        return t, window_end
-
-    def _note_pending_arrivals(self) -> None:
-        """An event-driven population runs when an arrival is due: its ring
-        knows the next one after a run -- the first slot still holding
-        records (later per-link arrivals of spikes already taken in). A run
-        at that slot's end is the first that can deliver it. One readback of
-        the ring's counts (the host sync event-driven scheduling has anyway,
-        TODO.md, D-13) -- after the round's join (Network.step): the run
-        is on this population's stream."""
-        if self._runtime is None:
-            return  # no kernel ran: nothing pending
-        self._runtime.settle()  # (a stopped run rerun first)
-        ring = self._runtime.ring
-        if self._runtime.queues:  # (its queues' next arrival, exact: the run's event state, fused.py _ev_close)
-            nxt = self._runtime.next_arrival()
-            if math.isfinite(nxt) and not any(_same_time(nxt, q) for q in self._run_times):
-                self._run_times.append(nxt)
-            return
-        pending = ring.run_count.view(ring.n_groups, ring.n_slots).amax(0).tolist()  # (per slot, over the groups)
-        ring.first_pending = math.inf  # (none: the ring is empty -- its next run starts from its own start)
-        for k in range(ring.ring_pos, ring.ring_pos + ring.n_slots):
-            if pending[k % ring.n_slots]:
-                ring.first_pending = k
-                arrival = (k + 1) * ring.slot_width  # (a run at the slot's end; its spikes from its start on)
-                if arrival not in self._run_times:
-                    self._run_times.append(arrival)
-                self._floors[arrival] = min(self._floors.get(arrival, arrival), k * ring.slot_width)
-                return
 
     # ------------------------------------------------------------------ the fused kernel's runtime
 
@@ -576,8 +395,8 @@ class Population:
         """One run of the fused kernel over [t_start, t_end) in round
         `round_id`: what the sources emitted in earlier rounds taken in,
         every slot due by deliver_until (default t_end) delivered, update,
-        send, emission into the history. The scheduler's entry
-        (_execute_update_kernel) and the direct one."""
+        send, emission into the history. Network.step's launch of a
+        scheduled run, and the direct one."""
         self._ensure_runtime()
         self._runtime.count_received = self.count_received
         self._runtime.run(t_start, t_end, deliver_until=deliver_until, round_id=round_id, stream=stream)

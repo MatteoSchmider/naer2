@@ -15,7 +15,7 @@ applies and plans otherwise.
     .forget()                    back to planning (the network changed, a run stopped, ...)
 
 What is compared and shifted: the entries (integer columns exactly, times up to float rounding), the network's
-time and round, each population's scheduling state (Population._schedule_state: numbers shifted, everything
+time and round, each population's scheduling state (PopSchedule.state, naer2/sim/scheduler.py: numbers shifted, everything
 else equal), each runtime's run id and ring position.
 """
 
@@ -80,7 +80,7 @@ class _Snapshot:
         self.n = len(schedule.launches)
         self.signature = schedule.signature()
         self.network = (network.t, network.round_id)
-        self.pops = {id(p): (p, p._schedule_state()) for p in network.populations}
+        self.pops = {id(p): (p, network.scheduler.state(p).state()) for p in network.populations}
         self.runtimes = {key: (rt.run_id, rt.ring.ring_pos) for key, rt in schedule.runtimes.items()}
         self.rows = schedule.rows
 
@@ -163,7 +163,7 @@ class Periodic:
     @staticmethod
     def applies(network, launches) -> bool:
         """Whether a planned window qualifies: every population clocked, no gated launch."""
-        return (not any(p._is_event_driven for p in network.populations)
+        return (not any(p._event_driven for p in network.populations)
                 and not any(g for runs in launches for *_, g in runs))
 
     def learn(self, network, schedule: Schedule, start: tuple) -> None:
@@ -202,6 +202,6 @@ class Periodic:
         schedule = ShiftedSchedule(base, self._shift, k)
         network.t, network.round_id = _shifted(base.network, self._shift.network, k)
         for key, (pop, state) in base.pops.items():
-            pop._restore_schedule(_shifted(state, self._shift.pops[key], k))
+            network.scheduler.state(pop).set_state(_shifted(state, self._shift.pops[key], k))
         self._end = (network.t, network.round_id)
         return schedule

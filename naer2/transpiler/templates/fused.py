@@ -626,9 +626,9 @@ EV_NONE = gl.constexpr(2147483647)
 def _gate_skip(gated, plan, n_conns, ev, run_id, round_id, t_start, t_end, slot_width, n_groups, SK: gl.constexpr,
                KP: gl.constexpr, MAX_CONNS: gl.constexpr, NUM_WARPS: gl.constexpr, QUEUES: gl.constexpr = False):
     """(skip, start) of a gated run (an event-driven population's planned launch: Network.plan): its due time,
-    as the host would decide it (Population._next_run_time), is the earliest of (A) every fresh source run with
+    as the host would decide it (naer2/sim/scheduler.py: PopSchedule.next_run_time), is the earliest of (A) every fresh source run with
     spikes -- its earliest emission + its connection's minimum delay (intake's) -- and (B) the end of the first
-    slot still holding records after the population's last run (any group's: _note_pending_arrivals'). Nothing
+    slot still holding records after the population's last run (any group's: Population._pending_arrival's). Nothing
     due before its window's end: skip. Else the run starts at the due time, if later than its planned start --
     a launch is planned at the earliest time an arrival could be due (sources with precise spike times: a little
     later), and covers its window: the run exactly the stepped one (its start, its bare spikes, its first

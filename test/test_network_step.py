@@ -186,12 +186,12 @@ def test_a_source_runs_every_smallest_outgoing_delay(mode):
         network.step(0.05)
         (network.run_planned if mode == "planned" else network.run_graph)(until=5.0)
     assert A.timestep is None and A._own_timestep() == 0.3
-    assert A.runtime.runs_made() == round(A._horizon / 0.3)
+    assert A.runtime.runs_made() == round(network.scheduler.state(A).horizon / 0.3)
     for B, conn, d in zip(Bs, conns, (0.5, 0.3)):
         B.check()
-        count, total = _periodic_expected(conn, phases, 0.7, d, B._window[1])
+        count, total = _periodic_expected(conn, phases, 0.7, d, network.scheduler.state(B).window[1])
         assert count.sum() > 1000
-        assert torch.equal(B.runtime.n_received.cpu().long(), count), (d, B._window)
+        assert torch.equal(B.runtime.n_received.cpu().long(), count), (d, network.scheduler.state(B).window)
         assert torch.allclose(B.current.cpu().double(), total, atol=1e-3)
 
 
@@ -217,7 +217,7 @@ def test_an_event_driven_consumer_idle_longer_than_its_ring(mode):
         (network.run_planned if mode == "planned" else network.run_graph)(until=5.0)
     B.check()
     assert B.runtime.ring.n_slots * B.runtime.ring.slot_width < 2.0
-    count, total = _periodic_expected(conn, phases, 3.0, 0.5, B._window[1])
+    count, total = _periodic_expected(conn, phases, 3.0, 0.5, network.scheduler.state(B).window[1])
     assert int(count.sum()) == 2 * len(conn.fabric.topology)  # (both spikes of every source)
     assert torch.equal(B.runtime.n_received.cpu().long(), count)
     assert torch.allclose(B.current.cpu().double(), total, atol=1e-3)

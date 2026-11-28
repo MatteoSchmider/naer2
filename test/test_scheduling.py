@@ -1,6 +1,6 @@
 """
-Network.step()'s horizon scheduling (Population._relax_horizon /
-_next_run_time / the run check in _execute_update_kernel), on one network
+Network.step()'s horizon scheduling (naer2/sim/scheduler.py: the horizons'
+fixed point, next_run_time, the runs a round takes), on one network
 covering every kind of population:
 
   A   timestep 0.2, update()          advances strictly by its timestep
@@ -18,17 +18,21 @@ covering every kind of population:
       delay 0.3 both ways
 
 Every population runs once at t = 0. Intake is the real host side
-(Population._intake: read each source once per run, schedule event-driven
-consumers from the source's emission summary). The update kernel is a
-stand-in: it records the run's window, leaves the run's emission summary
-as one spike stamped at the window's start, and,
-like the real one will, records a later per-link arrival it finds.
+(Scheduler.intake: read each source once per run, schedule event-driven
+consumers from the source's emission summary). The kernel and the device's
+feedback are stand-ins: a run records its window, its emission summary is
+one spike stamped at the window's start, and its ring's next pending
+arrival (Population._pending_arrival) the earliest later per-link arrival
+of what it took in.
 """
+
+import math
 
 import pytest
 import torch
 
 from naer2.population import Population
+from naer2.sim.scheduler import Scheduler
 from test.nodes import counter, delay_probe
 from test.patterns import all_to_all
 
@@ -50,10 +54,6 @@ EXPECTED = {
 }
 
 
-class _Ran(Exception):
-    pass
-
-
 def _delays(conn) -> list[float]:
     d = getattr(conn.fabric, "delay", None)
     return sorted(set(d.tolist())) if isinstance(d, torch.Tensor) else [d or 0.0]
@@ -62,42 +62,43 @@ def _delays(conn) -> list[float]:
 @pytest.fixture
 def stand_ins(monkeypatch):
     runs: list[tuple[float, Population, float]] = []
+    last: dict = {}  # population -> its last run's window
     taken: dict = {}  # conn -> emission times still to deliver
 
-    def kernel(self, device):  # reached only once the run check has passed
-        start, end = self._window
-        runs.append((start, self, end))
-        self._summary = (self._run_id, 1, start)  # the run's emission summary: one spike at its start
+    def run(self, t_start, t_end, round_id=None, stream=None, **kw):  # the kernel
+        runs.append((t_start, self, t_end))
+        last[self] = (t_start, t_end)
+
+    def summary(self):  # the run's emission summary: one spike at its start
+        return (1, last[self][0]) if self in last else (0, math.inf)
+
+    def pending(self):  # the ring's next pending arrival: a later per-link arrival of what the run took in
+        end = last[self][1]
+        found = []
         for conn in self.incoming:
             for e in taken.get(conn, []):
                 later = [e + d for d in _delays(conn) if e + d > end + 1e-9]
-                if later and min(later) not in self._run_times:
-                    self._run_times.append(min(later))
+                if later:
+                    found.append(min(later))
             taken[conn] = [e for e in taken.get(conn, []) if e + max(_delays(conn)) > end + 1e-9]
-        raise _Ran
+        return (min(found), min(found)) if found else None
 
-    original_update = Population._execute_update_kernel
+    original_intake = Scheduler.intake
 
-    def update(self, t, **kw):
-        try:
-            return original_update(self, t, **kw)
-        except _Ran:
-            return self._window
-
-    original_intake = Population._intake
-
-    def intake(self, t, planning=False):  # real intake, plus noting what was taken for the kernel stand-in
-        before = dict(self._read_run)
-        original_intake(self, t, planning=planning)
+    def intake(self, states, planning=False):  # real intake, plus noting what was taken for the stand-ins
+        before = [dict(s.read_run) for s in states]
+        original_intake(self, states, planning=planning)
         if planning:
             return
-        for conn in self.incoming:
-            if self._read_run.get(conn) != before.get(conn):
-                taken.setdefault(conn, []).append(conn._source._window[0])
+        for s, b in zip(states, before):
+            for conn in s.pop.incoming:
+                if s.read_run.get(conn) != b.get(conn):
+                    taken.setdefault(conn, []).append(last[conn._source][0])
 
-    monkeypatch.setattr(Population, "_ensure_on_device", kernel)
-    monkeypatch.setattr(Population, "_execute_update_kernel", update)
-    monkeypatch.setattr(Population, "_intake", intake)
+    monkeypatch.setattr(Population, "run", run)
+    monkeypatch.setattr(Population, "_emission_summary", summary)
+    monkeypatch.setattr(Population, "_pending_arrival", pending)
+    monkeypatch.setattr(Scheduler, "intake", intake)
     return runs
 
 
@@ -157,7 +158,7 @@ def test_a_plan_is_step_s_runs_ahead_of_time(stand_ins):
     planned = {}
     for launch in launches:
         for pop, start, end, gated in launch:
-            assert gated == pop._is_event_driven
+            assert gated == pop._event_driven
             planned.setdefault(names[pop], []).append((round(start, 6), round(end, 6)))
     network.step(1.3)
     ran = {}
@@ -179,22 +180,8 @@ def test_a_source_run_without_spikes_schedules_nothing(monkeypatch):
     """Intake reads the source's emission summary: B runs every 0.3 but
     never emits, so event-driven C only ever runs at t = 0."""
     runs = []
-
-    def kernel(self, device):
-        runs.append((round(self._window[0], 6), self))
-        self._summary = (self._run_id, 0, float("inf"))  # the run emitted nothing
-        raise _Ran
-
-    original_update = Population._execute_update_kernel
-
-    def update(self, t, **kw):
-        try:
-            original_update(self, t, **kw)
-        except _Ran:
-            pass
-
-    monkeypatch.setattr(Population, "_ensure_on_device", kernel)
-    monkeypatch.setattr(Population, "_execute_update_kernel", update)
+    monkeypatch.setattr(Population, "run", lambda self, t_start, t_end, **kw: runs.append((round(t_start, 6), self)))
+    monkeypatch.setattr(Population, "_emission_summary", lambda self: (0, math.inf))  # the run emitted nothing
 
     B = counter() * 2
     B.timestep = 0.3
