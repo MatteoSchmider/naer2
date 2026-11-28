@@ -1,10 +1,11 @@
 """
 Fused rounds: one kernel launch for a round in which every population runs, instead of one per population --
 the round's programs in one grid, each population's share running its own generated body (fused_template.py:
-fused_run, exactly the code its own kernel runs), dispatched on the program id. Opt-in, per network:
+fused_run, exactly the code its own kernel runs), dispatched on the program id. The default, per network:
 
     net = pop.network
-    net.fuse_rounds = True      # (off by default; changing it drops the captured graphs)
+    net.fuse_rounds = False     # (on by default: a kernel per population instead; changing it drops the
+                                #  captured graphs)
 
 Only the launch is shared. Every run stays its population's: its schedule entry, its status, its journal
 entry -- a stopped run is rerun through its population's own kernel (runtime._Launches.recover), as without

@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import naer2 as n2
-from naer2.ring import POOL_RESERVE
+from naer2.ring import RESERVE
 from naer2.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.edges import plastic_synapse, static_synapse
@@ -52,12 +52,12 @@ def _runtime(kernel, population, **state):
 
 def _connect(gen, dst_pop, conns, srcs, topos):
     """gen connected as its Population would be: a queue per connection where every connection has one delay
-    value (SPIKES.md: any sources), else the slotted ring (8 slots of 0.1 ms, per-cell runs: uniform sources)."""
+    value (SPIKES.md: any sources), else the slotted ring (8 slots of 0.1 ms: uniform sources)."""
     if dst_pop._queues():
-        gen.connect(srcs, topos, len(conns), pool=(256, len(conns) * (POOL_RESERVE + 1) + 9),
+        gen.connect(srcs, topos, len(conns), arena=(256, len(conns) * (RESERVE + 1) + 9),
                     min_delays=[dst_pop._min_delay(c) for c in conns], queues=True)
     else:
-        gen.connect(srcs, topos, n_slots=8, main_cap=8192)
+        gen.connect(srcs, topos, n_slots=8)
 
 
 def _same_spikes(a, b):
@@ -81,7 +81,7 @@ def test_generated_pd14_neuron_matches_the_reference():
     ref = _runtime(pd14_neuron_reference(dst_pop.instance), dst_pop, **init)
     gen = _runtime(gk, dst_pop, **init)
     for p in (ref, gen):  # ~2.7k links per (group, slot) here: above the default capacity
-        p.connect([src], [topo], n_slots=8, main_cap=8192)
+        p.connect([src], [topo], n_slots=8)
     spiked = 0
     for r in range(10):
         t = round(1.0 + 0.1 * r, 6)

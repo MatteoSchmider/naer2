@@ -31,9 +31,10 @@ class Network:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._streams: dict[Population, torch.cuda.Stream] = {}
         # Fused rounds (naer2/fusion.py): a round in which every population runs as ONE kernel launch, in
-        # planned and captured windows -- off by default (one kernel: the most registers any population
-        # needs, longer compiles); PD14 turns it on: net = pop.network; net.fuse_rounds = True
-        self._fuse_rounds = False
+        # planned and captured windows -- on by default (PD14, Brunel: not slower; its cost: the most registers
+        # any population needs, longer compiles); off (net.fuse_rounds = False): a kernel per population, e.g. to
+        # look at one population's own kernel
+        self._fuse_rounds = True
         self._fused = None
         # Periodic windows (naer2/periodic.py): a clock-only network's captured windows extrapolated once
         # learned, not planned -- off by default; PD14 turns it on (its tune)

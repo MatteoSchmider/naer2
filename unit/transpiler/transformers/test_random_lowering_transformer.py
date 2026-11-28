@@ -37,7 +37,7 @@ def test_multiple_call_sites_in_one_body_get_distinct_seeds():
     seed2 = second.split(" = ", 1)[1]
     assert seed1 == f"tl.rand({KEY}, offs)"
     assert seed2 != seed1
-    assert "seed.to(tl.int64) << 32" in seed2 and "t.to(tl.int32, bitcast=True) ^" in seed2  # (the salt: low)
+    assert "seed.to(tl.int64) << 32" in seed2 and "t.to(tl.int32, bitcast=True).to(tl.int64) ^" in seed2  # (the salt: low)
 
 
 def test_each_fresh_transformer_instance_restarts_the_call_site_count():

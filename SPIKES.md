@@ -75,7 +75,7 @@ No program ever waits on another (no decoupled look-back: PD14's kernel latency 
 ## Steps (to plan in detail)
 
 1. The layout choice per population, queues for homogeneous connections (and the network's default slot width
-   out of it); the queue structure in the pooled arenas, cursors, freeing.
+   out of it); the queue structure in the ring's arenas, cursors, freeing.
 2. Deterministic histories (per-program regions; PD14's cost measured first), sorted regions for non-uniform
    producers, order-preserving appends.
 3. Queue delivery: the k-way merge up to the run's end; gating and scheduling from the queues' heads.

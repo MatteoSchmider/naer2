@@ -136,10 +136,12 @@ def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n
     assert torch.allclose(consumer.received.cpu().double(), sums, atol=1e-4)
 
 
-@pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])  # pool: per-group arenas (Ring)
+# arena: the default (256-record blocks, grown from the smallest), or small blocks (8 records: the block tables, the
+# overflow logs and their fix-up in every run)
+@pytest.mark.parametrize("arena", [None, (8, 4096)], ids=["default", "small-blocks"])
 @pytest.mark.parametrize("consumer_first", [True, False])
 @pytest.mark.parametrize("long_segments", [False, True])
-def test_pull_and_deliver_end_to_end(long_segments, consumer_first, pool):
+def test_pull_and_deliver_end_to_end(long_segments, consumer_first, arena):
     """Sources A, B -> consumer C (3 groups), six rounds, every population
     running once per round -- C before or after its sources within the round
     (the outcome must not depend on it: C only ever sees earlier rounds).
@@ -150,7 +152,7 @@ def test_pull_and_deliver_end_to_end(long_segments, consumer_first, pool):
         _topology(a.n, 96, GROUP_SIZE, delay="random", k=24, seed=10, weight=True),
         _topology(b.n, 96, GROUP_SIZE, delay=0.2, k=90 if long_segments else 24, seed=11, weight=True),
     ]
-    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000, pool=pool)
+    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000, arena=arena)
 
     expected_by_read, delivered_by_run = [], []
     for r in range(6):
@@ -179,9 +181,9 @@ def test_pull_and_deliver_end_to_end(long_segments, consumer_first, pool):
     _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, 96)
 
 
-@pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])
+@pytest.mark.parametrize("arena", [None, (8, 4096)], ids=["default", "small-blocks"])
 @pytest.mark.parametrize("group_size", [256, 512])  # the link targets as bytes / as 16-bit halves
-def test_link_targets_at_either_width(group_size, pool):
+def test_link_targets_at_either_width(group_size, arena):
     """A consumer group's targets travel one byte each up to a group size
     of 256, else two (SimulationTopology.target_bits, the kernel's from its
     GROUP_SIZE): every link reaches the right target, up to a group's last
@@ -193,7 +195,7 @@ def test_link_targets_at_either_width(group_size, pool):
     topo = _topology(src.n, n, group_size, delay="random", k=60, seed=12, weight=True)
     assert topo.target_bits == (8 if group_size <= 256 else 16)
     assert int(topo.link_target.to(torch.int32).max() & (0xFF if group_size <= 256 else 0xFFFF)) > group_size - 8
-    consumer.connect([src], [topo], n_slots=24, log_cap=100_000, pool=pool)
+    consumer.connect([src], [topo], n_slots=24, log_cap=100_000, arena=arena)
     expected, delivered = [], []
     for r in range(5):
         t = round(1.0 + 0.1 * r, 6)

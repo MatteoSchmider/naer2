@@ -19,6 +19,7 @@ import time
 
 import torch
 
+from naer2.ring import RESERVE
 from naer2.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.networks.PD14.commanded import PD14_commanded
@@ -27,7 +28,8 @@ from test.networks.PD14.net import build, description
 # Hz: PD14's settled rates through Network.step (4000-5000 ms, the L4e -> L2/3e projection doubled, 2026-11-21)
 RATE = dict(E_23=0.81, I_23=2.74, E_4=4.21, I_4=5.60, E_5=7.18, I_5=8.30, E_6=1.07, I_6=7.50)
 RES = 0.1  # ms: timestep, delay buckets and ring slots
-# model "pd14": ring run capacity per population (links per (group, slot) cell, G=256) -- the peak demand
+# model "pd14": ring run capacity per population (links per (group, slot) cell, G=256; the arenas sized for it in
+# every slot at once: no resize while measured) -- the peak demand
 # through the thalamic volley at 700 ms (9.0k-31.8k, 32-42 rounds after its onset; measured 2026-11-22 on the 4090,
 # the L4e -> L2/3e projection doubled: L2/3 joins the volley now) + 25%, in multiples of 256 -- several GB of
 # rings (fits a 24 GB card, not the 780M)
@@ -35,11 +37,11 @@ PD14_MAIN_CAP = dict(E_23=34048, I_23=39936, E_4=11520, I_4=24320, E_5=33024, I_
 
 
 class PD14:
-    def __init__(self, G: int, unroll=None, stream=None, warps=4, main_cap: int | dict | None = None,
+    def __init__(self, G: int, unroll=None, stream=None, warps=4, run_cap: int | dict | None = None,
                  count_received: bool = True, model: str = "standin", t0: float = 10.0):
         """unroll / stream: None = the walk default (naer2.transpiler.templates.fused.WALK);
-        main_cap: ring run capacity, one for all or per population (default:
-        8 * G for the stand-in, PD14_MAIN_CAP for "pd14")."""
+        run_cap: ring run capacity, one for all or per population (default:
+        8 * G for the stand-in, PD14_MAIN_CAP for "pd14") -- every group's arena that many records a slot."""
         if model not in ("standin", "pd14"):
             raise ValueError("model must be 'standin' or 'pd14'")
         torch.cuda.set_device(0)
@@ -77,10 +79,10 @@ class PD14:
             self.links += sum(t.n_links for t in topos)
             self.segments += sum(t.n_segments for t in topos)
             n_slots = int((max(float(t.bucket_mean.max()) for t in topos) + 0.2) / RES) + 2
-            cap = main_cap.get(name) if isinstance(main_cap, dict) else main_cap
+            cap = run_cap.get(name) if isinstance(run_cap, dict) else run_cap
             cap = cap or (PD14_MAIN_CAP[name] if model == "pd14" else 8 * G)
             self.pops[name].connect([self.pops[members[c._source]] for c in conns], topos, n_slots,
-                                    main_cap=cap)
+                                    arena=(256, n_slots * (-(-cap // 256) + RESERVE) + 1))
         torch.cuda.synchronize()
         self.build_s = time.time() - t0
         del net

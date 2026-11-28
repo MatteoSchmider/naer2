@@ -23,7 +23,7 @@ ap.add_argument("G", type=int)
 ap.add_argument("--rounds", type=int, default=10)
 ap.add_argument("--unroll", type=int, default=None)
 ap.add_argument("--rdna2", action="store_true")
-ap.add_argument("--main-cap", type=int, default=None)
+ap.add_argument("--run-cap", type=int, default=None)
 ap.add_argument("--heat", type=int, default=0,
                 help="untraced rounds before each mode, and HEAT // 20 between measured rounds, so power "
                      "management keeps the clock up (short bursty runs stay at the lowest DPM level)")
@@ -40,7 +40,7 @@ from pd14_setup import PD14
 
 US = 0.01  # REALTIME tick: 10 ns
 med = st.median
-b = PD14(args.G, unroll=args.unroll, stream=args.stream, main_cap=args.main_cap,
+b = PD14(args.G, unroll=args.unroll, stream=args.stream, run_cap=args.run_cap,
          count_received=not args.no_counters)
 _masks = [b.fire_mask(r) for r in range(200)]
 

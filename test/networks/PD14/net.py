@@ -123,7 +123,5 @@ def tune(populations: dict, network, group_size: int = GROUP_SIZE) -> None:
     small = min(group_size, max(group_size // 2, 128))  # (128 at least: every population at the same warps)
     for name, pop in populations.items():
         pop.group_size = small if name in SMALL_GROUPS else group_size
-    # one kernel a round in planned and captured windows (naer2/fusion.py: ~0.8 us a round)
-    network.fuse_rounds = True
     # captured windows extrapolated once learned, not planned (naer2/periodic.py: every population clocked)
     network.periodic_windows = True

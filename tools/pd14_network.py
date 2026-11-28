@@ -5,11 +5,10 @@ and by the hand-built harness (tools/pd14_setup.py, model "pd14": the same
 generated kernels, connected and launched by hand, one round per 0.1 ms).
 Both from build() under the same seed, at the same group size.
 
-    python tools/pd14_network.py record {network,harness} OUT.pt [--ms 800] [--G 256] [--harness-caps]
-        [--block B] [--in-flight C]
+    python tools/pd14_network.py record {network,harness} OUT.pt [--ms 800] [--G 256] [--block B] [--in-flight C]
     python tools/pd14_network.py compare A.pt B.pt [--last MS]
     python tools/pd14_network.py [--rdna2] time {network,harness} [--ms 800] [--G 256] [--rounds 200]
-        [--harness-caps | --scaled-caps | --block B] [--in-flight C]
+        [--block B] [--in-flight C]
 
 record: per round, every population's spikes ((e, node) per run; one
 readback per run, so not timed). Run each path in its own process (two
@@ -23,9 +22,7 @@ time: wall time per round, the path running freely (no readback) through
 `--rounds` rounds after --ms of simulated time (default: into the volley).
 
 Rings (the network path): the populations' default arenas (--block B
-records per block, 0: per-cell runs; --in-flight C: Population.ring_in_flight),
-or per-cell runs at the harness's capacities (--harness-caps: nothing is
-lost) or those scaled to the group size (--scaled-caps).
+records per block; --in-flight C: Population.ring_in_flight).
 """
 
 import argparse
@@ -40,11 +37,9 @@ import torch
 RES = 0.1
 
 
-def _network(G, harness_caps=False, scaled_caps=False, block=None, in_flight=None):
-    """PD14 at group size G (with its expert settings: test/networks/PD14/net.py, tune). Rings: the populations' default (per-group arenas, Population.ring_block /
-    ring_in_flight; block / in_flight override), or per-cell runs at the harness's capacities (harness_caps)
-    or those scaled to G (scaled_caps)."""
-    from pd14_setup import PD14_MAIN_CAP
+def _network(G, block=None, in_flight=None):
+    """PD14 at group size G (with its expert settings: test/networks/PD14/net.py, tune). Rings: the populations'
+    default arenas (Population.ring_block / ring_in_flight; block / in_flight override)."""
     from test.networks.PD14.net import build, description, tune
 
     torch.cuda.set_device(0)
@@ -56,13 +51,9 @@ def _network(G, harness_caps=False, scaled_caps=False, block=None, in_flight=Non
     tune(pops, net, G)  # (PD14's expert settings at group size G: net.py)
     for name, p in pops.items():
         if block is not None:
-            p.ring_block = block or None  # 0: per-cell runs
+            p.ring_block = block
         if in_flight is not None:
             p.ring_in_flight = in_flight
-        if harness_caps and name in PD14_MAIN_CAP:  # the harness's ring capacities: no growth, no lost links
-            p.ring_block, p.main_cap = None, PD14_MAIN_CAP[name]
-        elif scaled_caps and name in PD14_MAIN_CAP:  # the same per group neuron, at group size G (sized for 256)
-            p.ring_block, p.main_cap = None, -(-PD14_MAIN_CAP[name] * G // 256 // 16) * 16
     return net, pops
 
 
@@ -97,8 +88,8 @@ def _runtime(path, p):
     return p.runtime if path == "network" else p
 
 
-def record(path, out, ms, G, harness_caps=False, block=None, in_flight=None):
-    obj = _network(G, harness_caps, block=block, in_flight=in_flight) if path == "network" else _harness(G)
+def record(path, out, ms, G, block=None, in_flight=None):
+    obj = _network(G, block=block, in_flight=in_flight) if path == "network" else _harness(G)
     n_rounds = round(ms / RES)
     runs = {}  # name -> [(round, t_start, t_end, [(e, node)])]
     last = {}
@@ -168,8 +159,8 @@ def compare(a_path, b_path, last=None):
             f"{_rate(b['runs'].get(name, []), b['sizes'][name], lo, ms):.2f}" for name in sorted(a["runs"])))
 
 
-def timed(path, ms, G, rounds, harness_caps=False, scaled_caps=False, block=None, in_flight=None):
-    obj = _network(G, harness_caps, scaled_caps, block, in_flight) if path == "network" else _harness(G)
+def timed(path, ms, G, rounds, block=None, in_flight=None):
+    obj = _network(G, block, in_flight) if path == "network" else _harness(G)
     n = round(ms / RES)
     t0 = time.time()
     for r in range(n):
@@ -204,8 +195,7 @@ if __name__ == "__main__":
     rec.add_argument("out")
     rec.add_argument("--ms", type=float, default=800.0)
     rec.add_argument("--G", type=int, default=256)
-    rec.add_argument("--harness-caps", action="store_true", help="network: the harness's ring capacities")
-    rec.add_argument("--block", type=int, default=None, help="network: ring arena block (0: per-cell runs)")
+    rec.add_argument("--block", type=int, default=None, help="network: ring arena block (records)")
     rec.add_argument("--in-flight", type=float, default=None, help="network: ring arena share of incoming links")
     cmp_ = sub.add_parser("compare")
     cmp_.add_argument("a")
@@ -216,18 +206,15 @@ if __name__ == "__main__":
     tm.add_argument("--ms", type=float, default=800.0)
     tm.add_argument("--G", type=int, default=256)
     tm.add_argument("--rounds", type=int, default=200)
-    tm.add_argument("--harness-caps", action="store_true")
-    tm.add_argument("--scaled-caps", action="store_true", help="network: the harness's capacities scaled by G / 256")
-    tm.add_argument("--block", type=int, default=None, help="network: ring arena block (0: per-cell runs)")
+    tm.add_argument("--block", type=int, default=None, help="network: ring arena block (records)")
     tm.add_argument("--in-flight", type=float, default=None, help="network: ring arena share of incoming links")
     ap.add_argument("--rdna2", action="store_true", help="the RX 6600 eGPU (see tools/rdna2.py for the env vars)")
     args = ap.parse_args()
     if args.rdna2:
         import rdna2  # noqa: F401
     if args.cmd == "record":
-        record(args.path, args.out, args.ms, args.G, args.harness_caps, args.block, args.in_flight)
+        record(args.path, args.out, args.ms, args.G, args.block, args.in_flight)
     elif args.cmd == "compare":
         compare(args.a, args.b, args.last)
     else:
-        timed(args.path, args.ms, args.G, args.rounds, args.harness_caps, args.scaled_caps, args.block,
-              args.in_flight)
+        timed(args.path, args.ms, args.G, args.rounds, args.block, args.in_flight)

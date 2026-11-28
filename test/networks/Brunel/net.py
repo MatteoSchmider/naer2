@@ -74,9 +74,6 @@ def build(N: int | None = None, K: int | None = None, eta: float | None = None, 
         _connect(E, target, C_E, J, D)
         _connect(I, target, C_I, -g * J, D)
         _connect(P, target, C_E, J, D)
-    # a round's populations in one kernel (naer2/fusion.py): N = 50000 on the 4090, captured windows, 2.94 ms
-    # wall per simulated ms, 3.02 unfused
-    E.network.fuse_rounds = True
     return E.network, {"E": E, "I": I, "P": P}
 
 

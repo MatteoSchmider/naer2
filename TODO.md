@@ -20,11 +20,12 @@
 Every population runs one fused Gluon kernel per run (pull intake, delivery, update, send, emission),
 generated from its hooks (`naer2/transpiler/templates/fused.py` the fixed template -- what limits optimizing it
 further: `limitations.md` next to it -- and `fused_template.py` its generator), on its runtime
-(`naer2/runtime.py`: state, emission history `naer2/history.py`, ring `naer2/ring.py`, plan of incoming
+(`naer2/runtime.py`: state, emission history `naer2/history.py`, ring `naer2/ring.py` -- per group an arena of
+blocks --, plan of incoming
 `SimulationTopology`s). `Network.step` schedules round by round (horizons, rounds, one stream per population);
 `Network.run_graph` replays planned windows of rounds from captured device graphs (`naer2/schedule.py`,
-`naer2/graph.py`), optionally with every round's populations fused into one kernel (`naer2/fusion.py`,
-`Network.fuse_rounds`) and, for clock-only networks, windows extrapolated instead of planned
+`naer2/graph.py`), every round's populations fused into one kernel by default (`naer2/fusion.py`,
+`Network.fuse_rounds`; off: a kernel per population, the step path's and a rerun's always) and, for clock-only networks, windows extrapolated instead of planned
 (`naer2/periodic.py`, `Network.periodic_windows`). PD14 (`test/networks/PD14/net.py`, its expert settings in
 `tune`): rates within a few percent of the published model; on the RTX 4090 ~25 us wall clock per 0.1 ms round
 in quiet activity, GPU-bound (2026-11-21).
@@ -41,18 +42,12 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
 
 ## Medium changes
 
-- **The per-cell rings** (unpooled: `Population.ring_block = None`, and most runtime-level tests): production
-  always pools, and queues need the pool; dropping them removes every `POOL_B == 0` branch of the kernel and the
-  ring (`Ring.grow`, `_rec`), the tests then re-parametrized onto arenas -- or keep them as the simple reference
-  layout.
 - **Brunel's speed**: latency-bound (as naer1 was) -- a round ~1-3 ms at every size from 10k to 110k on the 4090
   (captured windows; 50k: 1.5 ms wall per simulated ms on the 2026-11-28 instance, 2.9 on the 2026-11-23 one), its
   kernels' chain of dependent steps (the pull's loads, the merge's and the batch walk's barriers), not the links
   moved. To cut with aggressive prefetching and latency hiding: the next block's / batch's records and links loaded
   while the current one is walked, fewer barriers per batch, more independent work in flight per program. Memory
   ~8.3 B a link on the GPU, ~24 B in construction on the host (129 s at 100k, ~N^2) -- to cut too.
-- **The unfused path** (a population's own kernel per run, `Network.fuse_rounds` off): the fused round is the
-  default everywhere and not slower (PD14, Brunel) -- to remove, with its launch and capture code.
 - **README.md** is out of date in general (e.g. "What's deliberately not here yet" says nothing runs a kernel).
 - **The showcases** (`showcases/`) predate the fused path in places (e.g. `hybrid_scheduling.py` mentions
   `carry_cap`) -- look at them again, and check they still run.
@@ -70,8 +65,8 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   (`test_network_step::test_gap_history_grows_with_a_slow_consumer`; today the overrun raises).
 - **Ring memory**: the per-cell overflow log -- at least one block (256 records) per cell, most of the quiet-activity
   memory beyond the arenas; a per-group log would be smaller (a claim per record past the held blocks); the
-  reserve (`ring.POOL_RESERVE` = 2 blocks per main run; PD14's quiet slots end with ~220-360 records) could follow
-  the need; a run holds at most `ring.POOL_MAX_BLOCKS` = 2047 blocks (the packed claim counter's field): past it,
+  reserve (`ring.RESERVE` = 2 blocks per slot's run; PD14's quiet slots end with ~220-360 records) could follow
+  the need; a run holds at most `ring.MAX_BLOCKS` = 2047 blocks (the packed claim counter's field): past it,
   the runtime raises.
 - **Group-local link targets as `uint8` / `int16`** (group sizes up to 256 / 65536): 2-4x less target memory at
   billions of synapses.

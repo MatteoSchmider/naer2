@@ -26,16 +26,13 @@ blocks it holds, the most it logged, lost bits, done -- fused.py:
 _run_status; no copy, no event); later runs judge every slot that has
 landed, in run order, and a run whose slot is still pending waits for it
 -- so a size follows the runs at most status_slots behind (check() judges
-them all).
-  - per-cell runs: a run past the capacity stops (nothing committed) and
-    the capacity grows to its need (Ring.grow) before it reruns
-  - pooled: the arenas (blocks per group) and overflow logs (records per
-    cell) follow the runs' need -- the most blocks any group held, the
-    most records any cell logged (Little's law at work: the arrival rate x
-    how long a record stays) -- with headroom and hysteresis: grow when
-    need x grow_at exceeds the size, shrink when need x grow_at stays below
-    half of it for shrink_window runs, either to need x grow_to
-    (Ring.resize); a run that doesn't fit stops and reruns.
+them all). The arenas (blocks per group) and overflow logs (records per
+cell) follow the runs' need -- the most blocks any group held, the most
+records any cell logged (Little's law at work: the arrival rate x how long
+a record stays) -- with headroom and hysteresis: grow when need x grow_at
+exceeds the size, shrink when need x grow_at stays below half of it for
+shrink_window runs, either to need x grow_to (Ring.resize); a run that
+doesn't fit stops and reruns.
 Every size is a runtime value in the ring's header: a resize keeps the
 compiled kernel and its launcher.
 
@@ -58,7 +55,7 @@ import triton
 from triton import knobs
 
 from .history import EmissionHistory
-from .ring import FLAG_STOPPED, POOL_MAX_BLOCKS, POOL_RESERVE, Ring
+from .ring import FLAG_STOPPED, MAX_BLOCKS, RESERVE, Ring
 from .schedule import RUN_WORDS, write_entry
 from .trace import Trace
 from .transpiler.templates.fused import FUSED_TRACE_TAGS, WALK, FusedPlan
@@ -242,7 +239,7 @@ class PopulationRuntime:
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
         self.seed = 0  # random.*'s stream (the population's own seed: Population.seed)
         # a development aid: every block the pull pops and delivery frees checked on the device (fused.py:
-        # ARENA_CHECK -- pooled rings; arena_errors() the first violation); off: compiled out
+        # ARENA_CHECK; arena_errors() the first violation); off: compiled out
         self.arena_check = False
         self._chk, self._chk_key = None, None
         self.trace = None
@@ -254,15 +251,15 @@ class PopulationRuntime:
         # judged once landed, in run order (see the module docstring); a run whose slot is still in flight waits
         # for it -- so the host runs at most status_slots runs ahead of what the sizing has seen
         self.status_slots = 4
-        # the rings' sizing (pooled: blocks per arena, records per overflow log; per-cell: the main run
-        # capacity), from every run's need: grow when need x grow_at exceeds the size; shrink (pooled) when
-        # need x grow_at stays below half the size for shrink_window runs; either way to need x grow_to
+        # the rings' sizing (blocks per arena, records per overflow log), from every run's need: grow when
+        # need x grow_at exceeds the size; shrink when need x grow_at stays below half the size for
+        # shrink_window runs; either way to need x grow_to
         self.grow_at, self.grow_to, self.shrink_window = 1.5, 2.0, 200
-        self.growths: list[tuple[int, str, int]] = []  # (run id, "main" / "arena" / "log", new size)
-        self.resizes: list[tuple[int, int, int]] = []  # pooled: (run id, blocks per arena, log records per cell)
+        self.growths: list[tuple[int, str, int]] = []  # (run id, "arena" / "log", new size)
+        self.resizes: list[tuple[int, int, int]] = []  # (run id, blocks per arena, log records per cell)
         self.stops: list[int] = []  # run ids that stopped (the ring too small) and were rerun
         self._pending = collections.deque()
-        self._wanted = None  # pooled: (blocks, log records, run id) for the next _Launches.resize
+        self._wanted = None  # (blocks, log records, run id) for the next _Launches.resize
         signature = kernel.kernel.params
         self._constexpr_names = [p.name for p in signature if p.is_constexpr]
         self.connect([], [], n_slots=1)
@@ -272,22 +269,20 @@ class PopulationRuntime:
         return self.kernel.uniform_emission
 
     def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
-                main_cap: int | None = None, pool: tuple[int, int] | None = None,
-                min_delays: list[float] | None = None, queues: bool = False):
-        """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs.
-        min_delays: per connection its minimum delay as the host schedules with it (a gated run's due time;
-        default 0). queues: a queue per connection (n_slots: the connections; fused.py _pull_queues; pooled
-        only); else the slotted ring, its sources' emission uniform (fused.py _pull)."""
-        if queues and not pool:
-            raise ValueError("queues live in pooled arenas (a pool)")
+                arena: tuple[int, int] | None = None, min_delays: list[float] | None = None, queues: bool = False):
+        """arena: (block, blocks per group) of the ring (Ring; default: 256-record blocks, the smallest arena --
+        every slot's reserve and one more -- grown to the runs' need). min_delays: per connection its minimum
+        delay as the host schedules with it (a gated run's due time; default 0). queues: a queue per connection
+        (n_slots: the connections; fused.py _pull_queues); else the slotted ring, its sources' emission uniform
+        (fused.py _pull). log_cap: the delivery log's records (a development aid; 0: none)."""
         if not queues and not all(s.uniform_emission for s in sources):
             raise NotImplementedError(
-                "the slotted ring (per-link delays, or per-cell runs: Population.ring_block None) takes uniform "
-                "sources only (bare n2.spike() in send): a source emitting at precise times -- a loop, or inside "
-                "delivery -- needs every incoming connection one delay value, its queue (SPIKES.md)")
+                "the slotted ring (per-link delays) takes uniform sources only (bare n2.spike() in send): a source "
+                "emitting at precise times -- a loop, or inside delivery -- needs every incoming connection one "
+                "delay value, its queue (SPIKES.md)")
         self.queues = queues
-        self.ring = Ring(self.n_groups, n_slots, slot_width, self.device, pool=pool,
-                         **({"main_cap": main_cap} if main_cap else {}))
+        self.ring = Ring(self.n_groups, n_slots, slot_width, self.device,
+                         arena or (256, n_slots * (RESERVE + 1) + 1))
         self.wmark = torch.full((self.n_groups,), -math.inf, device=self.device)
         self.plan = FusedPlan([s.history for s in sources], topologies, self.n_groups, self.device,
                               min_delays=min_delays)
@@ -425,14 +420,14 @@ class PopulationRuntime:
         """The arena check's buffer (fused.py: ARENA_CHECK): 16 words of the first violation, then a held count
         per (group, block) -- rebuilt from the ring's tables whenever the ring's buffer or arena size changed
         (an allocation, a resize: the device is idle then), the violation kept. Unchecked: a dummy word."""
-        if not (self.arena_check and self.ring is not None and self.ring.pool_b):
+        if not (self.arena_check and self.ring is not None):
             if self._chk is None or self._chk.numel() != 16:
                 self._chk = torch.zeros(16, dtype=torch.int32, device=self.device)
             return self._chk
         ring = self.ring
-        key = (ring.buf.data_ptr(), ring.pool_nb)
+        key = (ring.buf.data_ptr(), ring.n_blocks)
         if self._chk_key != key:
-            g, S, nb, B = ring.n_groups, ring.n_slots, ring.pool_nb, ring.pool_b
+            g, S, nb, B = ring.n_groups, ring.n_slots, ring.n_blocks, ring.block
             dev = self.device
             held = torch.zeros(g * nb, dtype=torch.int32, device=dev)
             group = torch.arange(g * S, device=dev) // S
@@ -578,42 +573,37 @@ class PopulationRuntime:
         self._follow_need(blocks, most, lost, run, 1)
 
     def _follow_need(self, blocks: int, most: int, lost: int, run_id: int, n_runs: int) -> None:
-        """The ring following what complete runs needed -- n_runs of them, run_id the last (pooled: the most
-        blocks any group held, the most records any cell logged; per-cell: the longest run) -- see the
-        module docstring. (lost: the runs' lost bits -- links lost, raised by check(); 4: the arena check.)"""
+        """The ring following what complete runs needed -- n_runs of them, run_id the last (the most blocks any
+        group held, the most records any cell logged) -- see the module docstring. (lost: the runs' lost bits --
+        links lost, raised by check(); 4: the arena check.)"""
         ring = self.ring
-        if not ring.pool_b:
-            longest = blocks
-            if longest * self.grow_at > ring.main_cap:
-                self._grow_cells(-(-math.ceil(longest * self.grow_to) // 4) * 4, run_id)
-            return
         w = self._window
         w[0], w[1], w[2] = max(w[0], blocks), max(w[1], most), w[2] + n_runs
         nb, log_cap = self._sizes(blocks, most)
-        grew = nb > ring.pool_nb or log_cap > ring.log_cap
+        grew = nb > ring.n_blocks or log_cap > ring.log_cap
         if not grew and w[2] >= self.shrink_window:
             floor_nb, floor_log = self._floors()
-            if w[0] * self.grow_at < ring.pool_nb / 2:
+            if w[0] * self.grow_at < ring.n_blocks / 2:
                 nb = max(math.ceil(w[0] * self.grow_to), floor_nb)
             if w[1] * self.grow_at < ring.log_cap / 2:
                 log_cap = max(math.ceil(w[1] * self.grow_to), floor_log)
             self._window = [0, 0, 0]
-        if (nb, log_cap) != (ring.pool_nb, ring.log_cap):
+        if (nb, log_cap) != (ring.n_blocks, ring.log_cap):
             self._want(nb, log_cap, run_id)
             self._launches.resize()
 
     def _floors(self) -> tuple[int, int]:
-        """Pooled: the smallest arena (every slot its reserve, a partly used block, one more) and log (one
+        """The smallest arena (every slot its reserve, a partly used block, one more) and log (one
         block: a run hardly ever logs more in quiet activity, and a burst stops a run at worst)."""
-        return self.ring.n_slots * (POOL_RESERVE + 1) + 1, self.ring.pool_b
+        return self.ring.n_slots * (RESERVE + 1) + 1, self.ring.block
 
     def _sizes(self, blocks: int, most: int) -> tuple[int, int]:
-        """Pooled: the arena and log sizes for a run's need -- grown to need x grow_to where need x grow_at
+        """The arena and log sizes for a run's need -- grown to need x grow_to where need x grow_at
         exceeds them, else as they are; once one grows, the other too wherever it has less than grow_to x
         its need (one resize, one copy of the arena, for both)."""
         ring = self.ring
         floor_nb, floor_log = self._floors()
-        nb, log_cap = ring.pool_nb, ring.log_cap
+        nb, log_cap = ring.n_blocks, ring.log_cap
         at = self.grow_to if blocks * self.grow_at > nb or most * self.grow_at > log_cap else None
         if at and blocks * at > nb:
             nb = max(math.ceil(blocks * self.grow_to), floor_nb)
@@ -622,7 +612,7 @@ class PopulationRuntime:
         return nb, log_cap
 
     def _want(self, nb: int, log_cap: int, run_id: int) -> None:
-        """Pooled: the arenas and logs to these sizes, at the next _Launches.resize (or recovery)."""
+        """The arenas and logs to these sizes, at the next _Launches.resize (or recovery)."""
         self._wanted = (nb, log_cap, run_id)
 
     def _apply_wanted(self) -> None:
@@ -631,12 +621,12 @@ class PopulationRuntime:
             return
         (nb, log_cap, run_id), ring = self._wanted, self.ring
         self._wanted = None
-        if nb < ring.pool_nb:  # never below what the groups hold now (at most what their last pull held)
+        if nb < ring.n_blocks:  # never below what the groups hold now (at most what their last pull held)
             nb = max(nb, int(ring.stats[:, 0].max()))
-        if (nb, log_cap) == (ring.pool_nb, ring.log_cap):
+        if (nb, log_cap) == (ring.n_blocks, ring.log_cap):
             return
-        grew = (nb > ring.pool_nb, log_cap > ring.log_cap)
-        ring.resize(pool_nb=nb, log_cap=log_cap)
+        grew = (nb > ring.n_blocks, log_cap > ring.log_cap)
+        ring.resize(n_blocks=nb, log_cap=log_cap)
         self.resizes.append((self.run_id, nb, log_cap))
         if grew[0]:
             self.growths.append((run_id, "arena", ring.arena))
@@ -651,23 +641,12 @@ class PopulationRuntime:
             return
         self.stops.append(self.run_id)
         stats = ring.stats.cpu()
-        if not ring.pool_b:
-            longest = int(stats[:, 0].max())
-            self._grow_cells(-(-math.ceil(longest * self.grow_to) // 4) * 4, self.run_id)
-        else:
-            blocks, most = int(stats[:, 0].max()), int(stats[:, 1].max())
-            if blocks >= 1 << 24:
-                raise RuntimeError(f"a ring run needs more than {POOL_MAX_BLOCKS} blocks of {ring.pool_b} records "
-                                   f"in one slot (Population.ring_block: larger blocks)")
-            self._want(*self._sizes(blocks, most), self.run_id)  # (applied by the recovery)
+        blocks, most = int(stats[:, 0].max()), int(stats[:, 1].max())
+        if blocks >= 1 << 24:
+            raise RuntimeError(f"a ring run needs more than {MAX_BLOCKS} blocks of {ring.block} records "
+                               f"in one slot (Population.ring_block: larger blocks)")
+        self._want(*self._sizes(blocks, most), self.run_id)  # (applied by the recovery)
         ring.flags[FLAG_STOPPED] = 0
-
-    def _grow_cells(self, main_cap: int, run_id: int) -> None:
-        """Per-cell runs: a larger capacity (Ring.grow), the device idle (see _Launches.resize)."""
-        torch.cuda.synchronize()
-        self.ring.grow(main_cap)
-        torch.cuda.synchronize()  # (the copies done before any stream's next kernel: see _Launches.resize)
-        self.growths.append((run_id, "main", main_cap))
 
     def _constexprs(self, num_warps) -> dict:
         p2, lanes = triton.next_power_of_2, 32 * num_warps
@@ -680,8 +659,8 @@ class PopulationRuntime:
             COUNT=self.count_received, NSP=p2(self.ring.n_slots),
             TRACE=self.trace.level if self.trace is not None else 0,
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
-            POOL_B=self.ring.pool_b,
-            ARENA_CHECK=bool(self.arena_check and self.ring.pool_b), QUEUES=self.queues,
+            BLOCK=self.ring.block,
+            ARENA_CHECK=bool(self.arena_check), QUEUES=self.queues,
             GP=p2(max([max(h.G if h.regions else 1, 1) for h in self.plan.histories], default=1)),
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}

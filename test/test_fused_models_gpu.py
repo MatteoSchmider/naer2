@@ -96,8 +96,7 @@ def test_pd14_neuron_integrates_this_runs_deliveries():
     neuron = PD14_neuron(K_cortical=2000)
     src = commanded_runtime(300, group_size=G, device=DEVICE)  # firing on command
     dst = _neuron_runtime(neuron, 500, potential=torch.normal(-60.0, 4.0, (500,)))
-    dst.connect([src], [random_topology(300, 500, G, delay=0.1, k=40, seed=3, weight=True)], n_slots=4,
-                main_cap=8192)
+    dst.connect([src], [random_topology(300, 500, G, delay=0.1, k=40, seed=3, weight=True)], n_slots=4)
     delivered = 0
     for r in range(6):
         t = round(1.0 + 0.1 * r, 6)

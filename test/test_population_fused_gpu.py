@@ -94,21 +94,16 @@ def test_a_population_without_connections():
     assert torch.all(T.next_spike >= 1.0) and T.next_spike is T.runtime.state["next_spike"]
 
 
-@pytest.mark.parametrize("ring", ["cells", "arena"])
-def test_a_run_too_large_for_its_ring_stops_and_reruns(ring):
-    """cells: main capacity 64 per (group, slot); arena: every group's
-    arena at its minimum (4-record blocks: per slot its reserved ones and a
-    partly used one). The burst's intake doesn't fit: that run stops with
+def test_a_run_too_large_for_its_ring_stops_and_reruns():
+    """Every group's arena at its minimum (4-record blocks: per slot its
+    reserved ones and a partly used one). The burst's intake doesn't fit: that run stops with
     nothing committed, so does every run after it (the source's, the
     consumer's), the ring grows to the run's need x grow_to once the device
     is idle, and every stopped run runs again -- every link delivered,
     exactly, nothing lost, no warning; the rounds after it too (each rerun
     with its own commands)."""
     src, dst, conn = _pair()
-    if ring == "cells":
-        dst.ring_block, dst.main_cap = None, 64
-    else:
-        dst.ring_block, dst.ring_in_flight = 4, 0.0
+    dst.ring_block, dst.ring_in_flight = 4, 0.0
     # the burst, then a different pattern every round right after it: the runs stopped behind the burst's
     # intake are rerun with the commands they were launched with, not the later ones
     pattern = {r: torch.rand(300, generator=torch.Generator().manual_seed(2 + r)) < (0.3 if r == 0 else 0.01)
@@ -121,14 +116,14 @@ def test_a_run_too_large_for_its_ring_stops_and_reruns(ring):
             src.run(t, t + 0.1, round_id=r)
             dst.run(t, t + 0.1, round_id=r)
             if r == 0:
-                start = dst.runtime.ring.main_cap if ring == "cells" else dst.runtime.ring.pool_nb
+                start = dst.runtime.ring.n_blocks
                 for rt in (src.runtime, dst.runtime):  # a stop noticed late: only once the status slots run out
                     judge = rt._judge_pending
                     rt._judge_pending = lambda stream, wait, judge=judge: judge(stream, wait) if wait else None
         dst.check()
     rt = dst.runtime
     assert rt.stops and rt.growths
-    assert (rt.ring.main_cap if ring == "cells" else rt.ring.pool_nb) > start
+    assert rt.ring.n_blocks > start
     count = sum(_expected(conn, p, 500)[0] for p in pattern.values())
     assert int(count.sum()) > 0
     assert torch.equal(rt.n_received.cpu().long(), count)
@@ -151,7 +146,7 @@ def test_a_ring_arena_shrinks_back_and_keeps_what_it_holds():
         dst.run(t, t + 0.1, round_id=r)
         if r == 0:
             dst.runtime.shrink_window = 5
-            start = dst.runtime.ring.pool_nb
+            start = dst.runtime.ring.n_blocks
     dst.check()
     rt = dst.runtime
     shrinks = [r for r in rt.resizes if r[1] < start]

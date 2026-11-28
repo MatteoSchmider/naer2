@@ -28,8 +28,7 @@ if "--keep-old" in sys.argv:  # never free a ring's old buffer (diagnostic)
 if "--zero-growth" in sys.argv:  # every ring buffer zero-filled, also when grown (diagnostic)
     from naer2 import ring as RG
     _alloc = RG.Ring._allocate
-    RG.Ring._allocate = lambda self, main_cap, device, zero_records=True: _alloc(
-        self, main_cap, device, zero_records=True)
+    RG.Ring._allocate = lambda self, device, zero_records=True: _alloc(self, device, zero_records=True)
 for a in sys.argv:
     if a.startswith("--warps="):  # the warp cap (diagnostic): runtime._warp_cap overridden
         R._warp_cap = lambda device, _w=int(a.split("=")[1]): _w
@@ -46,15 +45,15 @@ if "--staging" in sys.argv:  # (diagnostic, needs tools/pd14_volley_debug.patch:
 INV = []  # TEMP: arena invariant (held blocks + free stack = every id once, per group), checked before resizes
 def _check_arena(rt, when):
     ring = rt.ring
-    if not ring.pool_b or len(INV) >= 2:
+    if len(INV) >= 2:
         return
-    g, S, nb, B = ring.n_groups, ring.n_slots, ring.pool_nb, ring.pool_b
+    g, S, nb, B = ring.n_groups, ring.n_slots, ring.n_blocks, ring.block
     table, stack = ring.table.cpu(), ring.stack.cpu()
     nblk, top = ring.nblk.cpu(), ring.top.cpu()
     for grp in range(g):
         ids = []
         for c in range(grp * S, (grp + 1) * S):
-            ids += [(int(x), f"main cell {c}") for x in table[c, :int(nblk[c])]]
+            ids += [(int(x), f"cell {c}") for x in table[c, :int(nblk[c])]]
         ids += [(int(x), "free") for x in stack[grp, :int(top[grp])]]
         seen = {}
         dups = []
@@ -70,10 +69,10 @@ _apply2 = R.PopulationRuntime._apply_wanted
 def _apply_inv(self):
     if self._wanted is None:
         return _apply2(self)
-    nb0 = self.ring.pool_nb
+    nb0 = self.ring.n_blocks
     _check_arena(self, f"{self.run_id}, before resizing from {nb0}")
     out = _apply2(self)
-    _check_arena(self, f"{self.run_id}, after resizing {nb0} -> {self.ring.pool_nb}")
+    _check_arena(self, f"{self.run_id}, after resizing {nb0} -> {self.ring.n_blocks}")
     return out
 CHECK_ARENA = "--check-arena" in sys.argv  # (diagnostic: copies the arenas' tables at every resize -- a sync
 if CHECK_ARENA:                           # that hides the race, TODO.md)
