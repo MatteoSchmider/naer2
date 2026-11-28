@@ -47,6 +47,10 @@ The watermark, side runs, `_side_insert`, `_merge_links`, the sequential general
 (flag 2), the delay classes (`NC`, `_stage_merged`'s classes become queues), `_floors` for queue populations, and
 lost links (one batched pull for every source: it stops a run and reruns it).
 
+Done 2026-11-28: the side runs, `_side_insert`, `_merge_links`, the sequential general pull, the delay classes and
+lost links (every pull stops and reruns). The slotted ring takes uniform sources only for now (non-uniform ones:
+NotImplementedError); its watermark and the uniform contract stay, a check (flag 2).
+
 ## Order: the producer places, the consumer merges (decided 2026-11-22)
 
 No program ever waits on another (no decoupled look-back: PD14's kernel latency can't spare it).
@@ -75,6 +79,7 @@ No program ever waits on another (no decoupled look-back: PD14's kernel latency 
 2. Deterministic histories (per-program regions; PD14's cost measured first), sorted regions for non-uniform
    producers, order-preserving appends.
 3. Queue delivery: the k-way merge up to the run's end; gating and scheduling from the queues' heads.
-4. One pull for every source; the side runs and the general pull removed.
+4. One pull for every source; the side runs and the general pull removed (removed 2026-11-28; the slotted ring's
+   pull for non-uniform sources still to come).
 5. Brunel against its numbers (rates, CV, the reference), speed on the 780M and the 4090; PD14 unchanged
    (speed, accuracy), its summation order now reproducible.

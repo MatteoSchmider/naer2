@@ -60,9 +60,9 @@ def _network(G, harness_caps=False, scaled_caps=False, block=None, in_flight=Non
         if in_flight is not None:
             p.ring_in_flight = in_flight
         if harness_caps and name in PD14_MAIN_CAP:  # the harness's ring capacities: no growth, no lost links
-            p.ring_block, p.main_cap, p.side_cap = None, PD14_MAIN_CAP[name], 16
+            p.ring_block, p.main_cap = None, PD14_MAIN_CAP[name]
         elif scaled_caps and name in PD14_MAIN_CAP:  # the same per group neuron, at group size G (sized for 256)
-            p.ring_block, p.main_cap, p.side_cap = None, -(-PD14_MAIN_CAP[name] * G // 256 // 16) * 16, 16
+            p.ring_block, p.main_cap = None, -(-PD14_MAIN_CAP[name] * G // 256 // 16) * 16
     return net, pops
 
 

@@ -111,16 +111,15 @@ class Population:
         # and a partly used one -- by default the reserves alone: the
         # runtime sizes the arenas from what the runs need (naer2/runtime.py;
         # PD14: quiet activity needs little more than the reserves, the
-        # thalamic volley ~4x that). main_cap / side_cap: with ring_block
-        # None only, per-cell runs of that many records (None: their
-        # defaults).
+        # thalamic volley ~4x that). main_cap: with ring_block None only,
+        # per-cell runs of that many records (None: the default) -- the
+        # slotted ring then, whatever the delays (queues are pooled).
         self._fused = None
         self._runtime = None
         self._connected = False
         self.ring_block: int | None = 256
         self.ring_in_flight: float = 0.0
         self.main_cap: int | None = None
-        self.side_cap: int | None = None
         # the emission history's depth; None: the network's derived one
         # (Network._plan_histories), 3 without a network step
         self.history_depth: int | None = None
@@ -128,9 +127,6 @@ class Population:
         # the spikes one run can emit (its history's cap); None: one per neuron -- more where neurons fire inside
         # delivery, any number of times a run (D-3); past it the run's spikes are lost and check() raises
         self.history_cap: int | None = None
-        # the slotted ring's records per segment (a source's links into a group in one record, the walk expanding
-        # it) instead of per link -- queues always hold segments (SPIKES.md)
-        self.segment_records: bool = __import__("os").environ.get("NAER2_SEG") == "1"  # (EXPERIMENT)
         # the runtime's receive counters (runtime.received / n_received: summed weight and links per neuron), a
         # development aid -- off by default, a little work per delivered link
         self.count_received: bool = False
@@ -449,11 +445,10 @@ class Population:
             if math.isfinite(nxt) and not any(_same_time(nxt, q) for q in self._run_times):
                 self._run_times.append(nxt)
             return
-        pending = (ring.main_count + ring.side_count).view(ring.n_groups * ring.n_classes, ring.ring_slots)
-        pending = pending.amax(0).tolist()  # (per slot, over the groups and delay classes)
+        pending = ring.main_count.view(ring.n_groups, ring.n_slots).amax(0).tolist()  # (per slot, over the groups)
         ring.first_pending = math.inf  # (none: the ring is empty -- its next run starts from its own start)
-        for k in range(ring.ring_pos, ring.ring_pos + ring.ring_slots):
-            if pending[k % ring.ring_slots]:
+        for k in range(ring.ring_pos, ring.ring_pos + ring.n_slots):
+            if pending[k % ring.n_slots]:
                 ring.first_pending = k
                 arrival = (k + 1) * ring.slot_width  # (a run at the slot's end; its spikes from its start on)
                 if arrival not in self._run_times:
@@ -493,7 +488,6 @@ class Population:
                                           state={a: getattr(self, a) for a in kernel.attrs},
                                           history_cap=self.history_cap)
         self._runtime.seed = self.seed
-        self._runtime.segment_records = self.segment_records
 
     def _resolution(self, conn) -> float:
         """A connection's delay quantization: its own, else the network's."""
@@ -513,13 +507,11 @@ class Population:
         """receive's time (T_A, T_C, T_B: T_A e + T_C k + T_B for a record emitted at e, delivered from slot k;
         D-1, BRUNEL.md, fused.py _deliver_link) by the incoming delays: one homogeneous delay D over every
         incoming link -- exact, e + D (emission order is arrival order); otherwise the slot's center or end
-        (slot_time), every link of a slot at one time. Several homogeneous delays: (1, 0, 0) -- exact too, each
-        delay class's delay added by delivery (a ring per class, merged by arrival: _delay_classes)."""
+        (slot_time), every link of a slot at one time. (Queues: each connection's delay added by delivery
+        itself, exact -- these constants unused.)"""
         delays = [self._homogeneous_delay(c) for c in self.incoming]
         if None not in delays and len(set(delays)) <= 1:
             return 1.0, 0.0, delays[0] if delays else 0.0
-        if self._delay_classes() is not None:  # (each class's delay added by delivery itself: _deliver, NC > 1)
-            return 1.0, 0.0, 0.0
         if self.slot_time not in ("center", "end"):
             raise ValueError(f"slot_time is 'center' or 'end', not {self.slot_time!r}")
         w = self._slot_width()
@@ -532,16 +524,6 @@ class Population:
         _delivery_time's constants stay a slotted ring's.)"""
         return (bool(self.incoming) and bool(self.ring_block)
                 and all(self._homogeneous_delay(c) is not None for c in self.incoming))
-
-    def _delay_classes(self) -> tuple[list[int], list[float]] | None:
-        """Several homogeneous delays (every incoming connection one delay value, not all the same; D-1,
-        BRUNEL.md): per connection its delay class, per class its delay (in increasing order) -- a ring per
-        class, merged by arrival at delivery. None otherwise (one value, or any per-link delays)."""
-        delays = [self._homogeneous_delay(c) for c in self.incoming]
-        if None in delays or len(set(delays)) <= 1:
-            return None
-        values = sorted(set(delays))
-        return [values.index(d) for d in delays], values
 
     def _slot_width(self) -> float:
         """The ring's slot width: the finest resolution its incoming
@@ -586,17 +568,14 @@ class Population:
         # reach up to a source window + the longest delay past this run's start (_max_window)
         longest = max((float(t.bucket_mean.max()) for t in topologies), default=0.0)
         n_slots = math.ceil(longest / w) + math.ceil(self._ring_window() / w - 1e-9) + 3
-        caps = {k: v for k, v in (("main_cap", self.main_cap), ("side_cap", self.side_cap)) if v}
         min_delays = [self._min_delay(c) for c in self.incoming]
         if self._queues():  # (a queue per connection: one cell each, no slots -- SPIKES.md)
             self._runtime.connect(sources, topologies, len(self.incoming), slot_width=w,
                                   pool=self._ring_pool(topologies, len(self.incoming)), min_delays=min_delays,
-                                  queues=True, **caps)
+                                  queues=True)
         else:
-            classes, class_delays = self._delay_classes() or (None, None)
-            cells = n_slots * (len(class_delays) if class_delays else 1)  # (a group's cells: a ring per class)
-            self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, cells),
-                                  min_delays=min_delays, classes=classes, class_delays=class_delays, **caps)
+            self._runtime.connect(sources, topologies, n_slots, slot_width=w, pool=self._ring_pool(topologies, n_slots),
+                                  min_delays=min_delays, main_cap=self.main_cap)
         self._connected = True
 
     def run(self, t_start: float, t_end: float, deliver_until: float | None = None, round_id: int | None = None,

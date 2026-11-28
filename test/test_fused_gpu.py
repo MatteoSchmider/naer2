@@ -46,12 +46,6 @@ def _walk(monkeypatch, request):
     monkeypatch.setattr(runtime, "WALK", dict(stream=stream, unroll=unroll))
 
 
-@pytest.fixture(autouse=True, params=[True, False], ids=["batch", "runs"])
-def _pull(monkeypatch, request):
-    """Pull intake: fresh runs batched by emission time or one by one."""
-    monkeypatch.setattr(runtime, "PULL", dict(batch=request.param))
-
-
 def Pop(n, depth=3, uniform=True):
     return commanded_runtime(n, uniform=uniform, group_size=GROUP_SIZE, depth=depth, device=DEVICE)
 
@@ -145,27 +139,23 @@ def _check_deliveries(consumer, expected_by_read, delivered_by_run, due_until, n
 @pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])  # pool: per-group arenas (Ring)
 @pytest.mark.parametrize("consumer_first", [True, False])
 @pytest.mark.parametrize("long_segments", [False, True])
-@pytest.mark.parametrize("uniform", [True, False])
-def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first, pool):
+def test_pull_and_deliver_end_to_end(long_segments, consumer_first, pool):
     """Sources A, B -> consumer C (3 groups), six rounds, every population
     running once per round -- C before or after its sources within the round
     (the outcome must not depend on it: C only ever sees earlier rounds).
     Spikes emitted in round r are taken in by C's run in round r + 1."""
     rng = random.Random(5)
-    a, b, consumer = Pop(150, uniform=uniform), Pop(90, uniform=uniform), Pop(96)
+    a, b, consumer = Pop(150), Pop(90), Pop(96)
     topologies = [  # per-link delays (A -> C) and one homogeneous delay (B -> C)
         _topology(a.n, 96, GROUP_SIZE, delay="random", k=24, seed=10, weight=True),
         _topology(b.n, 96, GROUP_SIZE, delay=0.2, k=90 if long_segments else 24, seed=11, weight=True),
     ]
-    # run capacities count links (one ring record per link): emission-delayed spikes with long
-    # segments put a few thousand links into a side run
-    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000, side_cap=4096, pool=pool)
+    consumer.connect([a, b], topologies, n_slots=16, log_cap=200_000, pool=pool)
 
     expected_by_read, delivered_by_run = [], []
     for r in range(6):
         t = round(1.0 + 0.1 * r, 6)
-        fires = {src: (_fire_pattern(src.n, t, t + 0.1, 0.3, rng),
-                       torch.tensor([rng.choice([0.0, 0.0, 0.15]) for _ in range(src.n)])) for src in (a, b)}
+        fires = {src: (_fire_pattern(src.n, t, t + 0.1, 0.3, rng),) for src in (a, b)}
 
         def run_consumer():
             ring_pos = consumer.ring.ring_pos  # where this run's intake lands late arrivals
@@ -191,20 +181,19 @@ def test_pull_and_deliver_end_to_end(uniform, long_segments, consumer_first, poo
 
 @pytest.mark.parametrize("pool", [None, (8, 4096)], ids=["cells", "pool"])
 @pytest.mark.parametrize("group_size", [256, 512])  # the link targets as bytes / as 16-bit halves
-@pytest.mark.parametrize("uniform", [True, False])
-def test_link_targets_at_either_width(uniform, group_size, pool):
+def test_link_targets_at_either_width(group_size, pool):
     """A consumer group's targets travel one byte each up to a group size
     of 256, else two (SimulationTopology.target_bits, the kernel's from its
     GROUP_SIZE): every link reaches the right target, up to a group's last
     neuron."""
     rng = random.Random(9)
     n = 3 * group_size - 17  # a ragged last group
-    src = Pop(200, uniform=uniform)
+    src = Pop(200)
     consumer = commanded_runtime(n, group_size=group_size, device=DEVICE)
     topo = _topology(src.n, n, group_size, delay="random", k=60, seed=12, weight=True)
     assert topo.target_bits == (8 if group_size <= 256 else 16)
     assert int(topo.link_target.to(torch.int32).max() & (0xFF if group_size <= 256 else 0xFFFF)) > group_size - 8
-    consumer.connect([src], [topo], n_slots=24, log_cap=100_000, side_cap=4096, pool=pool)
+    consumer.connect([src], [topo], n_slots=24, log_cap=100_000, pool=pool)
     expected, delivered = [], []
     for r in range(5):
         t = round(1.0 + 0.1 * r, 6)

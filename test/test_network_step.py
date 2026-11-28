@@ -216,7 +216,7 @@ def test_an_event_driven_consumer_idle_longer_than_its_ring(mode):
         network.step(0.05)
         (network.run_planned if mode == "planned" else network.run_graph)(until=5.0)
     B.check()
-    assert B.runtime.ring.ring_slots * B.runtime.ring.slot_width < 2.0
+    assert B.runtime.ring.n_slots * B.runtime.ring.slot_width < 2.0
     count, total = _periodic_expected(conn, phases, 3.0, 0.5, B._window[1])
     assert int(count.sum()) == 2 * len(conn.fabric.topology)  # (both spikes of every source)
     assert torch.equal(B.runtime.n_received.cpu().long(), count)

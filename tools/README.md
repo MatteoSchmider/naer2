@@ -12,7 +12,6 @@ are in git history (commit `caea455`).
 | `pd14_setup.py` | the shared PD14 benchmark: PD14's populations as `PopulationRuntime`s (`naer2/runtime.py`) running kernels generated from their hooks, with their `SimulationTopology` connections (0.1 ms buckets); `model="standin"`: the 8 cortical populations as `PD14_commanded` (PD14 firing on command at PD14-like rates), `"pd14"`: the real network with the thalamus; one round = one fused kernel per population, each on its own stream (pre-made events through a hub) |
 | `pd14_roundtrip.py G` | wall clock per round, populations on their own streams (`--sequential`: on one); `--breakdown`: host issue time (queue filling, GPU idle) and the round alone |
 | `trace_round.py G` | every program of every population's kernel on one wall-clock axis, from the kernels' own stamps (`naer2/trace.py`): the round's span and GPU busy time (concurrent) and per population its span, programs alive and phases (isolated); `--level 2/3` split the pull intake further, `--heat N` keeps the clock up, `--no-counters` compiles the stand-in receive counters out (PD14's kernel) |
-| `fused_sweep.py G` | the fused kernel's pull-intake variants (runs batched by emission time or one by one; segments always through the group directory), interleaved; also the directories' memory |
 | `kernel_isa.py G` | compiles the fused kernel and summarizes its ISA: VGPRs, spills, LDS, per loop the instruction mix and the highest VGPR touched |
 | `rdna2.py` | lets Triton 3.9 compile for RDNA2 (lowers as gfx1100, codegen as gfx1030) |
 

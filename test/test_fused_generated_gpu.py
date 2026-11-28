@@ -19,6 +19,7 @@ import pytest
 import torch
 
 import naer2 as n2
+from naer2.ring import POOL_RESERVE
 from naer2.runtime import PopulationRuntime
 from naer2.transpiler.templates.fused_template import FusedKernelTemplate
 from test.edges import plastic_synapse, static_synapse
@@ -47,6 +48,16 @@ def _runtime(kernel, population, **state):
                            state={**_defaults(population), **state})
     rt.count_received = True
     return rt
+
+
+def _connect(gen, dst_pop, conns, srcs, topos):
+    """gen connected as its Population would be: a queue per connection where every connection has one delay
+    value (SPIKES.md: any sources), else the slotted ring (8 slots of 0.1 ms, per-cell runs: uniform sources)."""
+    if dst_pop._queues():
+        gen.connect(srcs, topos, len(conns), pool=(256, len(conns) * (POOL_RESERVE + 1) + 9),
+                    min_delays=[dst_pop._min_delay(c) for c in conns], queues=True)
+    else:
+        gen.connect(srcs, topos, n_slots=8, main_cap=8192)
 
 
 def _same_spikes(a, b):
@@ -153,10 +164,9 @@ class _bare_spiking_receiver:
 
 
 def _spiking_run(node, weight, delay=0.15, seed=41, uniform=False, history_cap=1200):
-    """Sources fire once, at random times in [1.0, 1.1) (uniform: at 1.0 -- the batched pull, the walk); the
-    consumer (weight on every link, one
-    homogeneous delay: exact arrivals) runs rounds 0..3, its history taking history_cap spikes a run. Returns (consumer, fire times, connection, every
-    spike it emitted as (e, node))."""
+    """Sources fire once, at random times in [1.0, 1.1) (uniform: at 1.0, every arrival tied); the consumer
+    (weight on every link, one homogeneous delay: its queue, exact arrivals) runs rounds 0..3, its history taking
+    history_cap spikes a run. Returns (consumer, fire times, connection, every spike it emitted as (e, node))."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, node() * 300
     conn = src >> PD14_connection(0.1) >> dst
     conn.weight = torch.full(conn.shape, weight)
@@ -165,7 +175,7 @@ def _spiking_run(node, weight, delay=0.15, seed=41, uniform=False, history_cap=1
     assert not gk.uniform_emission  # spikes at the delivery's time
     gen = PopulationRuntime(gk, 300, group_size=G, device=DEVICE, state=_defaults(dst), history_cap=history_cap)
     srcs = commanded_runtime(200, uniform=uniform, group_size=G, device=DEVICE)
-    gen.connect([srcs], [conn.fabric.simulation(300, G, DEVICE, attrs=["weight"])], n_slots=8, main_cap=8192)
+    _connect(gen, dst, [conn], [srcs], [conn.fabric.simulation(300, G, DEVICE, attrs=["weight"])])
     g = torch.Generator().manual_seed(seed)
     at = torch.full((200,), 1.0) if uniform else 1.0 + 0.1 * torch.rand(200, generator=g)
     fire = torch.where(torch.rand(200, generator=g) < 0.3, at, math.inf).float()
@@ -183,8 +193,8 @@ def _spiking_run(node, weight, delay=0.15, seed=41, uniform=False, history_cap=1
 def test_spikes_inside_delivery(node, uniform):
     """D-3: n2.spike() in receive fires at the delivery -- explicit (its time) or bare (the delivery time
     itself): every link 0.4, so a target fires at every third input, at that input's arrival (fp32 e + D,
-    in arrival order), any number of times a run -- against a host reference. Timed sources: the general
-    pull, side runs, the one-link merge; uniform: the walk (a row per warp)."""
+    in arrival order), any number of times a run -- against a host reference. The queue's batch walk, timed
+    sources and uniform ones (all arrivals at one time: a beat's receives one by one)."""
     gen, fire, conn, spikes = _spiking_run(node, 0.4, uniform=uniform)
     gen.check()
     offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
@@ -338,7 +348,7 @@ def _deliver_once(dst_pop, sources, attrs=None, delay=0.2):
     for conn, _ in sources:
         res = dst_pop._slot_width() if isinstance(delay, torch.Tensor) else None  # (per link: quantized at it)
         topos.append(conn.fabric.simulation(n, G, DEVICE, resolution=res, attrs=list(attrs)))
-    gen.connect(srcs, topos, n_slots=8, main_cap=8192)
+    _connect(gen, dst_pop, [c for c, _ in sources], srcs, topos)
     for r in range(3):
         t = round(1.0 + 0.1 * r, 6)
         gen.run(t, t + 0.1, round_id=r)
@@ -422,7 +432,7 @@ def test_gap_source_attrs():
 
 
 def test_receive_time_one_homogeneous_delay_is_exact():
-    """D-1 (BRUNEL.md): one homogeneous delay D over every incoming link -- receive's time is the arrival,
+    """D-1 (BRUNEL.md): one homogeneous delay D over every incoming link -- a queue, receive's time the arrival,
     e + D exactly (emission order is arrival order). The sources fire at random times in [1.0, 1.1): every
     target's last input is its latest arrival."""
     src, dst = PD14_neuron(K_cortical=2000) * 200, _arrival_recorder() * 300
@@ -491,24 +501,26 @@ class _order_checker:
         self.n += 1.0
 
 
-def _run_spread(dst, conns, delay, rounds=8):
-    """Every source fires once per round at a random time in it; the consumer runs `rounds` rounds."""
+def _run_spread(dst, conns, delay, uniform, rounds=8):
+    """Every source fires once per round (uniform: at its start, else at a random time in it); the consumer runs
+    `rounds` rounds."""
     for conn in conns:
         conn.delay = delay(conn) if callable(delay) else delay
     gk = FusedKernelTemplate(dst).build()
     n = len(dst.shape)
     gen = _runtime(gk, dst)
     sizes = [len(c._source.shape) for c in conns]
-    srcs = [commanded_runtime(k, uniform=False, group_size=G, device=DEVICE) for k in sizes]
+    srcs = [commanded_runtime(k, uniform=uniform, group_size=G, device=DEVICE) for k in sizes]
     res = dst._slot_width() if callable(delay) else None  # (per-link delays: quantized at the slot width)
     topos = [c.fabric.simulation(n, G, DEVICE, resolution=res, attrs=[]) for c in conns]
-    gen.connect(srcs, topos, n_slots=8, main_cap=8192)
+    _connect(gen, dst, conns, srcs, topos)
     g = torch.Generator().manual_seed(23)
     for r in range(rounds):
         t = round(1.0 + 0.1 * r, 6)
         gen.run(t, t + 0.1, round_id=r)
         for src, k in zip(srcs, sizes):
-            times = torch.where(torch.rand(k, generator=g) < 0.3, t + 0.1 * torch.rand(k, generator=g), math.inf)
+            at = torch.full((k,), t) if uniform else t + 0.1 * torch.rand(k, generator=g)
+            times = torch.where(torch.rand(k, generator=g) < 0.3, at, math.inf)
             command(src, t, t + 0.1, times if r < rounds - 3 else None, round_id=r)
     gen.check()
     return gen
@@ -516,9 +528,9 @@ def _run_spread(dst, conns, delay, rounds=8):
 
 @pytest.mark.parametrize("mode", ["homogeneous", "per_link"])
 def test_receive_times_never_step_back(mode):
-    """D-1: per target, receive's times are non-decreasing -- one homogeneous delay (exact arrivals, in
-    emission order) and per-link delays spanning slots (the slot times) alike; two connections, sources
-    firing at random times over several rounds."""
+    """D-1: per target, receive's times are non-decreasing -- one homogeneous delay (the queues: exact arrivals,
+    merged; sources firing at random times) and per-link delays spanning slots (the slot times; uniform
+    sources) alike; two connections, over several rounds."""
     a, b = PD14_neuron(K_cortical=2000) * 200, PD14_neuron(K_cortical=2000) * 150
     dst = _order_checker() * 300
     ca, cb = a >> PD14_connection(0.1) >> dst, b >> PD14_connection(0.1) >> dst
@@ -527,7 +539,7 @@ def test_receive_times_never_step_back(mode):
         delay = lambda c: _per_link_delays(c, 0.1, 0.4, len(c._source.shape))
     else:
         delay = 0.15
-    gen = _run_spread(dst, [ca, cb], delay)
+    gen = _run_spread(dst, [ca, cb], delay, uniform=mode == "per_link")
     assert float(gen.state["n"].sum()) > 1000
     assert float(gen.state["back"].sum()) == 0.0
 
@@ -551,7 +563,7 @@ class _order_hash:
         self.n += 1.0
 
 
-def _run_classes(dst, conns, delays, uniform, rounds=4, seed=31, weights=True):
+def _run_queues(dst, conns, delays, uniform, rounds=4, seed=31, weights=True):
     """conns[i] at the homogeneous delays[i], its weight i + 1 on every link (weights); every source fires in rounds
     0..rounds-1 (uniform: at the round's start; else at random times in it), the consumer runs until all has
     arrived. Returns (consumer, [per connection: fire times per source, per round])."""
@@ -559,14 +571,13 @@ def _run_classes(dst, conns, delays, uniform, rounds=4, seed=31, weights=True):
         conn.delay = d
         if weights:
             conn.weight = torch.full(conn.shape, float(wgt))
-    classes, class_delays = dst._delay_classes()
     gk = FusedKernelTemplate(dst).build()
     n = len(dst.shape)
     gen = _runtime(gk, dst)
     sizes = [len(c._source.shape) for c in conns]
     srcs = [commanded_runtime(k, uniform=uniform, group_size=G, device=DEVICE) for k in sizes]
     topos = [c.fabric.simulation(n, G, DEVICE, attrs=["weight"] if weights else []) for c in conns]
-    gen.connect(srcs, topos, n_slots=8, main_cap=8192, classes=classes, class_delays=class_delays)
+    _connect(gen, dst, conns, srcs, topos)
     g = torch.Generator().manual_seed(seed)
     fired = [[] for _ in conns]
     for r in range(rounds + 4):
@@ -584,9 +595,7 @@ def _run_classes(dst, conns, delays, uniform, rounds=4, seed=31, weights=True):
 
 def _arrival_order_reference(conns, delays, fired, n):
     """Per target, acc and n as _order_hash ends with: its inputs in arrival order (fp32 e + D, as delivery),
-    ties by class (the smaller delay first)."""
-    order = sorted(range(len(delays)), key=lambda i: delays[i])
-    cls = {i: order.index(i) for i in order}
+    ties by connection (the queues' merge: the lower one first)."""
     per = [[] for _ in range(n)]
     for i, conn in enumerate(conns):
         offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
@@ -595,7 +604,7 @@ def _arrival_order_reference(conns, delays, fired, n):
             arr = times + d
             for s in torch.isfinite(times).nonzero().flatten().tolist():
                 for j in tgt[offs[s]:offs[s + 1]].tolist():
-                    per[j].append((arr[s].item(), cls[i], float(i + 1)))
+                    per[j].append((arr[s].item(), i, float(i + 1)))
     acc, cnt = torch.zeros(n, dtype=torch.float64), torch.zeros(n)
     for j, inputs in enumerate(per):
         for _, _, w in sorted(inputs, key=lambda x: (x[0], x[1])):
@@ -606,17 +615,16 @@ def _arrival_order_reference(conns, delays, fired, n):
 
 @pytest.mark.parametrize("uniform", [True, False], ids=["uniform", "timed"])
 def test_several_homogeneous_delays_arrive_in_order(uniform):
-    """D-1, several homogeneous delays (BRUNEL.md, step 3): a ring per delay class, a slot's classes merged by
-    arrival -- every target's inputs in exact arrival order (ties: the smaller delay first) against a host
-    reference, each at its arrival. Uniform sources: the batched pull, the block merge (_stage_merged; at 0.1
-    and 0.2, a round's arrivals tie with the previous one's); timed: the general pull, side runs, the merge one
-    link at a time (_merge_classes)."""
+    """D-1, several homogeneous delays (SPIKES.md): a queue per connection, merged by arrival -- every target's
+    inputs in exact arrival order (ties: the lower connection first) against a host reference, each at its
+    arrival. Uniform sources: at 0.1 and 0.2, a round's arrivals tie with the previous one's; timed: any
+    times."""
     a, b, c = (PD14_neuron(K_cortical=2000) * k for k in (200, 150, 120))
     dst = _order_hash() * 300
     conns = [x >> PD14_connection(0.1) >> dst for x in (a, b, c)]
     delays = [0.2, 0.1, 0.15] if uniform else [0.2, 0.13, 0.17]
-    gen, fired = _run_classes(dst, conns, delays, uniform)
-    assert gen.ring.n_classes == 3
+    gen, fired = _run_queues(dst, conns, delays, uniform)
+    assert gen.queues and gen.ring.n_slots == 3
     want_acc, want_n = _arrival_order_reference(conns, delays, fired, 300)
     assert torch.equal(gen.state["n"].cpu(), want_n)
     assert float(want_n.sum()) > 1000
@@ -631,7 +639,7 @@ def test_several_homogeneous_delays_receive_at_the_arrival(uniform):
     dst = _arrival_recorder() * 300
     conns = [x >> PD14_connection(0.1) >> dst for x in (a, b)]
     delays = [0.1, 0.25]
-    gen, fired = _run_classes(dst, conns, delays, uniform, rounds=3, weights=False)
+    gen, fired = _run_queues(dst, conns, delays, uniform, rounds=3, weights=False)
     want = torch.full((300,), -1.0)
     for i, conn in enumerate(conns):
         offs, tgt = conn.fabric.topology.source_offsets, conn.fabric.topology.target_indices.long()
@@ -641,6 +649,47 @@ def test_several_homogeneous_delays_receive_at_the_arrival(uniform):
                 idx = tgt[offs[s]:offs[s + 1]]
                 want[idx] = torch.maximum(want[idx], arr[s].expand(len(idx)))
     assert torch.equal(gen.state["last_input"].cpu(), want)
+
+
+@pytest.mark.parametrize("uniform", [True, False], ids=["uniform", "timed"])
+def test_a_burst_past_a_chunk_arrives_in_order(uniform):
+    """A source run whose spikes share one time bin past what a chunk merges in LDS (fused.py _pull_queues: QCH,
+    1500 spikes at one exact time) -- the queue pull's merge path: every link delivered once, at its arrival;
+    timed (the source programs' sorted regions merged): every target's inputs in (arrival, source) order (an
+    order hash, its weight the source's, against a host reference). Uniform: one flat list, in its atomic
+    appends' order -- the merge path keeps it (the fast path ranks by node): the sum checked, not the order
+    (TODO.md: a flat list's order)."""
+    n_src = 1500
+    src, dst = PD14_neuron(K_cortical=2000) * n_src, (_accumulator() if uniform else _order_hash()) * 300
+    conn = src >> PD14_connection(0.1) >> dst
+    conn.delay = 0.2
+    offs = conn.fabric.topology.source_offsets
+    w_src = 1.0 + (torch.arange(n_src) % 13).float() / 16
+    conn.weight = w_src.repeat_interleave(offs.diff())
+    gen = _runtime(FusedKernelTemplate(dst).build(), dst)
+    srcs = [commanded_runtime(n_src, uniform=uniform, group_size=G, device=DEVICE)]
+    _connect(gen, dst, [conn], srcs, [conn.fabric.simulation(300, G, DEVICE, attrs=["weight"])])
+    assert gen.queues
+    for r in range(4):
+        t = round(1.0 + 0.1 * r, 6)
+        gen.run(t, t + 0.1, round_id=r)
+        command(srcs[0], t, t + 0.1, torch.full((n_src,), 1.0 if uniform else 1.05) if r == 0 else None, round_id=r)
+    gen.check()
+    tgt = conn.fabric.topology.target_indices.long()
+    if uniform:
+        want = _expected(conn, torch.ones(n_src, dtype=torch.bool), 300, w_src.repeat_interleave(offs.diff()))
+        assert torch.allclose(gen.state["acc"].cpu(), want, atol=1e-3)
+        assert int(gen.n_received.sum()) == len(conn.fabric.topology)
+        return
+    acc, cnt = torch.zeros(300, dtype=torch.float64), torch.zeros(300)
+    for s in range(n_src):  # (one arrival for all: source order)
+        for j in tgt[offs[s]:offs[s + 1]].tolist():
+            acc[j] = acc[j] * 0.5 + float(w_src[s])
+            cnt[j] += 1
+    assert float(cnt.sum()) == len(conn.fabric.topology)
+    assert torch.equal(gen.state["n"].cpu(), cnt)
+    assert torch.allclose(gen.state["acc"].cpu(), acc.float(), rtol=1e-5, atol=1e-5), \
+        (gen.state["acc"].cpu()[:6], acc.float()[:6])
 
 
 @n2.edge

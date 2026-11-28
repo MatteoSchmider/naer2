@@ -37,10 +37,10 @@ def pd14_neuron_kernel(
     t_ref_end_ptr, potential_ptr, current_ptr, last_time_ptr,
     n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
     received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed, check_ptr,
-    GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
+    GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
-    COUNT: gl.constexpr, BATCH: gl.constexpr, NSP: gl.constexpr,
+    COUNT: gl.constexpr, NSP: gl.constexpr,
     TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr,
     T_MEM: gl.constexpr, T_SYN: gl.constexpr, R_MEM: gl.constexpr, T_REF: gl.constexpr, V_THRESH: gl.constexpr,
     V_RESET: gl.constexpr, V_REST: gl.constexpr,
@@ -58,7 +58,7 @@ def pd14_neuron_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
-    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, UNIFORM_SOURCES and BATCH)  # (first)
+    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, True)  # (first)
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
@@ -69,8 +69,8 @@ def pd14_neuron_kernel(
     fin = gl.to_tensor(0)
     if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
-                         parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
-                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, 0)
+                         parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, NUM_WARPS,
+                         GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, 0)
         if ok:
             # receive touches current: the state through delivery
             state = (gl.load(current_ptr + offs, mask=mask),)
@@ -119,10 +119,10 @@ def pd14_poisson_kernel(
     next_spike_ptr,
     n_neurons, plan, n_conns, ring, wmark_ptr, oflags, ctl, status, n_status, sched, sched_i, ev, slot_width,
     received_ptr, n_received_ptr, log_ptr, log_cap, history, hist_cap, trace_ptr, seed, check_ptr,
-    GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr, UNIFORM_SOURCES: gl.constexpr,
+    GROUP_SIZE: gl.constexpr, K: gl.constexpr, SK: gl.constexpr, KP: gl.constexpr,
     N_SLOTS: gl.constexpr, LOG: gl.constexpr, STREAM: gl.constexpr,
     U: gl.constexpr, SPT: gl.constexpr, NUM_WARPS: gl.constexpr, MAX_CONNS: gl.constexpr, LOG_CJ: gl.constexpr,
-    COUNT: gl.constexpr, BATCH: gl.constexpr, NSP: gl.constexpr,
+    COUNT: gl.constexpr, NSP: gl.constexpr,
     TRACE: gl.constexpr, TRACE_CAP: gl.constexpr, POOL_B: gl.constexpr,
     P_RATE: gl.constexpr, P_START: gl.constexpr, P_STOP: gl.constexpr,
 ):
@@ -139,7 +139,7 @@ def pd14_poisson_kernel(
     offs = pid * GROUP_SIZE + lane
     mask = offs < n_neurons
 
-    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, UNIFORM_SOURCES and BATCH)  # (first)
+    hdrs = _pull_headers(plan, n_conns, SK, KP, MAX_CONNS, NUM_WARPS, True)  # (first)
     run_id, round_id, k_lo, k_hi, t_start, t_end, gated = _run_entry(sched, sched_i)
     parity = run_id % 2
     status_run = _status_slot(status, sched, sched_i, run_id, n_status, n_groups)
@@ -150,8 +150,8 @@ def pd14_poisson_kernel(
     fin = gl.to_tensor(0)
     if _run_gate(ring, ctl, pid, run_id) & ~skip:  # (see the generated kernels; gated skips: their branch)
         n_ev, ok = _pull(pid, n_groups, plan, n_conns, ring, wmark_ptr, oflags, ctl, k_lo, slot_width, round_id,
-                         parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, UNIFORM_SOURCES, BATCH,
-                         NUM_WARPS, GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, 0)
+                         parity, hdrs, trace, n_ev, SK, KP, MAX_CONNS, LOG_CJ, N_SLOTS, NSP, NUM_WARPS,
+                         GROUP_SIZE, TRACE, TRACE_CAP, POOL_B, check_ptr, 0)
         if ok:
             state = ()  # no receive
             if TRACE:

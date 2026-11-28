@@ -25,8 +25,8 @@ and slots, replacing the general pull: SPIKES.md.)
 
 - **Refactor A** (host side).
 - **The ring project**: segmented arena growth, ring memory (a per-group overflow log, the reserve, the 2047-block
-  limit), a history that grows for a slow consumer, the general pull's limits (lost links, the untested `lost`
-  path).
+  limit), a history that grows for a slow consumer, the untested `lost` path (blocks missing: only a shrink
+  below what's in use could, since the general pull's removal, 2026-11-28).
 - **The step path's schedule entries** in device memory (if stepping still matters next to captured windows).
 - **Scheduling**: implicit scheduling (no 0.1 ms default), `n_slots` revisited -- against Brunel.
 

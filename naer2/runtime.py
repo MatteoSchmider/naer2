@@ -13,10 +13,9 @@ arguments, then its constexprs (+ the kernel's own, FusedKernel.consts).
               (Population shares its attrs' tensors); a caller may replace a
               tensor between runs (same dtype and size)
   connect()   sources (their runtimes) and the SimulationTopology of each
-              connection: builds the ring, the watermarks and the plan;
-              uniform_sources when every source's kernel emits uniformly
-              (else the general pull for all -- a mixed path is an open
-              optimization, TODO.md D-5)
+              connection: builds the ring, the watermarks and the plan --
+              the slotted ring for uniform sources only (every source's
+              kernel emits uniformly), queues for any (SPIKES.md)
   run()       one run over [t_start, t_end) in round round_id: the sources'
               runs of earlier rounds taken in, every slot due by
               deliver_until delivered, update, send, emission
@@ -28,18 +27,17 @@ _run_status; no copy, no event); later runs judge every slot that has
 landed, in run order, and a run whose slot is still pending waits for it
 -- so a size follows the runs at most status_slots behind (check() judges
 them all).
-  - per-cell runs: a run kind (main, side) past its capacity lost the
-    links it couldn't take; its capacity doubles (Ring.grow)
+  - per-cell runs: a run past the capacity stops (nothing committed) and
+    the capacity grows to its need (Ring.grow) before it reruns
   - pooled: the arenas (blocks per group) and overflow logs (records per
     cell) follow the runs' need -- the most blocks any group held, the
     most records any cell logged (Little's law at work: the arrival rate x
     how long a record stays) -- with headroom and hysteresis: grow when
     need x grow_at exceeds the size, shrink when need x grow_at stays below
     half of it for shrink_window runs, either to need x grow_to
-    (Ring.resize). A run that ran out lost links (its need: at least twice
-    what it had).
-Lost links are reported with a warning. Every size is a runtime value in
-the ring's header: a resize keeps the compiled kernel and its launcher.
+    (Ring.resize); a run that doesn't fit stops and reruns.
+Every size is a runtime value in the ring's header: a resize keeps the
+compiled kernel and its launcher.
 
 The launch: the first run per configuration goes through the JIT (and
 compiles); later ones call the compiled kernel's launcher directly (~8 us
@@ -51,9 +49,7 @@ selects the compiled variant and dropped when the buffers change.
 import collections
 import contextlib
 import math
-import os
 import time
-import warnings
 import weakref
 
 import numpy as np
@@ -62,10 +58,10 @@ import triton
 from triton import knobs
 
 from .history import EmissionHistory
-from .ring import POOL_MAX_BLOCKS, POOL_RESERVE, Ring
+from .ring import FLAG_STOPPED, POOL_MAX_BLOCKS, POOL_RESERVE, Ring
 from .schedule import RUN_WORDS, write_entry
 from .trace import Trace
-from .transpiler.templates.fused import FUSED_TRACE_TAGS, PULL, WALK, FusedPlan
+from .transpiler.templates.fused import FUSED_TRACE_TAGS, WALK, FusedPlan
 
 
 def _direct_launch(kernel, n_programs, consts):
@@ -242,8 +238,6 @@ class PopulationRuntime:
         self.count_received = False
         self.stream_block, self.unroll = WALK["stream"], WALK["unroll"]
         self.waves_per_eu = 0
-        # the slotted ring's records: per link (False) or per segment (True: _walk_segments; a queue's always)
-        self.segment_records = os.environ.get("NAER2_SEG") == "1"  # (EXPERIMENT: the default flipped for a run)
         self.max_warps: int | None = None  # a program's warps at most (None: the device's cap, _warp_cap)
         self.maxnreg: int | None = None  # NVIDIA: registers per thread at most (None: the compiler's choice)
         self.seed = 0  # random.*'s stream (the population's own seed: Population.seed)
@@ -251,7 +245,6 @@ class PopulationRuntime:
         # ARENA_CHECK -- pooled rings; arena_errors() the first violation); off: compiled out
         self.arena_check = False
         self._chk, self._chk_key = None, None
-        self.batch = PULL["batch"]
         self.trace = None
         self.overrun = torch.zeros(1, device=self.device, dtype=torch.int32)
         self._launchers = {}
@@ -265,7 +258,7 @@ class PopulationRuntime:
         # capacity), from every run's need: grow when need x grow_at exceeds the size; shrink (pooled) when
         # need x grow_at stays below half the size for shrink_window runs; either way to need x grow_to
         self.grow_at, self.grow_to, self.shrink_window = 1.5, 2.0, 200
-        self.growths: list[tuple[int, str, int]] = []  # (run id, "main" / "side" / "arena" / "log", new size)
+        self.growths: list[tuple[int, str, int]] = []  # (run id, "main" / "arena" / "log", new size)
         self.resizes: list[tuple[int, int, int]] = []  # pooled: (run id, blocks per arena, log records per cell)
         self.stops: list[int] = []  # run ids that stopped (the ring too small) and were rerun
         self._pending = collections.deque()
@@ -279,28 +272,29 @@ class PopulationRuntime:
         return self.kernel.uniform_emission
 
     def connect(self, sources: list, topologies: list, n_slots: int, slot_width: float = 0.1, log_cap: int = 0,
-                main_cap: int | None = None, side_cap: int | None = None, pool: tuple[int, int] | None = None,
-                min_delays: list[float] | None = None, classes: list[int] | None = None,
-                class_delays: list[float] | None = None, queues: bool = False):
+                main_cap: int | None = None, pool: tuple[int, int] | None = None,
+                min_delays: list[float] | None = None, queues: bool = False):
         """pool: (block, blocks per group) -- the runs in per-group arenas (Ring); None: per-cell runs.
         min_delays: per connection its minimum delay as the host schedules with it (a gated run's due time;
-        default 0). classes, class_delays: several homogeneous delays (D-1, BRUNEL.md) -- per connection its
-        delay class, per class its delay: a ring of n_slots per class, delivered merged by arrival; None:
-        one class. queues: a queue per connection (n_slots: the connections; fused.py _pull_queues)."""
-        caps = {k: v for k, v in (("main_cap", main_cap), ("side_cap", side_cap)) if v}
-        n_classes = len(class_delays) if class_delays else 1
+        default 0). queues: a queue per connection (n_slots: the connections; fused.py _pull_queues; pooled
+        only); else the slotted ring, its sources' emission uniform (fused.py _pull)."""
+        if queues and not pool:
+            raise ValueError("queues live in pooled arenas (a pool)")
+        if not queues and not all(s.uniform_emission for s in sources):
+            raise NotImplementedError(
+                "the slotted ring (per-link delays, or per-cell runs: Population.ring_block None) takes uniform "
+                "sources only (bare n2.spike() in send): a source emitting at precise times -- a loop, or inside "
+                "delivery -- needs every incoming connection one delay value, its queue (SPIKES.md)")
         self.queues = queues
-        self.ring = Ring(self.n_groups, n_slots * n_classes, slot_width, self.device, pool=pool, n_classes=n_classes,
-                         **caps)
+        self.ring = Ring(self.n_groups, n_slots, slot_width, self.device, pool=pool,
+                         **({"main_cap": main_cap} if main_cap else {}))
         self.wmark = torch.full((self.n_groups,), -math.inf, device=self.device)
         self.plan = FusedPlan([s.history for s in sources], topologies, self.n_groups, self.device,
-                              min_delays=min_delays, classes=classes if n_classes > 1 else None,
-                              class_delays=class_delays if n_classes > 1 else None)
+                              min_delays=min_delays)
         # the event state (fused.py: _gate_skip, _ev_close): per run parity the delivery position, the runs
         # made, per group its first slot still holding records
         self.ev = torch.full((2, 2 + self.n_groups), 2147483647, device=self.device, dtype=torch.int32)
         self.ev[:, :2] = 0
-        self.uniform_sources = all(s.uniform_emission for s in sources)
         self.log_cap = log_cap
         self.log = torch.zeros(1 + 5 * max(log_cap, 1), device=self.device, dtype=torch.int32)
         self._launchers = {}  # new buffers (their sizes are part of the AMD backend's specialization)
@@ -443,10 +437,9 @@ class PopulationRuntime:
             held = torch.zeros(g * nb, dtype=torch.int32, device=dev)
             group = torch.arange(g * S, device=dev) // S
             col = torch.arange(nb, device=dev)
-            for table, n in ((ring.table, ring.nblk.long()), (ring.side_table, (ring.side_count.long() + B - 1) // B)):
-                used = (col[None, :] < n[:, None]) & (table[:, :nb] >= 0)
-                idx = (group[:, None] * nb + table[:, :nb].long().clamp(min=0))[used]
-                held.index_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
+            used = (col[None, :] < ring.nblk.long()[:, None]) & (ring.table[:, :nb] >= 0)
+            idx = (group[:, None] * nb + ring.table[:, :nb].long().clamp(min=0))[used]
+            held.index_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
             errors = self._chk[:16] if self._chk is not None else torch.zeros(16, dtype=torch.int32, device=dev)
             self._chk = torch.cat([errors, held])  # (on the current stream: the next launches after it)
             self._chk_key = key
@@ -508,7 +501,7 @@ class PopulationRuntime:
         window: naer2/schedule.py; a rerun: _Launches.recover)."""
         args, num_warps, aligned = self._launch_args(params)
         # what selects the compiled variant, besides the plan, ring and history (fixed between connect()s)
-        key = (num_warps, self.waves_per_eu, self.maxnreg, self.arena_check, self.count_received, self.batch, self.stream_block,
+        key = (num_warps, self.waves_per_eu, self.maxnreg, self.arena_check, self.count_received, self.stream_block,
                self.unroll, self.log_cap > 0)
         launch = self._launchers.get(key)
         if launch is not None and aligned:
@@ -587,20 +580,13 @@ class PopulationRuntime:
     def _follow_need(self, blocks: int, most: int, lost: int, run_id: int, n_runs: int) -> None:
         """The ring following what complete runs needed -- n_runs of them, run_id the last (pooled: the most
         blocks any group held, the most records any cell logged; per-cell: the longest run) -- see the
-        module docstring. The general pull's lost links (a full side run, or a main run / arena out of room:
-        it takes room one record at a time and can't stop) double that size."""
+        module docstring. (lost: the runs' lost bits -- links lost, raised by check(); 4: the arena check.)"""
         ring = self.ring
-        main_full = side_full = (lost & 3) > 0  # (the general pull: either kind grows; 4: the arena check)
         if not ring.pool_b:
             longest = blocks
-            main_cap = ring.main_cap
-            if longest * self.grow_at > main_cap or main_full:
-                main_cap = max(-(-math.ceil(longest * self.grow_to) // 4) * 4, 2 * main_cap if main_full else 0)
-            if main_cap != ring.main_cap or side_full:
-                self._grow_cells(main_cap, 2 * ring.side_cap if side_full else None, run_id, main_full or side_full)
+            if longest * self.grow_at > ring.main_cap:
+                self._grow_cells(-(-math.ceil(longest * self.grow_to) // 4) * 4, run_id)
             return
-        if main_full:  # (the general pull: the arena ran out, links lost)
-            blocks = max(blocks, 2 * ring.pool_nb)
         w = self._window
         w[0], w[1], w[2] = max(w[0], blocks), max(w[1], most), w[2] + n_runs
         nb, log_cap = self._sizes(blocks, most)
@@ -615,12 +601,6 @@ class PopulationRuntime:
         if (nb, log_cap) != (ring.pool_nb, ring.log_cap):
             self._want(nb, log_cap, run_id)
             self._launches.resize()
-        if main_full or side_full:
-            ring.flags[0] = 0
-            ring.flags[3] = 0
-            warnings.warn(f"a ring ran out in run {run_id} (the general pull: it can't stop a run): the links it "
-                          f"couldn't take were lost; the arenas are now {ring.pool_nb} blocks of {ring.pool_b} "
-                          f"records", RuntimeWarning, stacklevel=4)
 
     def _floors(self) -> tuple[int, int]:
         """Pooled: the smallest arena (every slot its reserve, a partly used block, one more) and log (one
@@ -667,51 +647,42 @@ class PopulationRuntime:
         """(_Launches.recover, the device idle) A ring that stopped a run grows to what that run needs, its
         flag cleared."""
         ring = self.ring
-        if not int(ring.flags[4]):
+        if not int(ring.flags[FLAG_STOPPED]):
             return
         self.stops.append(self.run_id)
         stats = ring.stats.cpu()
         if not ring.pool_b:
             longest = int(stats[:, 0].max())
-            self._grow_cells(-(-math.ceil(longest * self.grow_to) // 4) * 4, None, self.run_id, False)
+            self._grow_cells(-(-math.ceil(longest * self.grow_to) // 4) * 4, self.run_id)
         else:
             blocks, most = int(stats[:, 0].max()), int(stats[:, 1].max())
             if blocks >= 1 << 24:
                 raise RuntimeError(f"a ring run needs more than {POOL_MAX_BLOCKS} blocks of {ring.pool_b} records "
                                    f"in one slot (Population.ring_block: larger blocks)")
             self._want(*self._sizes(blocks, most), self.run_id)  # (applied by the recovery)
-        ring.flags[4] = 0
+        ring.flags[FLAG_STOPPED] = 0
 
-    def _grow_cells(self, main_cap: int | None, side_cap: int | None, run_id: int, lost: bool) -> None:
-        """Per-cell runs: larger capacities (Ring.grow), the device idle (see _Launches.resize)."""
-        ring = self.ring
+    def _grow_cells(self, main_cap: int, run_id: int) -> None:
+        """Per-cell runs: a larger capacity (Ring.grow), the device idle (see _Launches.resize)."""
         torch.cuda.synchronize()
-        ring.grow(main_cap=main_cap, side_cap=side_cap)
-        ring.flags[0] = 0
-        ring.flags[3] = 0
+        self.ring.grow(main_cap)
         torch.cuda.synchronize()  # (the copies done before any stream's next kernel: see _Launches.resize)
-        for kind, cap in (("main", main_cap), ("side", side_cap)):
-            if cap:
-                self.growths.append((run_id, kind, cap))
-        if lost:
-            warnings.warn(f"a ring run overflowed in run {run_id} (the general pull: it can't stop a run): its "
-                          f"links beyond the capacity were lost; the capacities are now main {ring.main_cap}, "
-                          f"side {ring.side_cap}", RuntimeWarning, stacklevel=4)
+        self.growths.append((run_id, "main", main_cap))
 
     def _constexprs(self, num_warps) -> dict:
         p2, lanes = triton.next_power_of_2, 32 * num_warps
         consts = dict(
             GROUP_SIZE=self.group_size, K=self.history.K, SK=self.plan.K, KP=p2(self.plan.K),
-            UNIFORM_SOURCES=self.uniform_sources, N_SLOTS=self.ring.n_slots,
+            N_SLOTS=self.ring.n_slots,
             LOG=self.log_cap > 0, STREAM=self.stream_block, U=self.unroll,
             SPT=max(self.group_size // lanes, 1), NUM_WARPS=num_warps, MAX_CONNS=p2(max(self.plan.n_conns, 1)),
             LOG_CJ=(p2(max(self.plan.n_conns, 1)) * p2(self.plan.K)).bit_length() - 1,
-            COUNT=self.count_received, BATCH=self.batch, NSP=p2(self.ring.n_slots),
+            COUNT=self.count_received, NSP=p2(self.ring.n_slots),
             TRACE=self.trace.level if self.trace is not None else 0,
             TRACE_CAP=self.trace.cap if self.trace is not None else 1,
             POOL_B=self.ring.pool_b,
-            ARENA_CHECK=bool(self.arena_check and self.ring.pool_b), NC=self.ring.n_classes,
-            SEG=self.segment_records, QUEUES=self.queues, GP=p2(max([max(h.G if h.regions else 1, 1) for h in self.plan.histories], default=1)),
+            ARENA_CHECK=bool(self.arena_check and self.ring.pool_b), QUEUES=self.queues,
+            GP=p2(max([max(h.G if h.regions else 1, 1) for h in self.plan.histories], default=1)),
             **self.kernel.consts)
         return {c: consts[c] for c in self._constexpr_names if c in consts}
 

@@ -3,10 +3,17 @@
 ## Next (decided 2026-11-22)
 
 1. **A short kernel refactor** -- before refactors A and B (PLAN.md), which stay open after it, then the rest.
-   Around segment records and the batch walk (one walk, one record format for queues and slots); the fused round
-   the default everywhere (Brunel: not slower, ~3% faster), the unfused path removed in a later refactor.
-2. **PD14's registers with segment records** (168 a thread, 46 spills; 27.0 us a round, link records 21.1):
-   capping them never helped -- finding and removing them should win part of it back.
+   The fused round the default everywhere (Brunel: not slower, ~3% faster), the unfused path removed in a later
+   refactor. Done 2026-11-28, from a trace of which paths PD14, Brunel and the tests compile: the delay classes
+   (`NC`), the run-by-run pull (`BATCH`), segment records on slots (`NAER2_SEG`: dropped -- PD14 keeps link
+   records, slower with segments; to rediscover where an optimization wants them), and the sequential general
+   pull with the side runs: the slotted ring takes uniform sources only (`UNIFORM_SOURCES` gone; non-uniform
+   sources need queues -- every incoming connection one delay value -- else NotImplementedError, a pull for them
+   to come with the model that needs it). The tests that ran the general pull now run queues (as a Population
+   would), plus a burst through the queue pull's merge path. Open: the per-cell rings (unpooled, only tests and
+   `ring_block = None`: keep or drop), the unfused path.
+2. **PD14's registers**: after the refactor 84-118 a thread (the fused round's 128 -> 118), no spills; capping
+   them never helped -- finding and removing them should.
 3. **Brunel**: 3x real time at 50k on the 4090 (captured windows) -- to optimize later, as PD14. Strong scaling
    on the 4090 (2026-11-23, captured windows, 100 ms): wall per simulated ms 2.8-3.0 from 10k to 60k, 3.5-3.7 from
    70k to 110k (2.18 G links); a round ~2.1-2.8 ms at every size (latency-bound, not by the links). Memory: GPU
@@ -17,22 +24,21 @@
    aggressive prefetching and latency hiding: the next block's / batch's records and links loaded while the
    current one is walked, fewer barriers per batch, more independent work in flight per program.
 
-## Open in the working tree (segment records and the batch walk, uncommitted experiment, 2026-11-22)
+## Open after the kernel refactor (2026-11-28)
 
-- **The batch walk writes no delivery log** (`_walk_batch`): the log-based tests (test_fused_gpu's end-to-end,
-  link-width and every-other-round tests) can't check segment records.
-- **`NAER2_SEG`**: a temporary environment flag flipping `segment_records`' default (runtime.py, population.py) --
-  the PD14 measurements' switch; to go once the record format is decided.
-- **The step-3 delay-class path** (`NC`, `_stage_merged`'s classes, `_merge_classes`, `Population._delay_classes`):
-  superseded by queues, and broken with segment records -- to remove.
+- **A flat list's order in the queue pull's merge path**: a uniform source's history is one flat list in its atomic
+  appends' order; the fast chunk merge ranks spikes by (e, node), the merge path (a chunk past QCH, a burst at
+  one time) keeps the list's order -- the summation order of tied inputs irreproducible there, as PD14's
+  (`test_a_burst_past_a_chunk_arrives_in_order[uniform]` checks the sums only).
+- **Coverage**: the batch walk's per-time send (`SEND1`) and Brunel's neuron path run in one test only
+  (`test_brunel_A_asynchronous_irregular`); queue deliveries are checked by order hashes and sums, not the delivery
+  log; test/fused_reference.py (the hand-written PD14 kernels) follows every `_pull` / `_deliver` signature.
 - **Exact ties** (found 2026-11-22: Brunel at N = 5000 and 50k jumped to ~330 Hz): delta synapses with one delay
   fire whole cascades at bit-identical times; with the threshold checked in receive, simultaneous inputs applied
   one by one (E before I) let excitation win. Now Brunel's check is in send, and the batch walk runs a neuron's
   per-delivery send once its inputs at one time are in (`_receive1` / `_send1`; the link walks still per link).
   Open: D-3 (spikes from receive) wants a model with heterogeneous delays and event-driven dynamics to test with;
   fp32 time merges distinct events on long runs (~1 us at 10 s).
-- **PD14 with segment records**: 36.9 us a round (link records 21.1): the link walk's staging buffers still
-  allocated beside the batch walk's (45.8 KB LDS, 46 spills) -- occupancy.
 
 
 Every population runs one fused Gluon kernel per run (pull intake, delivery, update, send, emission),
@@ -81,17 +87,10 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   the runtime raises.
 - **Group-local link targets as `uint8` / `int16`** (group sizes up to 256 / 65536): 2-4x less target memory at
   billions of synapses.
-- **Brunel (BRUNEL.md)**: the general pull's speed (~135 ms wall per simulated ms on the 780M at N = 5000:
-  sequential per spike and link, a barrier per link -- phase 2); its arenas sized up front (`ring_in_flight`: the
-  general pull can't stop a run that outgrows them, links are lost); a run at scale on the 4090, then planned
-  and captured windows.
 - **PD14's reproducible order** (SPIKES.md): its uniform producers keep one flat, atomically placed history list
   and its pull claims through LDS atomics, so a cell's order -- its targets' summation order -- varies between
   runs. Per-program regions cost 1.6 us a round (21.0 -> 22.6 on the 4090): a cheaper way, possibly a hacky one,
   separately.
-- **D-1, the delay classes' cost**: a ring per class (memory x classes, every class the longest delay's
-  slots); a slot with side runs (the general pull: timed sources) merges its classes one link at a time
-  (`_merge_classes`), the block merge (`_stage_merged`) reads every class's candidates twice -- both unmeasured.
 - **An event-driven test model**: a network to optimize the general (event-driven) path against -- planning,
   gated windows -- the way PD14 drove the clocked one.
 
@@ -114,10 +113,10 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   compile(), kernel compile + cache, device placement, real kernel launch...) -- split responsibilities out. Also:
   see if `Topology` can be plain tensors (and regions / positions made lighter -- doubtful there); edges, nodes,
   patterns, updates, receives, kernel, fabric each take a file -- maybe packaged more tightly, reusing things.
-- **The general (non-uniform) pull**: a mixed (NON_)UNIFORM_SOURCES pull (D-5); it takes room record by record
-  (`_take_block`, with barriers) and can't stop a run -- past its ring it still loses links (a warning) and the
-  ring doubles; the `lost` path (missing blocks, compacted freeing) only runs once an arena ran out (untested at
-  PD14's scale). LIMITATION: host readbacks of device state go through `PopulationRuntime.settle()` (a stopped
+- **Non-uniform sources on the slotted ring** (per-link delays, precise spike times -- a model with heterogeneous
+  delays and event-driven dynamics): NotImplementedError since the sequential general pull went (2026-11-28); a
+  batched pull for them, deterministic per slot (SPIKES.md). The `lost` path (missing blocks, compacted freeing)
+  only runs after a shrink below the blocks in use (never asked for; untested). LIMITATION: host readbacks of device state go through `PopulationRuntime.settle()` (a stopped
   run rerun first) -- anything reading a history or ring directly on the host must call it; a rerun reads the
   state tensors its launch read (the journal keeps them): replacing a state tensor between runs is safe
   (Population attrs do), writing into one in place isn't without a settle() first.
@@ -149,9 +148,9 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   2026-11-22, BRUNEL.md) -- the records keep the emission time, in
   emission order; per target the times never step back. One homogeneous
   delay D over every incoming link: exact, e + D. Several homogeneous
-  values: exact too -- a ring per delay class (a cell per group, class
-  and slot), a due slot's classes merged by arrival (ties: the smaller
-  delay first); the delivery log then records arrivals. Per-link delays: every link
+  values: exact too -- a queue per connection (SPIKES.md), merged by
+  arrival (ties: the lower connection first); the delivery log then
+  records arrivals. Per-link delays: every link
   of a slot at the slot's time, its center by default, its end with
   `Population.slot_time = "end"`. A bare n2.spike() in receive fires at
   exactly that time.
@@ -171,11 +170,11 @@ unconditional per-link attr load, the bare post-target `@` (a clear error now), 
   link step), measured with Brunel.
 - **D-4 bare n2.spike() emits at the window's start, t_start** -- inside
   delivery at exactly the delivery time (BRUNEL.md).
-- **D-5 two flags:** `uniform_emission` (this population's own spikes,
-  every n2.spike() bare; `FusedKernel.uniform_emission`) and
-  `uniform_sources` (all its sources', the batched pull;
-  `PopulationRuntime.uniform_sources`). Mixed sources fall back to the
-  general pull for all of them; a mixed path is an open optimization.
+- **D-5 `uniform_emission`** (this population's own spikes, every
+  n2.spike() bare; `FusedKernel.uniform_emission`): its history one flat
+  list (else a region per program, sorted). The slotted ring's pull takes
+  uniform sources only, queues any (2026-11-28: the general pull for
+  mixed sources removed).
 - **D-6 per-connection receive code, selected per source spike** (a gap):
   a small VARIANT index -- connections with the same (receive hook, edge
   type) share one (PD14: one for all 8) -- from the connection id in the

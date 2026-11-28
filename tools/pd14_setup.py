@@ -80,7 +80,7 @@ class PD14:
             cap = main_cap.get(name) if isinstance(main_cap, dict) else main_cap
             cap = cap or (PD14_MAIN_CAP[name] if model == "pd14" else 8 * G)
             self.pops[name].connect([self.pops[members[c._source]] for c in conns], topos, n_slots,
-                                    main_cap=cap, side_cap=16)
+                                    main_cap=cap)
         torch.cuda.synchronize()
         self.build_s = time.time() - t0
         del net

@@ -28,8 +28,8 @@ if "--keep-old" in sys.argv:  # never free a ring's old buffer (diagnostic)
 if "--zero-growth" in sys.argv:  # every ring buffer zero-filled, also when grown (diagnostic)
     from naer2 import ring as RG
     _alloc = RG.Ring._allocate
-    RG.Ring._allocate = lambda self, main_cap, side_cap, device, zero_records=True: _alloc(
-        self, main_cap, side_cap, device, zero_records=True)
+    RG.Ring._allocate = lambda self, main_cap, device, zero_records=True: _alloc(
+        self, main_cap, device, zero_records=True)
 for a in sys.argv:
     if a.startswith("--warps="):  # the warp cap (diagnostic): runtime._warp_cap overridden
         R._warp_cap = lambda device, _w=int(a.split("=")[1]): _w
@@ -49,13 +49,12 @@ def _check_arena(rt, when):
     if not ring.pool_b or len(INV) >= 2:
         return
     g, S, nb, B = ring.n_groups, ring.n_slots, ring.pool_nb, ring.pool_b
-    table, side, stack = ring.table.cpu(), ring.side_table.cpu(), ring.stack.cpu()
-    nblk, scount, top = ring.nblk.cpu(), ring.side_count.cpu(), ring.top.cpu()
+    table, stack = ring.table.cpu(), ring.stack.cpu()
+    nblk, top = ring.nblk.cpu(), ring.top.cpu()
     for grp in range(g):
         ids = []
         for c in range(grp * S, (grp + 1) * S):
             ids += [(int(x), f"main cell {c}") for x in table[c, :int(nblk[c])]]
-            ids += [(int(x), f"side cell {c}") for x in side[c, :-(-int(scount[c]) // B)]]
         ids += [(int(x), "free") for x in stack[grp, :int(top[grp])]]
         seen = {}
         dups = []
