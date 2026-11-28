@@ -2,7 +2,7 @@
 (events around the graph launch alone) and the wall clock -- for a kernel configuration: group size, warps
 per program, NVIDIA's register cap. One configuration per process.
 
-    python tools/pd14_graph_gpu.py [--G=256] [--Gpop=I_4:128,...] [--Wpop=I_4:8,...] [--stream=256] [--fuse | --unfused] [--warps=N] [--maxnreg=N] [--window=100] [--warmup=1000] [--trace | --slowest [--serial] [--status-device]] [--trace_rounds=40] [--rdna2]
+    python tools/pd14_graph_gpu.py [--G=256] [--Gpop=I_4:128,...] [--Wpop=I_4:8,...] [--stream=256] [--fuse | --unfused] [--warps=N] [--maxnreg=N] [--window=100] [--warmup=1000] [--trace | --slowest [--serial] [--status-device]] [--trace_rounds=40] [--steady] [--rdna2]
 
 Also each population's compiled registers per thread and spills (NVIDIA), so a register cap's cost shows.
 """
@@ -118,13 +118,30 @@ if "--status-device" in sys.argv:  # (after the windows' status slots are alloca
     net._graphs = {}
     net.run_graph(max_launches=WINDOW)
     torch.cuda.synchronize()
+if "--steady" in sys.argv:  # no shrinking from here on (each resize drains, copies and recaptures: its cost not a round's)
+    for p in pops.values():
+        p._runtime.shrink_window = 1 << 40
 events.clear()
+cap0, rs0 = getattr(net, "_captures", 0), sum(len(p._runtime.resizes) for p in pops.values())
+rs_at = {k: len(p._runtime.resizes) for k, p in pops.items()}
 t = time.perf_counter()
 n = 0
+per_window = []  # (wall per round of each window, host side: launch-to-launch, the queue bounded by the judging)
 while n < 10 * WINDOW:
-    n += net.run_graph(max_launches=WINDOW)
+    tw = time.perf_counter()
+    k_w = net.run_graph(max_launches=WINDOW)
+    n += k_w
+    per_window.append((time.perf_counter() - tw) / max(k_w, 1) * 1e6)
 torch.cuda.synchronize()
 wall = (time.perf_counter() - t) / n * 1e6
+per_window.sort()
+timed_extra = (f"; per window: median {per_window[len(per_window) // 2]:.0f}, max {per_window[-1]:.0f} us/round"
+               f"; timed: {n} rounds, {getattr(net, '_captures', 0) - cap0} captures, "
+               f"{sum(len(p._runtime.resizes) for p in pops.values()) - rs0} resizes")
+for k, p in pops.items():  # (which populations resized while timed: run id, blocks per arena, log records per cell)
+    if len(p._runtime.resizes) > rs_at[k]:
+        print(f"  timed resize {k}: {p._runtime.resizes[rs_at[k]:]} (before: {p._runtime.resizes[max(rs_at[k] - 2, 0):rs_at[k]]}), "
+              f"growths {p._runtime.growths[-3:]}")
 gpu = sorted(s.elapsed_time(e) * 1e3 / WINDOW for s, e in events)
 fused = [k for k in compiled if k.metadata.name.startswith("fused")][-len(pops):]  # (approximate: last compiled)
 regs = sorted({getattr(k, "n_regs", 0) for k in fused})
@@ -132,7 +149,7 @@ spills = max(getattr(k, "n_spills", 0) for k in fused)
 nw = sorted({k.metadata.num_warps for k in fused})
 print(f"{torch.cuda.get_device_name(0)} G={G} warps={nw} maxnreg={MAXNREG}: graph on the GPU "
       f"{gpu[len(gpu) // 2]:.1f} us/round (min {gpu[0]:.1f}), wall {wall:.0f} us/round; registers {regs}, "
-      f"spills {spills}; captures {net._captures}")
+      f"spills {spills}; captures {net._captures}{timed_extra}")
 
 if "--trace" in sys.argv:  # one stepped round against one replayed round, traced inside the kernels
     import statistics
